@@ -1,0 +1,63 @@
+[package]
+name = "incline"
+version = "0.1.0"
+edition = "2024"
+description = "Incline is an open-pit mine design project"
+repository = "https://github.com/Incline-Mine-Designer/Incline"
+license-file = "LICENSE.md"
+keywords = ["mining", "cad", "gpu", "wgpu", "design"]
+categories = ["graphics", "science"]
+exclude = [
+    "target/",
+    "docs/",
+    "tutorial/"
+]
+
+[features]
+default = []
+# Opt-in GUI inspection/automation over the egui_inspection protocol (egui_mcp and similar
+# tools). Off by default: enabling it lets any process that can reach EGUI_INSPECTION's bind
+# address (loopback-only unless explicitly overridden) read the UI tree, inject input, and
+# take screenshots. Build with `--features inspection` and run with `EGUI_INSPECTION=1`.
+inspection = ["dep:egui_inspection"]
+
+[build-dependencies]
+winresource = "0.1.31"
+
+[dependencies]
+anyhow = "1.0.103"
+glam = { version = "0.33.2", features = ["serde"] }
+dxf = "0.6.1"
+log = "0.4.33"
+lyon = "1.0.19"
+pollster = "0.4.0"
+rfd = "0.17.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+wgpu = "29.0.3"
+winit = "0.30.13"
+glyphon = { version = "0.10", git = "https://github.com/trimental/glyphon.git", rev = "a5458590fc0b52c0bac878219fb287bdffd1fb9a" } # Fork of glyphon with world-space transform support - not ideal
+twox-hash = "2.1.2"
+egui = "0.35.0"
+egui-winit = "0.35.0"
+egui-wgpu = "0.35.0"
+egui_extras = { version = "0.35.0", default-features = false, features = ["svg"] }
+egui_inspection = { version = "0.35.0", features = ["plugin"], optional = true }
+strum = { version = "0.28.0", features = ["derive"] }
+toml = "1.1.2"
+lazy_static = "1.5.0"
+rayon = "1.12.0"
+spade = "2.15.1"
+geo = "0.33.1"
+earcutr = "0.5.0"
+chrono = "0.4.45"
+colored = "3.1.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSImage"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSData"] }
+
+[dependencies.bytemuck]
+version = "1.25.0"
+features = ["derive"]

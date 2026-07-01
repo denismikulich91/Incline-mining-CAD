@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   width="512"
+   height="512"
+   viewBox="0 0 512 512"
+   version="1.1"
+   id="svg1"
+   inkscape:version="1.4.4 (dcaf3e7d9e, 2026-05-05)"
+   sodipodi:docname="make_poly.svg"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview1"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:document-units="px"
+     inkscape:zoom="1.5978956"
+     inkscape:cx="274.73635"
+     inkscape:cy="256.90039"
+     inkscape:window-width="2560"
+     inkscape:window-height="1366"
+     inkscape:window-x="0"
+     inkscape:window-y="0"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="svg1" />
+  <defs
+     id="defs1">
+    <inkscape:perspective
+       sodipodi:type="inkscape:persp3d"
+       inkscape:vp_x="546.34358 : 446.25023 : 1"
+       inkscape:vp_y="0 : 1000 : 0"
+       inkscape:vp_z="1281.1366 : 404.9459 : 1"
+       inkscape:persp3d-origin="256 : 170.66667 : 1"
+       id="perspective4" />
+  </defs>
+  <path
+     style="fill:none;stroke:#0065ff;stroke-width:44.8075;stroke-linecap:round;stroke-opacity:1"
+     d="M 409.85028,60.732479 H 84.409153 l -22.382384,8.49801 V 433.61311 l 14.942788,17.65442 H 409.85028 c 0,0 53.37268,9.1506 40.12295,-3.91979 L 256,256 C 256,256 449.06858,86.160811 449.97323,72.091871 450.73441,60.254232 409.85028,60.732479 409.85028,60.732479 Z"
+     id="path2"
+     sodipodi:nodetypes="ccccccscsc" />
+  <ellipse
+     style="fill:#ffffff;fill-opacity:1;stroke:none;stroke-width:0.828554;stroke-dasharray:none;stroke-opacity:1"
+     id="path19"
+     cx="62.026768"
+     cy="451.26755"
+     rx="40.122959"
+     ry="38.828671" />
+  <ellipse
+     style="fill:#ffffff;fill-opacity:1;stroke:none;stroke-width:0.828554;stroke-dasharray:none;stroke-opacity:1"
+     id="ellipse19"
+     cx="62.026768"
+     cy="60.732479"
+     rx="40.122959"
+     ry="38.828671" />
+  <ellipse
+     style="fill:#ffffff;fill-opacity:1;stroke:none;stroke-width:0.828554;stroke-dasharray:none;stroke-opacity:1"
+     id="ellipse1"
+     cx="449.97324"
+     cy="451.26755"
+     rx="40.122959"
+     ry="38.828671" />
+  <ellipse
+     style="fill:#ffffff;fill-opacity:1;stroke:none;stroke-width:0.828554;stroke-dasharray:none;stroke-opacity:1"
+     id="ellipse2"
+     cx="449.97324"
+     cy="60.732479"
+     rx="40.122959"
+     ry="38.828671" />
+</svg>

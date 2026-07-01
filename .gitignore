@@ -1,0 +1,19 @@
+# Rust
+/target
+Cargo.lock
+
+# MacOS
+.DS_Store
+
+# Ai Agents
+.claude/
+.cursor/
+.agents/
+.qwen/
+.aider*
+*.code-workspace
+
+# Flamegraph
+flamegraph.svg
+perf.data
+perf.data.old

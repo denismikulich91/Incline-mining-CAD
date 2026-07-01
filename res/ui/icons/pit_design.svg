@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Uploaded to: SVG Repo, www.svgrepo.com, Generator: SVG Repo Mixer Tools -->
+
+<svg
+   width="800px"
+   height="800px"
+   viewBox="0 0 24 24"
+   fill="none"
+   version="1.1"
+   id="svg1"
+   sodipodi:docname="pit_design.svg"
+   inkscape:version="1.4.4 (dcaf3e7d9e, 2026-05-05)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs1">
+    <rect
+       x="46.936733"
+       y="122.23108"
+       width="650.26932"
+       height="567.15219"
+       id="rect7" />
+  </defs>
+  <sodipodi:namedview
+     id="namedview1"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:zoom="0.72312501"
+     inkscape:cx="314.60674"
+     inkscape:cy="342.95592"
+     inkscape:window-width="1429"
+     inkscape:window-height="1217"
+     inkscape:window-x="0"
+     inkscape:window-y="0"
+     inkscape:window-maximized="0"
+     inkscape:current-layer="svg1" />
+  <path
+     style="fill:#442b02;fill-opacity:1;stroke:none;stroke-width:0.54399;stroke-linecap:round;stroke-opacity:1"
+     d="M 24,17.793069 H 17.687635 L 12.584912,10.784071 H 8.212724 L 3.842945,3.5202549 H 0 L 0,24 h 24 v -6.206931"
+     id="path1"
+     sodipodi:nodetypes="ccccccccc" />
+  <rect
+     style="fill:#332002;fill-opacity:1;stroke:none;stroke-width:0.54399;stroke-linecap:round;stroke-opacity:1"
+     id="rect3"
+     width="24"
+     height="6.2069311"
+     x="0"
+     y="17.793068"
+     rx="0.40684804"
+     ry="0.45591184" />
+  <path
+     style="fill:#7f5005;fill-opacity:1;stroke:none;stroke-width:0.54399;stroke-linecap:round;stroke-opacity:1"
+     d="m 0,3.5202549 h 3.8429451 l 4.369779,7.2638161 H 0 Z"
+     id="path3" />
+</svg>
