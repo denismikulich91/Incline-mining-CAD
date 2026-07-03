@@ -1,6 +1,6 @@
 [package]
 name = "incline"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Incline is an open-pit mine design project"
 repository = "https://github.com/Incline-Mine-Designer/Incline"
@@ -33,7 +33,7 @@ lyon = "1.0.19"
 pollster = "0.4.0"
 rfd = "0.17.2"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
 wgpu = "29.0.3"
 winit = "0.30.13"
 glyphon = { version = "0.10", git = "https://github.com/trimental/glyphon.git", rev = "a5458590fc0b52c0bac878219fb287bdffd1fb9a" } # Fork of glyphon with world-space transform support - not ideal
@@ -49,9 +49,11 @@ lazy_static = "1.5.0"
 rayon = "1.12.0"
 spade = "2.15.1"
 geo = "0.33.1"
-earcutr = "0.5.0"
 chrono = "0.4.45"
 colored = "3.1.1"
+earcut = "0.4"
+robust = "1.2"
+memmap2 = "0.9.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"

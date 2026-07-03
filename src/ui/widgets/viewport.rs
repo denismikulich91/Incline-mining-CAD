@@ -222,6 +222,8 @@ impl<'a> ColorScaleLegend<'a> {
                         ui.vertical_centered(|ui| {
                             self.draw_variable_dropdown(ui, content_width, commands);
                             ui.add_space(4.0);
+                            self.draw_empty_values_toggle(ui, content_width, commands);
+                            ui.add_space(4.0);
                             if let Some((min, max)) = self.range {
                                 self.draw_bar(ui, content_width, bar_width, min, max, commands);
                             } else {
@@ -230,6 +232,27 @@ impl<'a> ColorScaleLegend<'a> {
                         });
                     });
             });
+    }
+
+    fn draw_empty_values_toggle(
+        &self,
+        ui: &mut egui::Ui,
+        content_width: f32,
+        commands: &mut Vec<UiCommand>,
+    ) {
+        let mut hide = self.model.hide_empty_color_values;
+        ui.allocate_ui_with_layout(
+            egui::vec2(content_width, 20.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                if ui.checkbox(&mut hide, "Hide empty").changed() {
+                    commands.push(UiCommand::SetBlockModelHideEmptyValues {
+                        id: self.model.id,
+                        hide,
+                    });
+                }
+            },
+        );
     }
 
     fn draw_variable_dropdown(

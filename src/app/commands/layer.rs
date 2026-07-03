@@ -2,9 +2,33 @@ use anyhow::Result;
 
 use crate::{
     app::App,
-    model::{Command, LayerId},
+    model::{Command, Document, Layer, LayerId, Object, SceneEntityId},
     userspace_log, userspace_warn,
 };
+
+fn unique_layer_name(document: &Document, preferred: &str) -> String {
+    if document.layer_id_by_name(preferred).is_none() {
+        return preferred.to_string();
+    }
+
+    for index in 2.. {
+        let candidate = format!("{preferred} {index}");
+        if document.layer_id_by_name(&candidate).is_none() {
+            return candidate;
+        }
+    }
+
+    unreachable!("unbounded iterator should always find a unique layer name")
+}
+
+fn objects_on_layer(document: &Document, layer_id: LayerId) -> Vec<Object> {
+    document
+        .objects()
+        .iter()
+        .filter(|object| object.layer() == layer_id)
+        .cloned()
+        .collect()
+}
 
 impl<'a> App<'a> {
     pub(crate) fn create_layer(&mut self, project_index: usize, name: String) -> Result<()> {
@@ -71,6 +95,137 @@ impl<'a> App<'a> {
             self.invalidate_geometry();
         }
         Ok(())
+    }
+
+    pub(crate) fn duplicate_layer(&mut self, project_index: usize, layer_id: LayerId) {
+        self.workspace.set_active_index(project_index);
+        let Some(project) = self.workspace.projects.get_mut(project_index) else {
+            return;
+        };
+        let Some(source_layer) = project.pidb.document.layer(layer_id).cloned() else {
+            return;
+        };
+        let source_objects = objects_on_layer(&project.pidb.document, layer_id);
+        let duplicate_name = unique_layer_name(
+            &project.pidb.document,
+            &format!("{} copy", source_layer.name),
+        );
+
+        let doc = &mut project.pidb.document;
+        let new_layer_id = doc.allocate_layer_id();
+        let duplicate_layer = Layer {
+            id: new_layer_id,
+            name: duplicate_name.clone(),
+            color_index: source_layer.color_index,
+            color: source_layer.color,
+            visible: source_layer.visible,
+            elevation: source_layer.elevation,
+        };
+        let duplicate_objects: Vec<Object> = source_objects
+            .into_iter()
+            .map(|object| {
+                let object_id = doc.allocate_object_id();
+                object.with_id_and_layer(object_id, new_layer_id)
+            })
+            .collect();
+
+        self.history.execute(
+            doc,
+            Command::AddLayerSnapshot {
+                layer: duplicate_layer,
+                objects: duplicate_objects,
+            },
+        );
+        project.loaded_layers.insert(new_layer_id);
+        project.dirty = true;
+        project.invalidate_dirty_layers();
+        self.editor.selected_handles.clear();
+        userspace_log!("Duplicated layer '{duplicate_name}' in project {project_index}");
+        self.invalidate_geometry();
+    }
+
+    pub(crate) fn move_layer_to_project(
+        &mut self,
+        source_project_index: usize,
+        layer_id: LayerId,
+        target_project_index: usize,
+    ) {
+        if source_project_index == target_project_index {
+            return;
+        }
+
+        let Some(source_project) = self.workspace.projects.get(source_project_index) else {
+            return;
+        };
+        let Some(source_layer) = source_project.pidb.document.layer(layer_id).cloned() else {
+            return;
+        };
+        let source_objects = objects_on_layer(&source_project.pidb.document, layer_id);
+
+        let Some(target_project) = self.workspace.projects.get_mut(target_project_index) else {
+            return;
+        };
+        let new_layer_id = target_project.pidb.document.allocate_layer_id();
+        let target_name = unique_layer_name(&target_project.pidb.document, &source_layer.name);
+        let moved_layer = Layer {
+            id: new_layer_id,
+            name: target_name.clone(),
+            color_index: source_layer.color_index,
+            color: source_layer.color,
+            visible: source_layer.visible,
+            elevation: source_layer.elevation,
+        };
+        let moved_objects: Vec<Object> = source_objects
+            .iter()
+            .map(|object| {
+                let object_id = target_project.pidb.document.allocate_object_id();
+                object.with_id_and_layer(object_id, new_layer_id)
+            })
+            .collect();
+        let moved_handles: Vec<SceneEntityId> = moved_objects
+            .iter()
+            .map(|object| SceneEntityId::Object(object.id()))
+            .collect();
+
+        self.history.clear();
+        self.editor.selected_handles.clear();
+        self.editor.hidden_handles.clear();
+        self.editor.frozen_handles.clear();
+        self.editor.translucent_handles.clear();
+
+        if let Some(source_project) = self.workspace.projects.get_mut(source_project_index) {
+            for object in &source_objects {
+                source_project.pidb.document.remove_object(object.id());
+            }
+            source_project.pidb.document.delete_layer(layer_id);
+            source_project.loaded_layers.remove(&layer_id);
+            source_project.dirty = true;
+            source_project.invalidate_dirty_layers();
+        }
+
+        if let Some(target_project) = self.workspace.projects.get_mut(target_project_index) {
+            target_project
+                .pidb
+                .document
+                .append_layer_snapshot(&moved_layer, moved_objects.iter());
+            target_project.loaded_layers.insert(new_layer_id);
+            target_project.dirty = true;
+            target_project.invalidate_dirty_layers();
+        }
+
+        if self.editor.active_layer == Some(layer_id) {
+            self.editor.active_layer = None;
+        }
+        self.workspace.set_active_index(target_project_index);
+        self.editor.active_layer = Some(new_layer_id);
+        self.editor.selected_handles = moved_handles.into_iter().collect();
+        userspace_log!(
+            "Moved layer {:?} from project {} to project {}",
+            layer_id,
+            source_project_index,
+            target_project_index
+        );
+        self.invalidate_geometry();
     }
 
     pub(crate) fn load_layer(&mut self, project_index: usize, layer_id: LayerId) {
@@ -335,6 +490,35 @@ impl<'a> App<'a> {
         }
         userspace_log!("Requested unload of {count} layer(s) in project {project_index}");
         userspace_warn!("Requested unload of {count} layer(s) from PIDB index {project_index}");
+    }
+
+    pub(crate) fn select_all_objects_in_layer(&mut self, project_index: usize, layer_id: LayerId) {
+        let Some(project) = self.workspace.projects.get(project_index) else {
+            return;
+        };
+        if !project.loaded_layers.contains(&layer_id) {
+            return;
+        }
+        let handles: Vec<SceneEntityId> = project
+            .pidb
+            .document
+            .objects()
+            .iter()
+            .filter(|object| object.layer() == layer_id)
+            .map(|object| SceneEntityId::Object(object.id()))
+            .collect();
+
+        self.workspace.set_active_index(project_index);
+        self.history.clear();
+        self.editor.active_layer = Some(layer_id);
+        self.editor.selected_handles = handles.into_iter().collect();
+        self.editor.tri_selected_object_ids.clear();
+        self.editor.tri_selected_layer_ids.clear();
+        self.editor.canvas_context_menu_open = false;
+        let count = self.editor.selected_handles.len();
+        userspace_log!("Selected {count} object(s) in layer {:?}", layer_id);
+        self.invalidate_geometry();
+        self.invalidate_overlay();
     }
 
     pub(crate) fn unload_layer(&mut self, project_index: usize, layer_id: LayerId) {

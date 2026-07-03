@@ -35,9 +35,11 @@ impl egui::Widget for ExplorerEntry {
                     .sense(egui::Sense::click()),
             );
             let label = ui.add(
-                egui::Button::new(self.title)
+                egui::Button::new("")
+                    .left_text(self.title)
                     .frame(false)
-                    .selected(self.selected),
+                    .selected(self.selected)
+                    .min_size((ui.available_width(), ui.available_height()).into()),
             );
             icon.union(label)
         })

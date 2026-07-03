@@ -109,9 +109,11 @@ impl<'a> App<'a> {
                 }
                 let unsupported = model.unsupported_variables();
                 if !unsupported.is_empty() {
+                    // Debug-format the type so padding or unusual characters
+                    // in an unrecognized type string show up in the log.
                     let names = unsupported
                         .iter()
-                        .map(|variable| format!("{} ({})", variable.name, variable.physical_type))
+                        .map(|variable| format!("{} ({:?})", variable.name, variable.physical_type))
                         .collect::<Vec<_>>()
                         .join(", ");
                     userspace_warn!(
@@ -161,6 +163,8 @@ impl<'a> App<'a> {
                         color: DEFAULT_BLOCK_MODEL_COLOR,
                         active_numeric_variable: first_numeric,
                         color_transfer: ColorTransferFunction::default(),
+                        hide_empty_color_values: true,
+                        active_values_cache: Default::default(),
                     });
                     if !self.block_model_files.contains(&loaded.source) {
                         self.block_model_files.push(loaded.source);
@@ -214,6 +218,16 @@ impl<'a> App<'a> {
         self.invalidate_geometry();
     }
 
+    pub(crate) fn set_block_model_hide_empty_values(&mut self, id: BlockModelId, hide: bool) {
+        let Some(model) = self.block_models.iter_mut().find(|model| model.id == id) else {
+            return;
+        };
+        if model.hide_empty_color_values != hide {
+            model.hide_empty_color_values = hide;
+            self.invalidate_geometry();
+        }
+    }
+
     pub(crate) fn close_block_model(&mut self, id: BlockModelId) {
         let Some(index) = self.block_models.iter().position(|model| model.id == id) else {
             return;
@@ -221,7 +235,6 @@ impl<'a> App<'a> {
         let model = self.block_models.remove(index);
         self.clear_block_model_entity_state(model.entity_id());
         self.editor.block_model_table_pages.remove(&id);
-        self.editor.block_model_variable_cache.remove(&id);
         if self.active_block_model == Some(id) {
             self.active_block_model = None;
         }

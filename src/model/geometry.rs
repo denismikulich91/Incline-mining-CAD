@@ -2,8 +2,6 @@
 
 use glam::{DMat4, DQuat, DVec2, DVec3};
 
-use super::{Document, Object};
-
 pub(crate) fn point_to_dvec3(point: &dxf::Point) -> DVec3 {
     DVec3::new(point.x, point.y, point.z)
 }
@@ -71,21 +69,14 @@ impl Transform {
 // Geometric polygon/polyline offset
 // -------------------------------------------------------------------------
 
-/// Compute the 2D intersection parameter `t` on line A+t*r where it meets B+u*s.
-/// Returns `None` when lines are parallel.
+/// Intersect adjacent offset edge lines; `None` when (near-)parallel.
 fn intersect_offset_edges(a: DVec2, r: DVec2, b: DVec2, s: DVec2) -> Option<DVec2> {
-    let denom = r.x * s.y - r.y * s.x;
-    if denom.abs() < 1e-10 {
-        return None;
-    }
-    let t = ((b.x - a.x) * s.y - (b.y - a.y) * s.x) / denom;
-    Some(a + t * r)
+    crate::model::kernel::line_line(a, r, b, s)
 }
 
 /// When the mitre extension at a corner is larger than this multiple of the offset
 /// distance, the corner is bevelled instead to prevent self-intersecting output.
 const MITER_LIMIT: f64 = 4.0;
-pub(crate) const MIN_ROAD_TURN_ANGLE_DEGREES: f64 = 30.0;
 
 /// Offset each edge of a polyline/polygon perpendicular to itself in the XY plane,
 /// then intersect adjacent offset edges to find the new vertices.
@@ -266,408 +257,10 @@ pub(crate) fn geometric_offset_project_to_rl(
         .collect()
 }
 
-pub(crate) const ROAD_INTERSECTION_FLAT_CLEARANCE_M: f64 = 10.0;
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum RoadCenterlineRuleError {
-    SegmentTooShort {
-        required: f64,
-        actual: f64,
-    },
-    DegenerateSegment,
-    TurnTooSharp {
-        minimum_degrees: f64,
-        actual_degrees: f64,
-    },
-    SegmentTooSteep {
-        maximum_degrees: f64,
-        actual_degrees: f64,
-    },
-}
-
-impl std::fmt::Display for RoadCenterlineRuleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RoadCenterlineRuleError::SegmentTooShort { required, actual } => write!(
-                f,
-                "Road segment is too short for {required:.1} m flat intersection approach(es): {actual:.2} m available"
-            ),
-            RoadCenterlineRuleError::DegenerateSegment => {
-                f.write_str("Road segment is too short to place an intersection approach")
-            }
-            RoadCenterlineRuleError::TurnTooSharp {
-                minimum_degrees,
-                actual_degrees,
-            } => write!(
-                f,
-                "Road turn is too sharp: {actual_degrees:.1}° is below the {minimum_degrees:.0}° minimum"
-            ),
-            RoadCenterlineRuleError::SegmentTooSteep {
-                maximum_degrees,
-                actual_degrees,
-            } => write!(
-                f,
-                "Road segment angle is too steep: {actual_degrees:.1}° exceeds the {maximum_degrees:.1}° maximum"
-            ),
-        }
-    }
-}
-
-/// Insert mandatory flat road approaches next to road gradients and intersections.
-///
-/// Any segment that changes Z reserves flat clearance at both ends before the
-/// ramp begins/ends. Junctions can require more clearance so road edges miter
-/// cleanly around the connected road width.
-pub(crate) fn road_centerline_with_intersection_flats(
-    centerline: &[DVec3],
-    document: &Document,
-    road_width: f64,
-) -> Result<Vec<DVec3>, RoadCenterlineRuleError> {
-    if centerline.len() < 2 {
-        return Ok(centerline.to_vec());
-    }
-    validate_road_turn_angles(centerline)?;
-    validate_road_endpoint_attachment_turns(centerline, document)?;
-
-    let mut flat_after: Vec<f64> = vec![0.0; centerline.len()];
-    let mut flat_before: Vec<f64> = vec![0.0; centerline.len()];
-
-    for index in 0..centerline.len() - 1 {
-        let a = centerline[index];
-        let b = centerline[index + 1];
-        if !segment_is_inclined(a, b) {
-            continue;
-        }
-
-        flat_after[index] =
-            flat_after[index].max(road_flat_clearance_at_point(a, b, document, road_width));
-        flat_before[index + 1] =
-            flat_before[index + 1].max(road_flat_clearance_at_point(b, a, document, road_width));
-    }
-
-    for index in 0..centerline.len() - 1 {
-        let required = flat_after[index] + flat_before[index + 1];
-        if required > 0.0 {
-            let actual = horizontal_distance(centerline[index], centerline[index + 1]);
-            if actual + 1e-9 < required {
-                return Err(RoadCenterlineRuleError::SegmentTooShort { required, actual });
-            }
-        }
-    }
-
-    let extra_vertices = flat_after
-        .iter()
-        .filter(|&&clearance| clearance > 0.0)
-        .count()
-        + flat_before
-            .iter()
-            .filter(|&&clearance| clearance > 0.0)
-            .count();
-    let mut result = Vec::with_capacity(centerline.len() + extra_vertices);
-    result.push(centerline[0]);
-
-    for index in 0..centerline.len() - 1 {
-        let a = centerline[index];
-        let b = centerline[index + 1];
-        if flat_after[index] > 0.0 {
-            result.push(point_horiz_distance_from(a, b, flat_after[index], a.z)?);
-        }
-        if flat_before[index + 1] > 0.0 {
-            result.push(point_horiz_distance_from(
-                b,
-                a,
-                flat_before[index + 1],
-                b.z,
-            )?);
-        }
-        result.push(b);
-    }
-
-    validate_road_turn_angles(&result)?;
-    Ok(result)
-}
-
-fn road_flat_clearance_at_junction(
-    junction: DVec3,
-    branch_toward: DVec3,
-    document: &Document,
-    road_width: f64,
-) -> f64 {
-    let branch_delta = branch_toward.truncate() - junction.truncate();
-    let branch_len = branch_delta.length();
-    if branch_len < 1e-9 {
-        return ROAD_INTERSECTION_FLAT_CLEARANCE_M;
-    }
-
-    let branch_dir = branch_delta / branch_len;
-    let own_half_width = (road_width * 0.5).max(0.0);
-    connected_road_branches_at_junction(document, junction)
-        .into_iter()
-        .filter_map(|(other_dir, other_width)| {
-            let angle = branch_dir.dot(other_dir).clamp(-1.0, 1.0).acos();
-            if angle < 1e-6 {
-                return None;
-            }
-
-            let half_width = own_half_width.max(other_width * 0.5);
-            let tangent = (angle * 0.5).tan();
-            if tangent.abs() < 1e-9 {
-                return None;
-            }
-
-            Some(ROAD_INTERSECTION_FLAT_CLEARANCE_M + half_width / tangent)
-        })
-        .fold(ROAD_INTERSECTION_FLAT_CLEARANCE_M, f64::max)
-}
-
-fn road_flat_clearance_at_point(
-    point: DVec3,
-    branch_toward: DVec3,
-    document: &Document,
-    road_width: f64,
-) -> f64 {
-    if road_point_is_junction(point, document) {
-        road_flat_clearance_at_junction(point, branch_toward, document, road_width)
-    } else {
-        ROAD_INTERSECTION_FLAT_CLEARANCE_M
-    }
-}
-
-fn connected_road_branches_at_junction(document: &Document, junction: DVec3) -> Vec<(DVec2, f64)> {
-    let mut branches = Vec::new();
-    for object in document.objects() {
-        let Object::Road {
-            centerline, width, ..
-        } = object
-        else {
-            continue;
-        };
-        if centerline.len() < 2 {
-            continue;
-        }
-
-        for (index, vertex) in centerline.iter().enumerate() {
-            if !points_coincident(vertex.pos, junction) {
-                continue;
-            }
-            if index > 0 {
-                push_branch_dir(&mut branches, centerline[index - 1].pos, junction, *width);
-            }
-            if index + 1 < centerline.len() {
-                push_branch_dir(&mut branches, centerline[index + 1].pos, junction, *width);
-            }
-        }
-
-        for segment in centerline.windows(2) {
-            let a = segment[0].pos;
-            let b = segment[1].pos;
-            if point_on_segment_3d(junction, a, b) {
-                push_branch_dir(&mut branches, a, junction, *width);
-                push_branch_dir(&mut branches, b, junction, *width);
-            }
-        }
-    }
-    branches
-}
-
-fn push_branch_dir(branches: &mut Vec<(DVec2, f64)>, toward: DVec3, junction: DVec3, width: f64) {
-    let delta = toward.truncate() - junction.truncate();
-    let len = delta.length();
-    if len < 1e-9 {
-        return;
-    }
-    let dir = delta / len;
-    if branches
-        .iter()
-        .any(|(existing, _)| existing.dot(dir) > 1.0 - 1e-8)
-    {
-        return;
-    }
-    branches.push((dir, width));
-}
-
-pub(crate) fn validate_road_turn_angles(
-    centerline: &[DVec3],
-) -> Result<(), RoadCenterlineRuleError> {
-    if centerline.len() < 3 {
-        return Ok(());
-    }
-
-    for window in centerline.windows(3) {
-        let prev = window[0].truncate();
-        let joint = window[1].truncate();
-        let next = window[2].truncate();
-        let a = prev - joint;
-        let b = next - joint;
-        let a_len = a.length();
-        let b_len = b.length();
-        if a_len < 1e-9 || b_len < 1e-9 {
-            return Err(RoadCenterlineRuleError::DegenerateSegment);
-        }
-
-        let cos = (a.dot(b) / (a_len * b_len)).clamp(-1.0, 1.0);
-        let angle_degrees = cos.acos().to_degrees();
-        if angle_degrees + 1e-6 < MIN_ROAD_TURN_ANGLE_DEGREES {
-            return Err(RoadCenterlineRuleError::TurnTooSharp {
-                minimum_degrees: MIN_ROAD_TURN_ANGLE_DEGREES,
-                actual_degrees: angle_degrees,
-            });
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_road_endpoint_attachment_turns(
-    centerline: &[DVec3],
-    document: &Document,
-) -> Result<(), RoadCenterlineRuleError> {
-    let Some((&start, &end)) = centerline.first().zip(centerline.last()) else {
-        return Ok(());
-    };
-    if centerline.len() < 2 {
-        return Ok(());
-    }
-
-    validate_road_endpoint_attachment_turn(document, start, centerline[1])?;
-    if !points_coincident(start, end) {
-        validate_road_endpoint_attachment_turn(document, end, centerline[centerline.len() - 2])?;
-    }
-
-    Ok(())
-}
-
-fn validate_road_endpoint_attachment_turn(
-    document: &Document,
-    junction: DVec3,
-    new_branch: DVec3,
-) -> Result<(), RoadCenterlineRuleError> {
-    for object in document.objects() {
-        let Object::Road { centerline, .. } = object else {
-            continue;
-        };
-        if centerline.len() < 2 {
-            continue;
-        }
-
-        if points_coincident(centerline[0].pos, junction) {
-            validate_road_turn_angles(&[centerline[1].pos, junction, new_branch])?;
-        }
-        let last_index = centerline.len() - 1;
-        if points_coincident(centerline[last_index].pos, junction) {
-            validate_road_turn_angles(&[centerline[last_index - 1].pos, junction, new_branch])?;
-        }
-
-        for segment in centerline.windows(2) {
-            let a = segment[0].pos;
-            let b = segment[1].pos;
-            if point_on_segment_3d(junction, a, b) {
-                validate_road_turn_angles(&[a, junction, new_branch])?;
-                validate_road_turn_angles(&[b, junction, new_branch])?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-pub(crate) fn validate_road_segment_angles(
-    centerline: &[DVec3],
-    max_degrees: f64,
-) -> Result<(), RoadCenterlineRuleError> {
-    let max_degrees = max_degrees.clamp(0.0, 89.9);
-    for segment in centerline.windows(2) {
-        let delta = segment[1] - segment[0];
-        let horizontal = delta.truncate().length();
-        let vertical = delta.z.abs();
-        if horizontal < 1e-9 {
-            if vertical < 1e-9 {
-                continue;
-            }
-            return Err(RoadCenterlineRuleError::SegmentTooSteep {
-                maximum_degrees: max_degrees,
-                actual_degrees: 90.0,
-            });
-        }
-
-        let angle_degrees = vertical.atan2(horizontal).to_degrees();
-        if angle_degrees > max_degrees + 1e-6 {
-            return Err(RoadCenterlineRuleError::SegmentTooSteep {
-                maximum_degrees: max_degrees,
-                actual_degrees: angle_degrees,
-            });
-        }
-    }
-
-    Ok(())
-}
-
-fn road_point_is_junction(point: DVec3, document: &Document) -> bool {
-    document.objects().iter().any(|object| {
-        let Object::Road { centerline, .. } = object else {
-            return false;
-        };
-        if centerline.len() < 2 {
-            return false;
-        }
-
-        if centerline
-            .iter()
-            .any(|vertex| points_coincident(vertex.pos, point))
-        {
-            return true;
-        }
-
-        centerline
-            .windows(2)
-            .any(|segment| point_on_segment_3d(point, segment[0].pos, segment[1].pos))
-    })
-}
-
-fn point_on_segment_3d(point: DVec3, a: DVec3, b: DVec3) -> bool {
-    let ab = b - a;
-    let len_sq = ab.length_squared();
-    if len_sq < 1e-10 {
-        return points_coincident(point, a);
-    }
-    let t = (point - a).dot(ab) / len_sq;
-    if !(1e-6..=1.0 - 1e-6).contains(&t) {
-        return false;
-    }
-    points_coincident(point, a + ab * t)
-}
-
-fn point_horiz_distance_from(
-    from: DVec3,
-    toward: DVec3,
-    distance: f64,
-    z: f64,
-) -> Result<DVec3, RoadCenterlineRuleError> {
-    let delta = toward.truncate() - from.truncate();
-    let len = delta.length();
-    if len < 1e-9 {
-        return Err(RoadCenterlineRuleError::DegenerateSegment);
-    }
-    if len + 1e-9 < distance {
-        return Err(RoadCenterlineRuleError::SegmentTooShort {
-            required: distance,
-            actual: len,
-        });
-    }
-    let xy = from.truncate() + delta / len * distance;
-    Ok(DVec3::new(xy.x, xy.y, z))
-}
-
-fn segment_is_inclined(a: DVec3, b: DVec3) -> bool {
-    (b.z - a.z).abs() > 1e-6
-}
-
-fn horizontal_distance(a: DVec3, b: DVec3) -> f64 {
-    (b.truncate() - a.truncate()).length()
-}
+pub(crate) const ROAD_INTERSECTION_FLAT_CLEARANCE_M: f64 = 25.0;
 
 pub(crate) fn points_coincident(a: DVec3, b: DVec3) -> bool {
-    (a - b).length_squared() < 1e-8
+    crate::model::kernel::points_coincident_3d(a, b)
 }
 
 /// Signed area of a polygon (XY plane only). Positive = CCW, negative = CW.
@@ -719,102 +312,154 @@ pub(crate) fn offset_side_from_cursor(
     }
 }
 
-/// Ray-casting point-in-polygon test on the XY plane.
+/// Point-in-polygon test on the XY plane. Points on the boundary (within
+/// `kernel::XY_TOL`) count as inside; use [`crate::model::kernel::point_in_polygon`]
+/// directly when the boundary case needs explicit handling.
 pub(crate) fn point_in_polygon_xy(point: DVec2, verts: &[DVec3]) -> bool {
-    let n = verts.len();
-    let mut inside = false;
-    let mut j = n - 1;
-    for i in 0..n {
-        let (xi, yi) = (verts[i].x, verts[i].y);
-        let (xj, yj) = (verts[j].x, verts[j].y);
-        if ((yi > point.y) != (yj > point.y))
-            && (point.x < (xj - xi) * (point.y - yi) / (yj - yi) + xi)
-        {
-            inside = !inside;
-        }
-        j = i;
-    }
-    inside
+    !matches!(
+        crate::model::kernel::point_in_polygon(point, verts.iter().map(|v| v.truncate())),
+        crate::model::kernel::PolyContainment::Outside
+    )
 }
 
 /// Check if segment AB strictly intersects segment CD (not at shared endpoints).
 /// Returns the intersection point and its parameter along AB if found.
 fn seg_seg_intersection_2d(a: DVec2, b: DVec2, c: DVec2, d: DVec2) -> Option<(DVec2, f64)> {
-    let r = b - a;
-    let s = d - c;
-    let denom = r.x * s.y - r.y * s.x;
-    if denom.abs() < 1e-10 {
-        return None; // Parallel or collinear
-    }
-    let t = ((c.x - a.x) * s.y - (c.y - a.y) * s.x) / denom;
-    let u = ((c.x - a.x) * r.y - (c.y - a.y) * r.x) / denom;
-    const EPS: f64 = 1e-8;
-    if t > EPS && t < 1.0 - EPS && u > EPS && u < 1.0 - EPS {
-        Some((a + t * r, t))
-    } else {
-        None
+    match crate::model::kernel::segment_segment(a, b, c, d) {
+        crate::model::kernel::SegSeg::Crossing { point, t, .. } => Some((point, t)),
+        _ => None,
     }
 }
 
 /// Remove self-intersections from a closed polygon offset result (XY plane).
 ///
 /// When an inward offset is too large for a sharp corner the adjacent edges
-/// fold back and cross, creating a small loop. This function splits the polygon
-/// at each crossing, retains the loop with the greater XY area, and repeats
-/// until no crossings remain.
+/// fold back and cross, creating a small loop. Keeps the loop with the
+/// greatest XY area (the polygon body); see `split_self_intersection_loops`
+/// for callers that want the discarded lobes too.
 pub(crate) fn remove_self_intersections(verts: Vec<DVec3>) -> Vec<DVec3> {
     if verts.len() < 4 {
         return verts;
     }
-    let mut pts = verts;
+    split_self_intersection_loops(verts)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
 
-    let max_passes = pts.len() * pts.len();
-    for _ in 0..max_passes {
-        let n = pts.len();
-        if n < 3 {
-            break;
-        }
-        let mut found = false;
-        'search: for i in 0..n {
-            let a = pts[i].truncate();
-            let b = pts[(i + 1) % n].truncate();
-            // Only check edges that are non-adjacent to edge i→(i+1).
-            let j_end = if i == 0 { n - 1 } else { n };
-            for j in (i + 2)..j_end {
-                let c = pts[j].truncate();
-                let d = pts[(j + 1) % n].truncate();
-                if let Some((intersection_xy, t)) = seg_seg_intersection_2d(a, b, c, d) {
-                    let intersection_z = pts[i].z + t * (pts[(i + 1) % n].z - pts[i].z);
-                    let intersection =
-                        DVec3::new(intersection_xy.x, intersection_xy.y, intersection_z);
+/// Split a closed ring at its self-crossings into simple loops, largest
+/// XY area first, in a single sweep.
+///
+/// All pairwise edge crossings are collected once (`kernel::segment_segment`
+/// `Crossing`s only — endpoint touches don't split), inserted along their
+/// edges, then loops are peeled with a stack: when the ring returns to a
+/// crossing it has already passed, the vertices in between form one loop.
+/// Interleaved (non-nested) crossing pairs — which offset fold-backs don't
+/// produce — degrade gracefully: the orphaned occurrence stays a pass-through
+/// vertex. Each crossing keeps the Z interpolated on its own edge.
+pub(crate) fn split_self_intersection_loops(verts: Vec<DVec3>) -> Vec<Vec<DVec3>> {
+    let n = verts.len();
+    if n < 4 {
+        return vec![verts];
+    }
 
-                    let mut first = Vec::with_capacity(j - i + 1);
-                    first.push(intersection);
-                    first.extend_from_slice(&pts[i + 1..=j]);
-
-                    let mut second = Vec::with_capacity(n - (j - i) + 1);
-                    second.push(intersection);
-                    second.extend_from_slice(&pts[j + 1..]);
-                    second.extend_from_slice(&pts[..=i]);
-
-                    let first_area = signed_area_xy(&first).abs();
-                    let second_area = signed_area_xy(&second).abs();
-                    pts = if first_area > second_area {
-                        first
+    // Crossing occurrences per edge: (t along edge, pair id, position).
+    let mut edge_hits: Vec<Vec<(f64, usize, DVec3)>> = vec![Vec::new(); n];
+    let mut pair_count = 0usize;
+    for i in 0..n {
+        let a = verts[i];
+        let b = verts[(i + 1) % n];
+        // Adjacent edges share an endpoint and cannot properly cross.
+        let j_end = if i == 0 { n - 1 } else { n };
+        for j in (i + 2)..j_end {
+            let c = verts[j];
+            let d = verts[(j + 1) % n];
+            if let Some((point, t)) =
+                seg_seg_intersection_2d(a.truncate(), b.truncate(), c.truncate(), d.truncate())
+            {
+                let u = {
+                    let cd = (d - c).truncate();
+                    let len_sq = cd.length_squared();
+                    if len_sq > 0.0 {
+                        (point - c.truncate()).dot(cd) / len_sq
                     } else {
-                        second
-                    };
-                    found = true;
-                    break 'search;
-                }
+                        0.0
+                    }
+                };
+                let z_i = a.z + t * (b.z - a.z);
+                let z_j = c.z + u * (d.z - c.z);
+                edge_hits[i].push((t, pair_count, DVec3::new(point.x, point.y, z_i)));
+                edge_hits[j].push((u, pair_count, DVec3::new(point.x, point.y, z_j)));
+                pair_count += 1;
             }
         }
-        if !found {
-            break;
+    }
+    if pair_count == 0 {
+        return vec![verts];
+    }
+
+    // The ring with crossings inserted in edge order.
+    struct AugVertex {
+        pos: DVec3,
+        pair: Option<usize>,
+    }
+    let mut ring: Vec<AugVertex> = Vec::with_capacity(n + 2 * pair_count);
+    for (i, hits) in edge_hits.iter_mut().enumerate() {
+        ring.push(AugVertex {
+            pos: verts[i],
+            pair: None,
+        });
+        hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for &(_, pair, pos) in hits.iter() {
+            ring.push(AugVertex {
+                pos,
+                pair: Some(pair),
+            });
         }
     }
 
-    pts
+    // Peel loops: `open[pair]` is the stack index of the crossing's first
+    // occurrence; the second occurrence closes the loop between them.
+    let mut open: Vec<Option<usize>> = vec![None; pair_count];
+    let mut stack: Vec<AugVertex> = Vec::with_capacity(ring.len());
+    let mut loops: Vec<Vec<DVec3>> = Vec::new();
+    for vertex in ring {
+        let Some(pair) = vertex.pair else {
+            stack.push(vertex);
+            continue;
+        };
+        match open[pair] {
+            None => {
+                open[pair] = Some(stack.len());
+                stack.push(vertex);
+            }
+            Some(start) => {
+                let peeled: Vec<DVec3> = stack.drain(start..).map(|v| v.pos).collect();
+                // Crossings whose partner left with the peeled loop become
+                // plain vertices when the partner shows up later.
+                for slot in open.iter_mut() {
+                    if slot.is_some_and(|index| index >= start) {
+                        *slot = None;
+                    }
+                }
+                if peeled.len() >= 3 {
+                    loops.push(peeled);
+                }
+                // The ring passes through the crossing once more.
+                stack.push(AugVertex {
+                    pos: vertex.pos,
+                    pair: None,
+                });
+            }
+        }
+    }
+    let remainder: Vec<DVec3> = stack.into_iter().map(|v| v.pos).collect();
+    if remainder.len() >= 3 {
+        loops.push(remainder);
+    }
+
+    loops.sort_by(|a, b| signed_area_xy(b).abs().total_cmp(&signed_area_xy(a).abs()));
+    loops
 }
 
 fn compute_offset_centroid(verts: &[DVec3], closed: bool, signed_dist: f64) -> DVec2 {
@@ -829,6 +474,73 @@ fn compute_offset_centroid(verts: &[DVec3], closed: bool, signed_dist: f64) -> D
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bow_tie_splits_into_both_triangles_and_keeps_one() {
+        const E: f64 = 476_000.0;
+        const N: f64 = 7_654_000.0;
+        let ring = vec![
+            DVec3::new(E, N, 100.0),
+            DVec3::new(E + 10.0, N, 100.0),
+            DVec3::new(E, N + 10.0, 100.0),
+            DVec3::new(E + 10.0, N + 10.0, 100.0),
+        ];
+        let loops = split_self_intersection_loops(ring.clone());
+        assert_eq!(loops.len(), 2, "bow-tie must peel into two triangles");
+        for a_loop in &loops {
+            assert!((signed_area_xy(a_loop).abs() - 25.0).abs() < 1e-6);
+            // Each triangle contains the crossing point (E+5, N+5).
+            assert!(
+                a_loop
+                    .iter()
+                    .any(|v| (v.truncate() - DVec2::new(E + 5.0, N + 5.0)).length() < 1e-6)
+            );
+        }
+        let kept = remove_self_intersections(ring);
+        assert_eq!(kept.len(), 3);
+    }
+
+    #[test]
+    fn double_pinch_peels_all_three_lobes_largest_first() {
+        // A comb-shaped ring whose base edge is crossed twice: two 5x4 body
+        // lobes above y=0 and one 5x2 pocket below. The old implementation
+        // silently discarded all but one lobe.
+        let ring = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(15.0, 0.0, 0.0),
+            DVec3::new(15.0, 4.0, 0.0),
+            DVec3::new(10.0, 4.0, 0.0),
+            DVec3::new(10.0, -2.0, 0.0),
+            DVec3::new(5.0, -2.0, 0.0),
+            DVec3::new(5.0, 4.0, 0.0),
+            DVec3::new(0.0, 4.0, 0.0),
+        ];
+        let loops = split_self_intersection_loops(ring.clone());
+        let areas: Vec<f64> = loops
+            .iter()
+            .map(|a_loop| signed_area_xy(a_loop).abs())
+            .collect();
+        assert_eq!(areas.len(), 3, "expected two body lobes and the pocket");
+        assert!((areas[0] - 20.0).abs() < 1e-9);
+        assert!((areas[1] - 20.0).abs() < 1e-9);
+        assert!((areas[2] - 10.0).abs() < 1e-9);
+
+        let kept = remove_self_intersections(ring);
+        assert!((signed_area_xy(&kept).abs() - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn simple_ring_passes_through_unsplit() {
+        let ring = vec![
+            DVec3::new(0.0, 0.0, 5.0),
+            DVec3::new(10.0, 0.0, 5.0),
+            DVec3::new(10.0, 10.0, 5.0),
+            DVec3::new(0.0, 10.0, 5.0),
+        ];
+        let loops = split_self_intersection_loops(ring.clone());
+        assert_eq!(loops.len(), 1);
+        assert_eq!(loops[0], ring);
+    }
 
     #[test]
     fn project_to_rl_lands_flat_and_recedes_as_ramp_descends() {

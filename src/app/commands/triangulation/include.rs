@@ -254,7 +254,7 @@ pub(super) fn append_geo_polygon_as_triangles(
     source_triangle: [tri00t::Vertex; 3],
     output: &mut Vec<[tri00t::Vertex; 3]>,
 ) {
-    let mut flat = Vec::new();
+    let mut flat: Vec<[f64; 2]> = Vec::new();
     let mut holes = Vec::new();
 
     let exterior: Vec<_> = polygon.exterior().coords().copied().collect();
@@ -264,20 +264,18 @@ pub(super) fn append_geo_polygon_as_triangles(
         if ring.len().saturating_sub(1) < 3 {
             continue;
         }
-        holes.push(flat.len() / 2);
+        holes.push(flat.len());
         append_ring_coords(&ring, &mut flat);
     }
 
-    if flat.len() < 6 {
+    if flat.len() < 3 {
         return;
     }
-    let Ok(indices) = earcutr::earcut(&flat, &holes, 2) else {
-        return;
-    };
+    let mut indices: Vec<usize> = Vec::new();
+    earcut::Earcut::new().earcut(flat.iter().copied(), &holes, &mut indices);
     for triangle_indices in indices.chunks_exact(3) {
         let make_vertex = |index: usize| {
-            let x = flat[index * 2];
-            let y = flat[index * 2 + 1];
+            let [x, y] = flat[index];
             tri00t::Vertex::new(x, y, bary_z(x, y, source_triangle))
         };
         output.push([
@@ -288,10 +286,10 @@ pub(super) fn append_geo_polygon_as_triangles(
     }
 }
 
-pub(super) fn append_ring_coords(ring: &[geo::Coord<f64>], flat: &mut Vec<f64>) {
+pub(super) fn append_ring_coords(ring: &[geo::Coord<f64>], flat: &mut Vec<[f64; 2]>) {
     let count = ring.len().saturating_sub(1);
     for coord in &ring[..count] {
-        flat.extend([coord.x, coord.y]);
+        flat.push([coord.x, coord.y]);
     }
 }
 

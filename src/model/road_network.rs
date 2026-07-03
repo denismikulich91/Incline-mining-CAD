@@ -1,0 +1,2795 @@
+//! Road network resolution — the single source of truth for derived road
+//! geometry.
+//!
+//! `resolve` turns stored road centerlines (user intent) plus an optional
+//! in-progress "ghost" road into final side-line geometry. Nothing here
+//! mutates the document: junction pads, flat approaches and camber blending
+//! are derived per resolution. Every point shared between two roads (a
+//! junction corner, a seam miter) is computed exactly once by the node that
+//! owns it, so side lines meet exactly by construction.
+
+use glam::{DVec2, DVec3};
+
+use super::{Document, Object, ObjectId, RoadShape, geometry::ROAD_INTERSECTION_FLAT_CLEARANCE_M};
+
+/// XY tolerance for two points to be considered the same network node.
+const NODE_XY_EPS: f64 = crate::model::kernel::XY_TOL;
+/// Max elevation difference for coincident-in-plan points to join one node.
+/// Larger separations are crossings (overpass) and do not connect.
+const NODE_Z_TOL: f64 = crate::model::kernel::Z_TOL;
+/// Two ports within this many degrees of a straight continuation form a seam
+/// (settings blend across) rather than a junction pad (camber runs off to 0).
+const SEAM_STRAIGHT_TOL_DEGREES: f64 = 15.0;
+/// Length over which width and camber blend across a seam between roads with
+/// different settings.
+const SEAM_BLEND_M: f64 = 10.0;
+/// Mitre guard for corner points and vertex offsets, in multiples of the
+/// half-width; beyond this corners are bevelled.
+const MITER_LIMIT: f64 = 4.0;
+/// The junction pad solve assumes every edge runs straight (at its port
+/// heading) through its approach zone. An edge whose centerline deviates
+/// laterally by more than this fraction of the half-width inside the zone is
+/// compromised: pad corners would land off the road and the side-line trim
+/// would drop the wrong samples.
+const JUNCTION_APPROACH_DEVIATION_FRAC: f64 = 0.25;
+/// Minimum interior angle at any centerline vertex or between any two
+/// branches meeting at a node.
+pub(crate) const MIN_ROAD_TURN_ANGLE_DEGREES: f64 = 30.0;
+
+/// Identifies the source of an edge: a committed document object or the
+/// in-progress preview road.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum RoadKey {
+    Object(ObjectId),
+    Ghost,
+}
+
+/// The road currently being drawn (pending stroke + cursor), resolved exactly
+/// like a committed road so the preview IS the committed result.
+pub(crate) struct GhostRoad {
+    pub(crate) centerline: Vec<DVec3>,
+    pub(crate) width: f64,
+    pub(crate) camber_degrees: f64,
+    pub(crate) shape: RoadShape,
+}
+
+/// Final resolved geometry for one span of road between two network nodes.
+/// `left`/`right` are ready to draw: trimmed to shared junction corners, with
+/// camber blending and junction flattening already applied.
+pub(crate) struct EdgeGeom {
+    pub(crate) road: RoadKey,
+    pub(crate) center: Vec<DVec3>,
+    pub(crate) left: Vec<DVec3>,
+    pub(crate) right: Vec<DVec3>,
+    /// Draw a square cap across the road at the start/end (dead ends only).
+    pub(crate) start_cap: bool,
+    pub(crate) end_cap: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct ResolvedNetwork {
+    pub(crate) edges: Vec<EdgeGeom>,
+    /// Committed roads whose resolved geometry depends on the ghost: the
+    /// transitive closure of node-sharing from the ghost. A ghost junction
+    /// reshapes an edge's centre profile, and that edge in turn feeds the pad
+    /// solve at the road's other nodes, so influence propagates road-to-road.
+    pub(crate) ghost_affected: Vec<ObjectId>,
+}
+
+impl ResolvedNetwork {
+    pub(crate) fn edges_for(&self, key: RoadKey) -> impl Iterator<Item = &EdgeGeom> {
+        self.edges.iter().filter(move |edge| edge.road == key)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal working types
+// ---------------------------------------------------------------------------
+
+struct SourceRoad {
+    key: RoadKey,
+    centerline: Vec<DVec3>,
+    width: f64,
+    /// Cross slope of each side as rise per unit half-width (signed; negative
+    /// drops the edge below the centerline).
+    slope_left: f64,
+    slope_right: f64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NodeKind {
+    DeadEnd,
+    Seam,
+    Junction,
+    Attachment,
+}
+
+struct Node {
+    pos: DVec3,
+    z_sum: f64,
+    z_count: usize,
+    /// Segments of attached polylines near this node (side rays terminate on
+    /// these).
+    attachment_segments: Vec<[DVec3; 2]>,
+    /// Roads this node captures beyond the default `NODE_XY_EPS`: when a
+    /// crossing snaps onto a centerline vertex, the non-vertex road passes up
+    /// to this far from the node in plan and must still be cut here.
+    capture_roads: Vec<(usize, f64)>,
+    ports: Vec<Port>,
+    kind: NodeKind,
+}
+
+impl Node {
+    fn new(pos: DVec3) -> Self {
+        Self {
+            pos,
+            z_sum: pos.z,
+            z_count: 1,
+            attachment_segments: Vec::new(),
+            capture_roads: Vec::new(),
+            ports: Vec::new(),
+            kind: NodeKind::DeadEnd,
+        }
+    }
+}
+
+struct Port {
+    edge: usize,
+    at_start: bool,
+    heading: DVec2,
+    /// Half-width the edge presents at this node (after seam averaging).
+    hw: f64,
+    /// Flat/blend clearance along the edge from this node.
+    clearance: f64,
+    /// Cross slope of the side that lies counter-clockwise / clockwise of the
+    /// outward heading, at the node (after seam averaging).
+    slope_ccw: f64,
+    slope_cw: f64,
+}
+
+/// Per-end blending parameters applied while sampling an edge cross-section.
+#[derive(Clone, Copy)]
+struct EndBlend {
+    zone: f64,
+    target_w: f64,
+    target_slope_left: f64,
+    target_slope_right: f64,
+    /// Flatten the centerline to `flatten_z` over `zone` (junctions and
+    /// attachments).
+    flatten_z: Option<f64>,
+}
+
+struct WorkEdge {
+    road: usize,
+    start_node: usize,
+    end_node: usize,
+    center: Vec<DVec3>,
+    left: Vec<DVec3>,
+    right: Vec<DVec3>,
+    start_blend: EndBlend,
+    end_blend: EndBlend,
+    compromised: Option<(f64, f64)>,
+    /// The centerline bends away from a straight junction approach inside the
+    /// approach zone: `(required straight run, lateral deviation)`.
+    bend_compromised: Option<(f64, f64)>,
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+pub(crate) fn resolve(document: &Document, ghost: Option<&GhostRoad>) -> ResolvedNetwork {
+    let Some(Topology {
+        sources,
+        nodes,
+        mut edges,
+    }) = build_topology(document, ghost)
+    else {
+        return ResolvedNetwork::default();
+    };
+    sample_cross_sections(&sources, &mut edges);
+    solve_junctions(&mut edges, &nodes);
+    for edge in &mut edges {
+        remove_side_line_folds(&mut edge.left);
+        remove_side_line_folds(&mut edge.right);
+    }
+    let ghost_affected = ghost_affected_roads(&sources, &nodes, &edges);
+
+    ResolvedNetwork {
+        ghost_affected,
+        edges: edges
+            .into_iter()
+            .enumerate()
+            .map(|(index, edge)| {
+                let start_cap = nodes[edge.start_node].kind == NodeKind::DeadEnd
+                    && port_of(&nodes[edge.start_node], index, true).is_some();
+                let end_cap = nodes[edge.end_node].kind == NodeKind::DeadEnd
+                    && port_of(&nodes[edge.end_node], index, false).is_some();
+                EdgeGeom {
+                    road: sources[edge.road].key,
+                    center: edge.center,
+                    left: edge.left,
+                    right: edge.right,
+                    start_cap,
+                    end_cap,
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Committed roads reachable from the ghost through shared nodes (fixpoint
+/// over the node/port graph). Sorted by id so callers can compare sets cheaply.
+fn ghost_affected_roads(
+    sources: &[SourceRoad],
+    nodes: &[Node],
+    edges: &[WorkEdge],
+) -> Vec<ObjectId> {
+    if !sources.iter().any(|source| source.key == RoadKey::Ghost) {
+        return Vec::new();
+    }
+    let mut affected: Vec<bool> = sources
+        .iter()
+        .map(|source| source.key == RoadKey::Ghost)
+        .collect();
+    loop {
+        let mut changed = false;
+        for node in nodes {
+            if !node
+                .ports
+                .iter()
+                .any(|port| affected[edges[port.edge].road])
+            {
+                continue;
+            }
+            for port in &node.ports {
+                let road = edges[port.edge].road;
+                if !affected[road] {
+                    affected[road] = true;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut out: Vec<ObjectId> = sources
+        .iter()
+        .zip(&affected)
+        .filter(|&(_, &is_affected)| is_affected)
+        .filter_map(|(source, _)| match source.key {
+            RoadKey::Object(id) => Some(id),
+            RoadKey::Ghost => None,
+        })
+        .collect();
+    out.sort_unstable_by_key(|id| id.0);
+    out
+}
+
+struct Topology {
+    sources: Vec<SourceRoad>,
+    nodes: Vec<Node>,
+    edges: Vec<WorkEdge>,
+}
+
+/// Stages 0–4: everything up to (and including) center profiles — enough to
+/// know the network's nodes, ports and clearance conflicts, without paying
+/// for cross-section sampling and junction solving.
+fn build_topology(document: &Document, ghost: Option<&GhostRoad>) -> Option<Topology> {
+    let sources = collect_sources(document, ghost);
+    if sources.is_empty() {
+        return None;
+    }
+    let mut nodes = build_nodes(&sources, document);
+    let mut edges = split_roads_at_nodes(&sources, &mut nodes);
+    classify_nodes(&mut nodes);
+    build_center_profiles(&sources, &mut edges, &nodes);
+    Some(Topology {
+        sources,
+        nodes,
+        edges,
+    })
+}
+
+fn port_of(node: &Node, edge: usize, at_start: bool) -> Option<&Port> {
+    node.ports
+        .iter()
+        .find(|port| port.edge == edge && port.at_start == at_start)
+}
+
+// ---------------------------------------------------------------------------
+// Placement validation
+// ---------------------------------------------------------------------------
+
+/// A road-placement rule the ghost stroke violates. Produced by
+/// [`validate_ghost`]; `Display` gives the user-facing message.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum RoadRuleViolation {
+    SegmentTooSteep {
+        maximum_degrees: f64,
+        actual_degrees: f64,
+    },
+    TurnTooSharp {
+        minimum_degrees: f64,
+        actual_degrees: f64,
+    },
+    /// A network edge the stroke creates cannot fit a required flat zone
+    /// (junction approach or grade-break pocket).
+    ClearanceTooTight {
+        required: f64,
+        actual: f64,
+    },
+    /// A network edge the stroke creates bends inside a junction's
+    /// straight-approach zone (e.g. crossing another road just before its
+    /// corner), which the junction pad geometry cannot represent.
+    TurnTooCloseToJunction {
+        required_straight: f64,
+        deviation: f64,
+    },
+    DegenerateSegment,
+}
+
+impl std::fmt::Display for RoadRuleViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RoadRuleViolation::SegmentTooSteep {
+                maximum_degrees,
+                actual_degrees,
+            } => write!(
+                f,
+                "Road segment angle is too steep: {actual_degrees:.1}° exceeds the {maximum_degrees:.1}° maximum"
+            ),
+            RoadRuleViolation::TurnTooSharp {
+                minimum_degrees,
+                actual_degrees,
+            } => write!(
+                f,
+                "Road turn is too sharp: {actual_degrees:.1}° is below the {minimum_degrees:.0}° minimum"
+            ),
+            RoadRuleViolation::ClearanceTooTight { required, actual } => write!(
+                f,
+                "Not enough room for {required:.1} m of flat approach: {actual:.2} m available"
+            ),
+            RoadRuleViolation::TurnTooCloseToJunction {
+                required_straight,
+                deviation,
+            } => write!(
+                f,
+                "Road turns too close to a junction: it deviates {deviation:.1} m from a straight approach within the {required_straight:.1} m junction zone"
+            ),
+            RoadRuleViolation::DegenerateSegment => f.write_str("Road segment is too short"),
+        }
+    }
+}
+
+/// Check every placement rule against the ghost stroke: per-segment grade,
+/// turn angles (both at its own vertices and between branches at every node
+/// it joins — including mid-segment crossings), and flat-zone clearances.
+/// Edges that were already compromised without the ghost (legacy documents)
+/// are grandfathered; only newly created conflicts are refused.
+pub(crate) fn validate_ghost(
+    document: &Document,
+    ghost: &GhostRoad,
+    max_grade_degrees: f64,
+) -> Result<(), RoadRuleViolation> {
+    validate_centerline_grades(&ghost.centerline, max_grade_degrees)?;
+    validate_centerline_turns(&ghost.centerline)?;
+
+    let Some(topology) = build_topology(document, Some(ghost)) else {
+        return Ok(());
+    };
+    let is_ghost = |edge: usize| topology.sources[topology.edges[edge].road].key == RoadKey::Ghost;
+
+    // Interior angle between two branches is the angle between their outward
+    // headings; only pairs involving the ghost are checked so legacy
+    // geometry is never retroactively refused.
+    for node in &topology.nodes {
+        for (i, a) in node.ports.iter().enumerate() {
+            for b in &node.ports[i + 1..] {
+                if !is_ghost(a.edge) && !is_ghost(b.edge) {
+                    continue;
+                }
+                let angle_degrees = a
+                    .heading
+                    .dot(b.heading)
+                    .clamp(-1.0, 1.0)
+                    .acos()
+                    .to_degrees();
+                if angle_degrees + 1e-6 < MIN_ROAD_TURN_ANGLE_DEGREES {
+                    return Err(RoadRuleViolation::TurnTooSharp {
+                        minimum_degrees: MIN_ROAD_TURN_ANGLE_DEGREES,
+                        actual_degrees: angle_degrees,
+                    });
+                }
+            }
+        }
+    }
+
+    let preexisting: std::collections::HashSet<RoadKey> = build_topology(document, None)
+        .map(|t| {
+            t.edges
+                .iter()
+                .filter(|edge| edge.compromised.is_some() || edge.bend_compromised.is_some())
+                .map(|edge| t.sources[edge.road].key)
+                .collect()
+        })
+        .unwrap_or_default();
+    for edge in &topology.edges {
+        if preexisting.contains(&topology.sources[edge.road].key) {
+            continue;
+        }
+        if let Some((required, actual)) = edge.compromised {
+            return Err(RoadRuleViolation::ClearanceTooTight { required, actual });
+        }
+        if let Some((required_straight, deviation)) = edge.bend_compromised {
+            return Err(RoadRuleViolation::TurnTooCloseToJunction {
+                required_straight,
+                deviation,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_centerline_grades(
+    centerline: &[DVec3],
+    max_degrees: f64,
+) -> Result<(), RoadRuleViolation> {
+    let max_degrees = max_degrees.clamp(0.0, 89.9);
+    for segment in centerline.windows(2) {
+        let delta = segment[1] - segment[0];
+        let horizontal = delta.truncate().length();
+        let vertical = delta.z.abs();
+        if horizontal < 1e-9 {
+            if vertical < 1e-9 {
+                continue;
+            }
+            return Err(RoadRuleViolation::SegmentTooSteep {
+                maximum_degrees: max_degrees,
+                actual_degrees: 90.0,
+            });
+        }
+        let angle_degrees = vertical.atan2(horizontal).to_degrees();
+        if angle_degrees > max_degrees + 1e-6 {
+            return Err(RoadRuleViolation::SegmentTooSteep {
+                maximum_degrees: max_degrees,
+                actual_degrees: angle_degrees,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_centerline_turns(centerline: &[DVec3]) -> Result<(), RoadRuleViolation> {
+    for window in centerline.windows(3) {
+        let a = window[0].truncate() - window[1].truncate();
+        let b = window[2].truncate() - window[1].truncate();
+        let (a_len, b_len) = (a.length(), b.length());
+        if a_len < 1e-9 || b_len < 1e-9 {
+            return Err(RoadRuleViolation::DegenerateSegment);
+        }
+        let angle_degrees = (a.dot(b) / (a_len * b_len))
+            .clamp(-1.0, 1.0)
+            .acos()
+            .to_degrees();
+        if angle_degrees + 1e-6 < MIN_ROAD_TURN_ANGLE_DEGREES {
+            return Err(RoadRuleViolation::TurnTooSharp {
+                minimum_degrees: MIN_ROAD_TURN_ANGLE_DEGREES,
+                actual_degrees: angle_degrees,
+            });
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Stage 0 — collect sources
+// ---------------------------------------------------------------------------
+
+fn collect_sources(document: &Document, ghost: Option<&GhostRoad>) -> Vec<SourceRoad> {
+    let mut sources = Vec::new();
+    for object in document.objects() {
+        if let Object::Road {
+            id,
+            centerline,
+            width,
+            camber_degrees,
+            shape,
+            ..
+        } = object
+        {
+            let pts = dedup_centerline(centerline.iter().map(|v| v.pos));
+            if pts.len() >= 2 {
+                let (slope_left, slope_right) = side_slopes(*shape, *camber_degrees);
+                sources.push(SourceRoad {
+                    key: RoadKey::Object(*id),
+                    centerline: pts,
+                    width: *width,
+                    slope_left,
+                    slope_right,
+                });
+            }
+        }
+    }
+    if let Some(ghost) = ghost {
+        let pts = dedup_centerline(ghost.centerline.iter().copied());
+        if pts.len() >= 2 {
+            let (slope_left, slope_right) = side_slopes(ghost.shape, ghost.camber_degrees);
+            sources.push(SourceRoad {
+                key: RoadKey::Ghost,
+                centerline: pts,
+                width: ghost.width,
+                slope_left,
+                slope_right,
+            });
+        }
+    }
+    sources
+}
+
+fn side_slopes(shape: RoadShape, camber_degrees: f64) -> (f64, f64) {
+    // z_offsets is signed per side for a unit half-width of `width / 2`;
+    // normalize to rise-per-unit-half-width so widths can vary along an edge.
+    let probe_width = 2.0;
+    let (left, right) = shape.z_offsets(probe_width, camber_degrees);
+    (left, right)
+}
+
+fn dedup_centerline(points: impl Iterator<Item = DVec3>) -> Vec<DVec3> {
+    let mut out: Vec<DVec3> = Vec::new();
+    for point in points {
+        if out
+            .last()
+            .is_some_and(|last| (last.truncate() - point.truncate()).length() < 1e-6)
+        {
+            continue;
+        }
+        out.push(point);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Stage 1 — node discovery
+// ---------------------------------------------------------------------------
+
+fn build_nodes(sources: &[SourceRoad], document: &Document) -> Vec<Node> {
+    let mut nodes: Vec<Node> = Vec::new();
+
+    let find_or_create = |nodes: &mut Vec<Node>, pos: DVec3| -> usize {
+        for (index, node) in nodes.iter_mut().enumerate() {
+            if (node.pos.truncate() - pos.truncate()).length() < NODE_XY_EPS
+                && (node.pos.z - pos.z).abs() <= NODE_Z_TOL
+            {
+                node.z_sum += pos.z;
+                node.z_count += 1;
+                node.pos.z = node.z_sum / node.z_count as f64;
+                return index;
+            }
+        }
+        nodes.push(Node::new(pos));
+        nodes.len() - 1
+    };
+
+    // Road endpoints. An endpoint landing inside another road's body (within
+    // the wider half-width of its stored centerline in plan, at compatible
+    // elevation) attaches to that road. Roads draw from *derived*
+    // centerlines, which deviate from the stored ones near junction reroutes,
+    // so a stroke ended on the drawn road can sit slightly off the stored
+    // line; demanding exact contact would leave it dangling. The node goes
+    // onto the target centerline and captures the ending road so the split
+    // stage still terminates it here.
+    let mut attachments: Vec<(usize, usize, DVec2, f64)> = Vec::new();
+    for (road_index, source) in sources.iter().enumerate() {
+        let first = source.centerline[0];
+        let last = *source.centerline.last().expect("len >= 2");
+        for endpoint in [first, last] {
+            let Some((pos, dist, other)) = attach_endpoint_target(sources, road_index, endpoint)
+            else {
+                find_or_create(&mut nodes, endpoint);
+                continue;
+            };
+            let node = find_or_create(&mut nodes, pos);
+            nodes[node]
+                .capture_roads
+                .push((road_index, dist + NODE_XY_EPS));
+            let tol = (source.width * 0.5).max(sources[other].width * 0.5);
+            attachments.push((road_index, other, pos.truncate(), tol));
+        }
+    }
+
+    // Mid-segment crossings between roads at compatible elevation form real
+    // junction nodes (X-junctions). Incompatible elevations are overpasses
+    // and stay disconnected.
+    //
+    // A crossing landing within the wider road's half-width of an interior
+    // centerline vertex snaps onto that vertex: a stroke drawn "through a
+    // corner" almost never hits the vertex exactly, and a node just before
+    // the bend leaves the bend inside the junction pad where the pad solve
+    // (which assumes straight approaches) breaks down. Snapping instead
+    // yields the clean shared-vertex junction the stroke intends. The
+    // non-vertex road no longer passes through the node exactly, so the node
+    // records a capture radius for it and the split stage cuts it at its
+    // closest approach.
+    let mut crossing_positions: Vec<(DVec3, Option<(usize, f64)>)> = Vec::new();
+    for (ai, a) in sources.iter().enumerate() {
+        for (bi, b) in sources.iter().enumerate().skip(ai + 1) {
+            for seg_a in a.centerline.windows(2) {
+                for seg_b in b.centerline.windows(2) {
+                    let Some((xy, ta, tb)) = segment_intersection_xy(
+                        seg_a[0].truncate(),
+                        seg_a[1].truncate(),
+                        seg_b[0].truncate(),
+                        seg_b[1].truncate(),
+                    ) else {
+                        continue;
+                    };
+                    let za = seg_a[0].z + (seg_a[1].z - seg_a[0].z) * ta;
+                    let zb = seg_b[0].z + (seg_b[1].z - seg_b[0].z) * tb;
+                    if (za - zb).abs() > NODE_Z_TOL {
+                        continue;
+                    }
+                    // A crossing right at an endpoint attachment between the
+                    // same two roads IS the attachment: the endpoint rests a
+                    // hair past the centerline it attached to. Skip it so the
+                    // junction stays one node instead of gaining a sliver
+                    // twin (whose near-parallel ports read as a 0° turn).
+                    if attachments.iter().any(|&(x, y, pos, tol)| {
+                        ((x == ai && y == bi) || (x == bi && y == ai)) && (xy - pos).length() < tol
+                    }) {
+                        continue;
+                    }
+                    let cross = DVec3::new(xy.x, xy.y, (za + zb) * 0.5);
+                    let snap_tol = a.width.max(b.width) * 0.5;
+                    // Nearest interior vertex of either road within the snap
+                    // tolerance, at compatible elevation. `other` is the road
+                    // the node must capture at its closest approach.
+                    let mut snapped: Option<(f64, DVec3, usize, [DVec3; 2])> = None;
+                    for (road, other, other_seg) in [(a, bi, seg_b), (b, ai, seg_a)] {
+                        let interior = &road.centerline[1..road.centerline.len() - 1];
+                        for vertex in interior {
+                            let d = (vertex.truncate() - xy).length();
+                            if d < snap_tol
+                                && (vertex.z - cross.z).abs() <= NODE_Z_TOL
+                                && snapped.is_none_or(|(best, ..)| d < best)
+                            {
+                                snapped = Some((d, *vertex, other, [other_seg[0], other_seg[1]]));
+                            }
+                        }
+                    }
+                    match snapped {
+                        Some((_, vertex, other, seg)) => {
+                            let (proj, _) = crate::model::kernel::project_onto_segment(
+                                vertex.truncate(),
+                                seg[0].truncate(),
+                                seg[1].truncate(),
+                            );
+                            let capture = (proj - vertex.truncate()).length() + NODE_XY_EPS;
+                            crossing_positions.push((vertex, Some((other, capture))));
+                        }
+                        None => crossing_positions.push((cross, None)),
+                    }
+                }
+            }
+        }
+    }
+    for (pos, capture) in crossing_positions {
+        let index = find_or_create(&mut nodes, pos);
+        if let Some(capture) = capture {
+            nodes[index].capture_roads.push(capture);
+        }
+    }
+
+    // Interior vertices resting on another road also form junctions: the
+    // draw tool lets a stroke snap onto a road and continue past it, which
+    // leaves the contact as a mid-stroke vertex rather than an endpoint or a
+    // strict segment crossing.
+    let mut interior_hits: Vec<DVec3> = Vec::new();
+    for (ai, a) in sources.iter().enumerate() {
+        for (vi, v) in a.centerline.iter().enumerate() {
+            if vi == 0 || vi + 1 == a.centerline.len() {
+                continue;
+            }
+            let touches_other_road = sources.iter().enumerate().any(|(bi, b)| {
+                if ai == bi {
+                    return false;
+                }
+                b.centerline.iter().any(|w| {
+                    (w.truncate() - v.truncate()).length() < NODE_XY_EPS
+                        && (w.z - v.z).abs() <= NODE_Z_TOL
+                }) || b
+                    .centerline
+                    .windows(2)
+                    .any(|seg| point_on_segment_xy(*v, seg[0], seg[1]))
+            });
+            if touches_other_road {
+                interior_hits.push(*v);
+            }
+        }
+    }
+    for pos in interior_hits {
+        find_or_create(&mut nodes, pos);
+    }
+
+    // Polyline attachments: nodes sitting on (or at a vertex of) a polyline
+    // pick up the nearby polyline segments as their termination boundary.
+    for node in &mut nodes {
+        let junction = node.pos;
+        let mut attached = Vec::new();
+        for object in document.objects() {
+            let Object::Polyline { verts, closed, .. } = object else {
+                continue;
+            };
+            if verts.len() < 2 {
+                continue;
+            }
+            let mut segments: Vec<[DVec3; 2]> =
+                verts.windows(2).map(|w| [w[0].pos, w[1].pos]).collect();
+            if *closed && verts.len() >= 3 {
+                segments.push([verts.last().expect("non-empty").pos, verts[0].pos]);
+            }
+            let touching: Vec<usize> = (0..segments.len())
+                .filter(|&i| {
+                    let [a, b] = segments[i];
+                    point_on_segment_xy(junction, a, b)
+                        || points_coincident_3d(junction, a)
+                        || points_coincident_3d(junction, b)
+                })
+                .collect();
+            if touching.is_empty() {
+                continue;
+            }
+            // Include immediate neighbours so side rays landing just past a
+            // kink at the attachment point still find a boundary.
+            let mut wanted: Vec<usize> = Vec::new();
+            for &i in &touching {
+                for candidate in [i.wrapping_sub(1), i, i + 1] {
+                    let index = if *closed {
+                        candidate % segments.len()
+                    } else if candidate < segments.len() {
+                        candidate
+                    } else {
+                        continue;
+                    };
+                    if !wanted.contains(&index) {
+                        wanted.push(index);
+                    }
+                }
+            }
+            attached.extend(wanted.into_iter().map(|i| segments[i]));
+        }
+        node.attachment_segments = attached;
+    }
+
+    nodes
+}
+
+/// Closest point on another road's stored centerline for a road endpoint
+/// that rests inside that road's body but off its centerline. `None` when
+/// the endpoint is a plain dead end or already sits exactly on a centerline
+/// (which the strict node/split tolerances handle as before).
+fn attach_endpoint_target(
+    sources: &[SourceRoad],
+    road_index: usize,
+    endpoint: DVec3,
+) -> Option<(DVec3, f64, usize)> {
+    let own_hw = sources[road_index].width * 0.5;
+    let mut best: Option<(DVec3, f64, usize)> = None;
+    for (other_index, other) in sources.iter().enumerate() {
+        if other_index == road_index {
+            continue;
+        }
+        let tol = own_hw.max(other.width * 0.5);
+        for seg in other.centerline.windows(2) {
+            let (proj, t) = crate::model::kernel::project_onto_segment(
+                endpoint.truncate(),
+                seg[0].truncate(),
+                seg[1].truncate(),
+            );
+            let dist = (proj - endpoint.truncate()).length();
+            if dist >= tol {
+                continue;
+            }
+            // The endpoint may carry a junction-flattened z from snapping to
+            // the drawn line, hence the doubled window (mirrors the capture
+            // cuts in `split_roads_at_nodes`).
+            let z = seg[0].z + (seg[1].z - seg[0].z) * t;
+            if (z - endpoint.z).abs() > 2.0 * NODE_Z_TOL {
+                continue;
+            }
+            if best.is_none_or(|(_, d, _)| dist < d) {
+                best = Some((DVec3::new(proj.x, proj.y, z), dist, other_index));
+            }
+        }
+    }
+    // Exactly on a line already: keep the endpoint itself as the node.
+    best.filter(|&(_, dist, _)| dist > NODE_XY_EPS)
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2 — split roads into edges at nodes
+// ---------------------------------------------------------------------------
+
+fn split_roads_at_nodes(sources: &[SourceRoad], nodes: &mut [Node]) -> Vec<WorkEdge> {
+    let mut edges: Vec<WorkEdge> = Vec::new();
+
+    // A captured cut sits off the stored centerline (endpoint attach, corner
+    // snap). The bend back onto the stored line is confined to this run from
+    // the node so the rest of the road stays exactly where drawn, instead of
+    // the whole edge pivoting. It must clear every junction approach zone:
+    // clearance + hw / tan(min-branch-half-angle) bounds the zone.
+    let max_hw = sources
+        .iter()
+        .map(|source| source.width * 0.5)
+        .fold(0.0_f64, f64::max);
+    let reroute_len = ROAD_INTERSECTION_FLAT_CLEARANCE_M
+        + max_hw / (MIN_ROAD_TURN_ANGLE_DEGREES * 0.5).to_radians().tan()
+        + 1.0;
+
+    for (road_index, source) in sources.iter().enumerate() {
+        let pts = &source.centerline;
+        let stations = cumulative_stations(pts);
+        let total = *stations.last().expect("len >= 2");
+
+        // Cut list: (station, node index, plan deviation from the line).
+        let mut cuts: Vec<(f64, usize, f64)> = Vec::new();
+        for (node_index, node) in nodes.iter().enumerate() {
+            let node_xy = node.pos.truncate();
+            // Vertex coincidences.
+            for (i, p) in pts.iter().enumerate() {
+                if (p.truncate() - node_xy).length() < NODE_XY_EPS
+                    && (p.z - node.pos.z).abs() <= NODE_Z_TOL
+                {
+                    push_cut(&mut cuts, stations[i], node_index, 0.0);
+                }
+            }
+            // Interior segment coincidences. A node that snapped onto another
+            // road's vertex captures this road within its recorded radius
+            // (cut at the closest approach); everywhere else the strict
+            // point-on-line tolerance applies. The z window widens with a
+            // loose capture because the crossing and the vertex may each sit
+            // up to NODE_Z_TOL from the interpolated z.
+            let capture = node
+                .capture_roads
+                .iter()
+                .filter(|&&(road, _)| road == road_index)
+                .map(|&(_, radius)| radius)
+                .fold(NODE_XY_EPS, f64::max);
+            let z_tol = if capture > NODE_XY_EPS {
+                2.0 * NODE_Z_TOL
+            } else {
+                NODE_Z_TOL
+            };
+            for i in 0..pts.len() - 1 {
+                let a = pts[i];
+                let b = pts[i + 1];
+                let ab = b.truncate() - a.truncate();
+                let len_sq = ab.length_squared();
+                if len_sq < 1e-12 {
+                    continue;
+                }
+                let t = (node_xy - a.truncate()).dot(ab) / len_sq;
+                if !(1e-6..=1.0 - 1e-6).contains(&t) {
+                    continue;
+                }
+                let deviation = (a.truncate() + ab * t - node_xy).length();
+                if deviation >= capture {
+                    continue;
+                }
+                let z = a.z + (b.z - a.z) * t;
+                if (z - node.pos.z).abs() > z_tol {
+                    continue;
+                }
+                push_cut(
+                    &mut cuts,
+                    stations[i] + len_sq.sqrt() * t,
+                    node_index,
+                    deviation,
+                );
+            }
+        }
+        cuts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        cuts.dedup_by(|a, b| (a.0 - b.0).abs() < NODE_XY_EPS && a.1 == b.1);
+
+        let anchor_deviation = |nodes: &[Node], node: usize, p: DVec3| {
+            (p.truncate() - nodes[node].pos.truncate()).length()
+        };
+
+        // Endpoints resting off-line (attached into another road's body) have
+        // no exact cut; anchor the start on its node so the guards below can
+        // complete the ends. Everything else always has endpoint cuts.
+        if cuts.is_empty() {
+            let node = nearest_node(nodes, pts[0]);
+            cuts.push((0.0, node, anchor_deviation(nodes, node, pts[0])));
+        }
+
+        // Merge cuts that landed at nearly the same station (duplicate nodes
+        // from crossings right at endpoints): keep the first.
+        cuts.dedup_by(|a, b| (a.0 - b.0).abs() < NODE_XY_EPS);
+        if cuts.first().map(|c| c.0) != Some(0.0) {
+            // Guard: ensure the start station cut exists.
+            if let Some(first) = cuts.first().copied()
+                && first.0 > NODE_XY_EPS
+            {
+                // Off-line attach (or fall back to the nearest node at start).
+                let node = nearest_node(nodes, pts[0]);
+                cuts.insert(0, (0.0, node, anchor_deviation(nodes, node, pts[0])));
+            }
+        }
+        if cuts.last().map(|c| (c.0 - total).abs() < NODE_XY_EPS) != Some(true) {
+            let last = *pts.last().expect("len >= 2");
+            let node = nearest_node(nodes, last);
+            cuts.push((total, node, anchor_deviation(nodes, node, last)));
+        }
+
+        // Build one edge per consecutive cut pair.
+        for pair in cuts.windows(2) {
+            let (s0, n0, dev0) = pair[0];
+            let (s1, n1, dev1) = pair[1];
+            if s1 - s0 < NODE_XY_EPS {
+                continue;
+            }
+            // Rejoin points for off-line cuts: the derived center runs
+            // node → stored line at `reroute_len` → exact stored geometry,
+            // instead of pivoting the whole edge onto the node.
+            let mut kinks: Vec<f64> = Vec::new();
+            if dev0 > NODE_XY_EPS {
+                kinks.push(s0 + reroute_len);
+            }
+            if dev1 > NODE_XY_EPS {
+                kinks.push(s1 - reroute_len);
+            }
+            kinks.retain(|&s| s > s0 + NODE_XY_EPS && s < s1 - NODE_XY_EPS);
+            if kinks.len() == 2 && kinks[0] >= kinks[1] {
+                kinks.clear(); // reroutes overlap: fall back to the pivot
+            }
+            let mut waypoints: Vec<(f64, DVec3)> = kinks
+                .into_iter()
+                .map(|s| (s, point_at_station(pts, &stations, s)))
+                .collect();
+            for (i, p) in pts.iter().enumerate() {
+                if stations[i] > s0 + NODE_XY_EPS && stations[i] < s1 - NODE_XY_EPS {
+                    waypoints.push((stations[i], *p));
+                } else if stations[i] >= s1 - NODE_XY_EPS {
+                    break;
+                }
+            }
+            waypoints.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let mut center = vec![nodes[n0].pos];
+            center.extend(waypoints.into_iter().map(|(_, p)| p));
+            center.push(nodes[n1].pos);
+            let center = dedup_centerline(center.into_iter());
+            if center.len() < 2 {
+                continue;
+            }
+            let edge_index = edges.len();
+            let heading_start = polyline_heading(&center, true);
+            let heading_end = polyline_heading(&center, false);
+            let hw = sources[road_index].width * 0.5;
+            nodes[n0].ports.push(Port {
+                edge: edge_index,
+                at_start: true,
+                heading: heading_start,
+                hw,
+                clearance: ROAD_INTERSECTION_FLAT_CLEARANCE_M,
+                // start port: ccw of outward heading = edge's left side.
+                slope_ccw: source.slope_left,
+                slope_cw: source.slope_right,
+            });
+            nodes[n1].ports.push(Port {
+                edge: edge_index,
+                at_start: false,
+                heading: heading_end,
+                hw,
+                clearance: ROAD_INTERSECTION_FLAT_CLEARANCE_M,
+                // end port: ccw of outward heading = edge's right side.
+                slope_ccw: source.slope_right,
+                slope_cw: source.slope_left,
+            });
+            edges.push(WorkEdge {
+                road: road_index,
+                start_node: n0,
+                end_node: n1,
+                center,
+                left: Vec::new(),
+                right: Vec::new(),
+                start_blend: NEUTRAL_BLEND,
+                end_blend: NEUTRAL_BLEND,
+                compromised: None,
+                bend_compromised: None,
+            });
+        }
+    }
+
+    edges
+}
+
+const NEUTRAL_BLEND: EndBlend = EndBlend {
+    zone: 0.0,
+    target_w: 0.0,
+    target_slope_left: 0.0,
+    target_slope_right: 0.0,
+    flatten_z: None,
+};
+
+fn push_cut(cuts: &mut Vec<(f64, usize, f64)>, station: f64, node: usize, deviation: f64) {
+    if !cuts
+        .iter()
+        .any(|&(s, n, _)| n == node && (s - station).abs() < NODE_XY_EPS)
+    {
+        cuts.push((station, node, deviation));
+    }
+}
+
+/// Point on the stored polyline at `station` (linear in 3D).
+fn point_at_station(pts: &[DVec3], stations: &[f64], station: f64) -> DVec3 {
+    for i in 0..pts.len() - 1 {
+        if station <= stations[i + 1] {
+            let seg = stations[i + 1] - stations[i];
+            if seg < 1e-9 {
+                continue;
+            }
+            let t = ((station - stations[i]) / seg).clamp(0.0, 1.0);
+            return pts[i] + (pts[i + 1] - pts[i]) * t;
+        }
+    }
+    *pts.last().expect("non-empty")
+}
+
+fn nearest_node(nodes: &[Node], pos: DVec3) -> usize {
+    nodes
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (a.pos - pos)
+                .length_squared()
+                .partial_cmp(&(b.pos - pos).length_squared())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+fn polyline_heading(pts: &[DVec3], from_start: bool) -> DVec2 {
+    if from_start {
+        for p in pts.iter().skip(1) {
+            let d = p.truncate() - pts[0].truncate();
+            if d.length() > 1e-9 {
+                return d.normalize();
+            }
+        }
+    } else {
+        let last = pts.last().expect("non-empty").truncate();
+        for p in pts.iter().rev().skip(1) {
+            let d = p.truncate() - last;
+            if d.length() > 1e-9 {
+                return d.normalize();
+            }
+        }
+    }
+    DVec2::X
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3 — classify nodes, compute clearances and end blends
+// ---------------------------------------------------------------------------
+
+fn classify_nodes(nodes: &mut [Node]) {
+    let seam_dot = -(SEAM_STRAIGHT_TOL_DEGREES.to_radians().cos());
+
+    for node in nodes.iter_mut() {
+        node.kind = match node.ports.len() {
+            0 => continue,
+            1 => {
+                if node.attachment_segments.is_empty() {
+                    NodeKind::DeadEnd
+                } else {
+                    NodeKind::Attachment
+                }
+            }
+            2 => {
+                let dot = node.ports[0].heading.dot(node.ports[1].heading);
+                if dot <= seam_dot && node.attachment_segments.is_empty() {
+                    NodeKind::Seam
+                } else {
+                    NodeKind::Junction
+                }
+            }
+            _ => NodeKind::Junction,
+        };
+
+        match node.kind {
+            NodeKind::Junction => {
+                // Flat clearance per port grows so edge miters have room:
+                // base + half-width / tan(θ/2) against every other branch.
+                let headings: Vec<(DVec2, f64)> = node
+                    .ports
+                    .iter()
+                    .map(|port| (port.heading, port.hw))
+                    .collect();
+                for port in &mut node.ports {
+                    let mut clearance = ROAD_INTERSECTION_FLAT_CLEARANCE_M;
+                    for &(other_heading, other_hw) in &headings {
+                        let dot = port.heading.dot(other_heading).clamp(-1.0, 1.0);
+                        if dot > 1.0 - 1e-9 {
+                            continue; // itself / parallel duplicate
+                        }
+                        let angle = dot.acos();
+                        // Minimum turn rule keeps θ/2 ≥ 15°; floor the tangent
+                        // accordingly so bad inputs can't explode the zone.
+                        let tangent = (angle * 0.5).tan().max(15f64.to_radians().tan());
+                        clearance = clearance.max(
+                            ROAD_INTERSECTION_FLAT_CLEARANCE_M + port.hw.max(other_hw) / tangent,
+                        );
+                    }
+                    port.clearance = clearance;
+                }
+            }
+            NodeKind::Seam => {
+                // X2/X3: both roads meet the seam at averaged width and
+                // camber, blending back to their own settings over the runoff.
+                let hw = (node.ports[0].hw + node.ports[1].hw) * 0.5;
+                let shared_a = (node.ports[0].slope_ccw + node.ports[1].slope_cw) * 0.5;
+                let shared_b = (node.ports[0].slope_cw + node.ports[1].slope_ccw) * 0.5;
+                for (index, port) in node.ports.iter_mut().enumerate() {
+                    port.hw = hw;
+                    port.clearance = SEAM_BLEND_M;
+                    if index == 0 {
+                        port.slope_ccw = shared_a;
+                        port.slope_cw = shared_b;
+                    } else {
+                        port.slope_ccw = shared_b;
+                        port.slope_cw = shared_a;
+                    }
+                }
+            }
+            NodeKind::Attachment => {
+                for port in &mut node.ports {
+                    port.clearance = ROAD_INTERSECTION_FLAT_CLEARANCE_M;
+                    port.slope_ccw = 0.0;
+                    port.slope_cw = 0.0;
+                }
+            }
+            NodeKind::DeadEnd => {}
+        }
+    }
+}
+
+fn end_blend_for(node: &Node, port: &Port, source: &SourceRoad) -> EndBlend {
+    // Port slopes are expressed ccw/cw of the outward heading; convert back
+    // to the edge's left/right of travel.
+    let (slope_left, slope_right) = if port.at_start {
+        (port.slope_ccw, port.slope_cw)
+    } else {
+        (port.slope_cw, port.slope_ccw)
+    };
+    match node.kind {
+        NodeKind::DeadEnd => NEUTRAL_BLEND,
+        NodeKind::Seam => EndBlend {
+            zone: port.clearance,
+            target_w: port.hw * 2.0,
+            target_slope_left: slope_left,
+            target_slope_right: slope_right,
+            flatten_z: None,
+        },
+        NodeKind::Junction | NodeKind::Attachment => EndBlend {
+            zone: port.clearance,
+            target_w: source.width,
+            target_slope_left: 0.0,
+            target_slope_right: 0.0,
+            flatten_z: Some(node.pos.z),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4 — center profile (junction flattening + grade-break flats)
+// ---------------------------------------------------------------------------
+
+fn build_center_profiles(sources: &[SourceRoad], edges: &mut [WorkEdge], nodes: &[Node]) {
+    for (edge_index, edge) in edges.iter_mut().enumerate() {
+        let source = &sources[edge.road];
+        let start_node = &nodes[edge.start_node];
+        let end_node = &nodes[edge.end_node];
+        edge.start_blend = port_of(start_node, edge_index, true)
+            .map(|port| end_blend_for(start_node, port, source))
+            .unwrap_or(NEUTRAL_BLEND);
+        edge.end_blend = port_of(end_node, edge_index, false)
+            .map(|port| end_blend_for(end_node, port, source))
+            .unwrap_or(NEUTRAL_BLEND);
+
+        let total = polyline_length_xy(&edge.center);
+        // If both flat zones can't fit, shrink them proportionally so they
+        // meet in the middle instead of fighting (placement validation should
+        // normally prevent this).
+        let mut zone_start = edge.start_blend.zone;
+        let mut zone_end = edge.end_blend.zone;
+        let need = zone_start + zone_end;
+        if need > total && need > 1e-9 {
+            let scale = total / need;
+            zone_start *= scale;
+            zone_end *= scale;
+            edge.start_blend.zone = zone_start;
+            edge.end_blend.zone = zone_end;
+            // Seam blends shrinking is cosmetic; junction/attachment flat
+            // zones shrinking means the flat approach cannot fit.
+            if edge.start_blend.flatten_z.is_some() || edge.end_blend.flatten_z.is_some() {
+                mark_compromised(&mut edge.compromised, need, total);
+            }
+        }
+
+        if let Some(z) = edge.start_blend.flatten_z {
+            flatten_from_start(&mut edge.center, z, zone_start);
+        }
+        if let Some(z) = edge.end_blend.flatten_z {
+            edge.center.reverse();
+            flatten_from_start(&mut edge.center, z, zone_end);
+            edge.center.reverse();
+        }
+
+        if let Some((required, actual)) = insert_grade_break_flats(&mut edge.center) {
+            mark_compromised(&mut edge.compromised, required, actual);
+        }
+
+        // Extra stations through blend zones so camber/width transitions are
+        // sampled smoothly rather than jumping between sparse vertices.
+        for fraction in [1.0 / 3.0, 2.0 / 3.0, 1.0] {
+            if zone_start > 1e-9 {
+                insert_station_at(&mut edge.center, zone_start * fraction);
+            }
+            if zone_end > 1e-9 {
+                let total = polyline_length_xy(&edge.center);
+                insert_station_at(&mut edge.center, total - zone_end * fraction);
+            }
+        }
+
+        // Junction/attachment approaches must be straight in plan: the pad
+        // solve trusts the port heading for the whole zone, so a bend inside
+        // it puts pad corners off the road (crossing side lines). Crossings
+        // that land near a vertex snap onto it in `build_nodes`; anything
+        // still bending here is refused via `validate_ghost`.
+        for (at_start, node, blend) in [
+            (true, start_node, edge.start_blend),
+            (false, end_node, edge.end_blend),
+        ] {
+            if blend.flatten_z.is_none() {
+                continue;
+            }
+            let Some(port) = port_of(node, edge_index, at_start) else {
+                continue;
+            };
+            let deviation =
+                straight_approach_deviation(&edge.center, port.heading, blend.zone, at_start);
+            if deviation > port.hw * JUNCTION_APPROACH_DEVIATION_FRAC
+                && edge
+                    .bend_compromised
+                    .is_none_or(|(_, worst)| deviation > worst)
+            {
+                edge.bend_compromised = Some((blend.zone, deviation));
+            }
+        }
+    }
+}
+
+/// Worst lateral deviation of the centerline from a straight run along
+/// `heading` within `zone` metres of the edge's node end. Doubling back past
+/// the node counts as deviation too.
+fn straight_approach_deviation(
+    center: &[DVec3],
+    heading: DVec2,
+    zone: f64,
+    from_start: bool,
+) -> f64 {
+    if center.len() < 2 || zone <= 1e-9 {
+        return 0.0;
+    }
+    let pts: Vec<DVec2> = if from_start {
+        center.iter().map(|p| p.truncate()).collect()
+    } else {
+        center.iter().rev().map(|p| p.truncate()).collect()
+    };
+    let node = pts[0];
+    let mut worst = 0.0_f64;
+    let mut travelled = 0.0;
+    for pair in pts.windows(2) {
+        travelled += (pair[1] - pair[0]).length();
+        let rel = pair[1] - node;
+        let along = rel.dot(heading);
+        let perp = (rel - heading * along).length();
+        worst = worst.max(perp).max(-along);
+        if travelled >= zone - 1e-9 {
+            break;
+        }
+    }
+    worst
+}
+
+/// Force z = `node_z` over the first `clearance` metres, inserting a boundary
+/// vertex where the flat ends so the grade change has a station.
+fn flatten_from_start(pts: &mut Vec<DVec3>, node_z: f64, clearance: f64) {
+    if pts.len() < 2 || clearance < 1e-9 {
+        if let Some(first) = pts.first_mut() {
+            first.z = node_z;
+        }
+        return;
+    }
+    pts[0].z = node_z;
+    let mut travelled = 0.0;
+    let mut i = 0;
+    while i + 1 < pts.len() {
+        let a = pts[i];
+        let b = pts[i + 1];
+        let seg = (b.truncate() - a.truncate()).length();
+        if seg < 1e-9 {
+            pts[i + 1].z = node_z;
+            i += 1;
+            continue;
+        }
+        let remaining = clearance - travelled;
+        if seg <= remaining + 1e-9 {
+            pts[i + 1].z = node_z;
+            travelled += seg;
+            i += 1;
+            continue;
+        }
+        let t = remaining / seg;
+        if t > 1e-6 {
+            let xy = a.truncate() + (b.truncate() - a.truncate()) * t;
+            pts.insert(i + 1, DVec3::new(xy.x, xy.y, node_z));
+        }
+        return;
+    }
+}
+
+/// Every inclined segment reserves flat clearance at both ends, carved out of
+/// the segment itself — unless an adjacent flat run already provides it
+/// (which makes this idempotent over already-flattened legacy centerlines).
+///
+/// Returns the worst `(required, available)` shortfall when a needed pocket
+/// did not fit, so the edge can be flagged compromised.
+fn insert_grade_break_flats(pts: &mut Vec<DVec3>) -> Option<(f64, f64)> {
+    let clearance = ROAD_INTERSECTION_FLAT_CLEARANCE_M;
+    let original = pts.clone();
+    let mut shortfall: Option<(f64, f64)> = None;
+    let mut out: Vec<DVec3> = vec![original[0]];
+    for i in 0..original.len() - 1 {
+        let a = original[i];
+        let b = original[i + 1];
+        let seg = (b.truncate() - a.truncate()).length();
+        if (b.z - a.z).abs() > 1e-6 && seg > 1e-9 {
+            let dir = (b.truncate() - a.truncate()) / seg;
+            // A turn vertex must sit in a flat pocket unconditionally: a
+            // mitered corner on a grade skews the side lines, because the
+            // miter points are displaced in plan while carrying the vertex z.
+            // Straight grade breaks only need the flat if an adjacent run
+            // doesn't already provide it (keeps re-resolution of legacy
+            // centerlines that stored their flats stable).
+            let need_before =
+                is_turn_vertex(&original, i) || flat_run_before(&original, i) < clearance - 1e-6;
+            let need_after = is_turn_vertex(&original, i + 1)
+                || flat_run_after(&original, i + 1) < clearance - 1e-6;
+            let da = if need_before { clearance } else { 0.0 };
+            let db = if need_after { clearance } else { 0.0 };
+            if da + db < seg - 1e-6 {
+                if need_before {
+                    let xy = a.truncate() + dir * da;
+                    out.push(DVec3::new(xy.x, xy.y, a.z));
+                }
+                if need_after {
+                    let xy = b.truncate() - dir * db;
+                    out.push(DVec3::new(xy.x, xy.y, b.z));
+                }
+            } else if da + db > 0.0 {
+                mark_compromised(&mut shortfall, da + db, seg);
+            }
+        }
+        out.push(b);
+    }
+    *pts = out;
+    shortfall
+}
+
+/// Record a flat-zone shortfall, keeping the worst deficit seen so far.
+fn mark_compromised(slot: &mut Option<(f64, f64)>, required: f64, actual: f64) {
+    let worse = slot.is_none_or(|(r, a)| required - actual > r - a);
+    if worse {
+        *slot = Some((required, actual));
+    }
+}
+
+/// True when the centerline changes heading at `vertex` by more than a
+/// negligible amount (0.5°), i.e. the vertex is a corner rather than a
+/// collinear grade break.
+fn is_turn_vertex(pts: &[DVec3], vertex: usize) -> bool {
+    if vertex == 0 || vertex + 1 >= pts.len() {
+        return false;
+    }
+    let (Some(dir_in), Some(dir_out)) = (
+        seg_dir(pts[vertex - 1], pts[vertex]),
+        seg_dir(pts[vertex], pts[vertex + 1]),
+    ) else {
+        return false;
+    };
+    dir_in.dot(dir_out) < 0.5_f64.to_radians().cos()
+}
+
+fn flat_run_before(pts: &[DVec3], vertex: usize) -> f64 {
+    let mut run = 0.0;
+    let mut i = vertex;
+    while i > 0 {
+        let a = pts[i - 1];
+        let b = pts[i];
+        if (b.z - a.z).abs() > 1e-6 {
+            break;
+        }
+        run += (b.truncate() - a.truncate()).length();
+        i -= 1;
+    }
+    run
+}
+
+fn flat_run_after(pts: &[DVec3], vertex: usize) -> f64 {
+    let mut run = 0.0;
+    let mut i = vertex;
+    while i + 1 < pts.len() {
+        let a = pts[i];
+        let b = pts[i + 1];
+        if (b.z - a.z).abs() > 1e-6 {
+            break;
+        }
+        run += (b.truncate() - a.truncate()).length();
+        i += 1;
+    }
+    run
+}
+
+fn insert_station_at(pts: &mut Vec<DVec3>, station: f64) {
+    if station <= 1e-6 {
+        return;
+    }
+    let mut travelled = 0.0;
+    for i in 0..pts.len() - 1 {
+        let a = pts[i];
+        let b = pts[i + 1];
+        let seg = (b.truncate() - a.truncate()).length();
+        if seg < 1e-9 {
+            continue;
+        }
+        if travelled + seg >= station - 1e-6 {
+            let t = ((station - travelled) / seg).clamp(0.0, 1.0);
+            if t > 1e-4 && t < 1.0 - 1e-4 {
+                pts.insert(i + 1, a + (b - a) * t);
+            }
+            return;
+        }
+        travelled += seg;
+    }
+}
+
+fn cumulative_stations(pts: &[DVec3]) -> Vec<f64> {
+    let mut stations = Vec::with_capacity(pts.len());
+    let mut s = 0.0;
+    stations.push(0.0);
+    for pair in pts.windows(2) {
+        s += (pair[1].truncate() - pair[0].truncate()).length();
+        stations.push(s);
+    }
+    stations
+}
+
+fn polyline_length_xy(pts: &[DVec3]) -> f64 {
+    pts.windows(2)
+        .map(|pair| (pair[1].truncate() - pair[0].truncate()).length())
+        .sum()
+}
+
+// ---------------------------------------------------------------------------
+// Stage 5 — cross-section sampling
+// ---------------------------------------------------------------------------
+
+fn sample_cross_sections(sources: &[SourceRoad], edges: &mut [WorkEdge]) {
+    for edge in edges.iter_mut() {
+        let source = &sources[edge.road];
+        let pts = &edge.center;
+        let n = pts.len();
+        let stations = cumulative_stations(pts);
+        let total = *stations.last().expect("len >= 2");
+
+        let base_w = source.width;
+        let base_l = source.slope_left;
+        let base_r = source.slope_right;
+        let sb = edge.start_blend;
+        let eb = edge.end_blend;
+        // Neutral blends target the edge's own settings.
+        let (sb_w, sb_l, sb_r) = if sb.zone > 1e-9 {
+            (sb.target_w, sb.target_slope_left, sb.target_slope_right)
+        } else {
+            (base_w, base_l, base_r)
+        };
+        let (eb_w, eb_l, eb_r) = if eb.zone > 1e-9 {
+            (eb.target_w, eb.target_slope_left, eb.target_slope_right)
+        } else {
+            (base_w, base_l, base_r)
+        };
+
+        let mut left = Vec::with_capacity(n);
+        let mut right = Vec::with_capacity(n);
+        for i in 0..n {
+            let s = stations[i];
+            let fs = blend_factor(s, sb.zone);
+            let fe = blend_factor(total - s, eb.zone);
+            let w = base_w + (1.0 - fs) * (sb_w - base_w) + (1.0 - fe) * (eb_w - base_w);
+            let slope_l = base_l + (1.0 - fs) * (sb_l - base_l) + (1.0 - fe) * (eb_l - base_l);
+            let slope_r = base_r + (1.0 - fs) * (sb_r - base_r) + (1.0 - fe) * (eb_r - base_r);
+            let normal = miter_normal(pts, i);
+            let hw = w * 0.5;
+            let c = pts[i];
+            left.push(DVec3::new(
+                c.x + normal.x * hw,
+                c.y + normal.y * hw,
+                c.z + slope_l * hw,
+            ));
+            right.push(DVec3::new(
+                c.x - normal.x * hw,
+                c.y - normal.y * hw,
+                c.z + slope_r * hw,
+            ));
+        }
+        edge.left = left;
+        edge.right = right;
+    }
+}
+
+fn blend_factor(distance_from_end: f64, zone: f64) -> f64 {
+    if zone <= 1e-9 {
+        return 1.0;
+    }
+    let x = (distance_from_end / zone).clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
+
+/// Left-perpendicular offset direction at vertex `i`, miter-scaled so that
+/// offsetting by `hw` along it reproduces the intersection of the two
+/// adjacent offset edges (capped at MITER_LIMIT).
+fn miter_normal(pts: &[DVec3], i: usize) -> DVec2 {
+    let n = pts.len();
+    let dir_in = if i > 0 {
+        seg_dir(pts[i - 1], pts[i])
+    } else {
+        None
+    };
+    let dir_out = if i + 1 < n {
+        seg_dir(pts[i], pts[i + 1])
+    } else {
+        None
+    };
+    match (dir_in, dir_out) {
+        (Some(din), Some(dout)) => {
+            let perp_in = DVec2::new(-din.y, din.x);
+            let perp_out = DVec2::new(-dout.y, dout.x);
+            let bis = perp_in + perp_out;
+            if bis.length() < 1e-9 {
+                return perp_out;
+            }
+            let bis = bis.normalize();
+            // cos of the half-angle between the adjacent edges.
+            let cos_half = bis.dot(perp_out).clamp(1.0 / MITER_LIMIT, 1.0);
+            bis / cos_half
+        }
+        (Some(d), None) | (None, Some(d)) => DVec2::new(-d.y, d.x),
+        (None, None) => DVec2::Y,
+    }
+}
+
+fn seg_dir(a: DVec3, b: DVec3) -> Option<DVec2> {
+    let d = b.truncate() - a.truncate();
+    let len = d.length();
+    (len > 1e-9).then(|| d / len)
+}
+
+// ---------------------------------------------------------------------------
+// Stage 6 — junction solver
+// ---------------------------------------------------------------------------
+
+fn solve_junctions(edges: &mut [WorkEdge], nodes: &[Node]) {
+    for node in nodes.iter() {
+        match node.kind {
+            NodeKind::DeadEnd => {}
+            NodeKind::Attachment => solve_attachment(node, edges),
+            NodeKind::Seam | NodeKind::Junction => solve_pad(node, edges),
+        }
+    }
+}
+
+/// Compute the shared corner between adjacent ports and trim each side line
+/// to it. Corners exist once; both neighbouring edges receive the same value.
+fn solve_pad(node: &Node, edges: &mut [WorkEdge]) {
+    let mut order: Vec<usize> = (0..node.ports.len()).collect();
+    order.sort_by(|&a, &b| {
+        let ha = node.ports[a].heading;
+        let hb = node.ports[b].heading;
+        ha.y.atan2(ha.x)
+            .partial_cmp(&hb.y.atan2(hb.x))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let node_xy = node.pos.truncate();
+    let count = order.len();
+    for k in 0..count {
+        let pi = &node.ports[order[k]];
+        let pj = &node.ports[order[(k + 1) % count]];
+        // Skip the self-pair on single-port pads (shouldn't occur: pads have
+        // ≥ 2 ports), and the duplicate second pair on 2-port nodes is fine —
+        // it computes the other side's corner.
+        if count == 1 {
+            break;
+        }
+        let hi = pi.heading;
+        let hj = pj.heading;
+        let base_i = node_xy + DVec2::new(-hi.y, hi.x) * pi.hw; // ccw side of i
+        let base_j = node_xy + DVec2::new(hj.y, -hj.x) * pj.hw; // cw side of j
+        let max_reach = MITER_LIMIT * 2.0 * pi.hw.max(pj.hw);
+        let corner_xy = intersect_lines(base_i, hi, base_j, hj)
+            .filter(|xy| (*xy - node_xy).length() <= max_reach)
+            .unwrap_or((base_i + base_j) * 0.5);
+
+        let corner_z = match node.kind {
+            // Flat pad plane.
+            NodeKind::Junction => node.pos.z,
+            // Seam: shared cross-slope value on this geometric side.
+            NodeKind::Seam => {
+                let shared = (pi.slope_ccw + pj.slope_cw) * 0.5;
+                let hw = (pi.hw + pj.hw) * 0.5;
+                node.pos.z + shared * hw
+            }
+            _ => node.pos.z,
+        };
+        let corner = DVec3::new(corner_xy.x, corner_xy.y, corner_z);
+
+        let pin_i = matches!(node.kind, NodeKind::Junction);
+        trim_port_side(edges, pi, true, node_xy, corner, pin_i);
+        trim_port_side(edges, pj, false, node_xy, corner, pin_i);
+    }
+}
+
+/// Terminate each side line exactly on the attached polyline: shoot the side
+/// line's own direction at the attachment segments, take the contact with
+/// the attachment's interpolated z, then blend camber/z away from it.
+fn solve_attachment(node: &Node, edges: &mut [WorkEdge]) {
+    let node_xy = node.pos.truncate();
+    for port in &node.ports {
+        for ccw in [true, false] {
+            let hw = port.hw;
+            let h = port.heading;
+            let perp = if ccw {
+                DVec2::new(-h.y, h.x)
+            } else {
+                DVec2::new(h.y, -h.x)
+            };
+            let base = node_xy + perp * hw;
+            let mut best: Option<(f64, DVec3)> = None;
+            for segment in &node.attachment_segments {
+                let a = segment[0].truncate();
+                let b = segment[1].truncate();
+                let Some((xy, t)) = intersect_line_with_segment(base, h, a, b) else {
+                    continue;
+                };
+                let z = segment[0].z + (segment[1].z - segment[0].z) * t;
+                let ray_t = (xy - base).dot(h);
+                if best
+                    .as_ref()
+                    .is_none_or(|(best_t, _)| ray_t.abs() < best_t.abs())
+                {
+                    best = Some((ray_t, DVec3::new(xy.x, xy.y, z)));
+                }
+            }
+            let Some((_, corner)) = best else {
+                continue;
+            };
+            trim_port_side(edges, port, ccw, node_xy, corner, true);
+        }
+    }
+}
+
+/// Replace the node-side terminus of one side line with `corner`, dropping
+/// samples the corner overtakes (inside the pad) and keeping samples beyond
+/// it. Outer corners (negative along) extend the line instead. When `pin_z`
+/// is set, z re-blends from the corner over the port's clearance zone.
+fn trim_port_side(
+    edges: &mut [WorkEdge],
+    port: &Port,
+    ccw: bool,
+    node_xy: DVec2,
+    corner: DVec3,
+    pin_z: bool,
+) {
+    let edge = &mut edges[port.edge];
+    // ccw of outward heading ↔ left of travel at start ports, right at end.
+    let side = match (port.at_start, ccw) {
+        (true, true) | (false, false) => &mut edge.left,
+        (true, false) | (false, true) => &mut edge.right,
+    };
+    if side.len() < 2 {
+        return;
+    }
+    let reversed = !port.at_start;
+    if reversed {
+        side.reverse();
+    }
+
+    let h = port.heading;
+    let along = |p: &DVec3| (p.truncate() - node_xy).dot(h);
+    let corner_along = along(&corner);
+    // First sample the corner does not overtake. Inner corners (positive
+    // along) drop pad-interior samples; outer corners (negative along) keep
+    // everything and the corner extends the line.
+    let keep_from = side
+        .iter()
+        .position(|p| along(p) > corner_along + 1e-6)
+        .unwrap_or(side.len() - 1)
+        .min(side.len() - 1);
+    let mut new_side = Vec::with_capacity(side.len() - keep_from + 1);
+    new_side.push(corner);
+    new_side.extend_from_slice(&side[keep_from..]);
+
+    if pin_z && port.clearance > corner_along + 1e-6 {
+        let zone = port.clearance;
+        for p in new_side.iter_mut().skip(1) {
+            let a = along(p);
+            if a >= zone {
+                break;
+            }
+            let f = blend_factor(a - corner_along, zone - corner_along);
+            p.z = corner.z + (p.z - corner.z) * f;
+        }
+    }
+
+    if reversed {
+        new_side.reverse();
+    }
+    *side = new_side;
+}
+
+/// Remove self-intersection loops from a side line. On the inside of a tight
+/// bend the mitered offset folds back over itself; splitting at the crossing
+/// and dropping the loop leaves a clean pinched corner. Endpoints (shared
+/// junction corners) are never touched.
+fn remove_side_line_folds(pts: &mut Vec<DVec3>) {
+    let max_passes = pts.len();
+    for _ in 0..max_passes {
+        let n = pts.len();
+        if n < 4 {
+            return;
+        }
+        let mut fold: Option<(usize, usize, DVec3)> = None;
+        'search: for i in 0..n - 1 {
+            for j in (i + 2)..(n - 1) {
+                if let Some((xy, t, _)) = segment_intersection_xy(
+                    pts[i].truncate(),
+                    pts[i + 1].truncate(),
+                    pts[j].truncate(),
+                    pts[j + 1].truncate(),
+                ) {
+                    let z = pts[i].z + (pts[i + 1].z - pts[i].z) * t;
+                    fold = Some((i, j, DVec3::new(xy.x, xy.y, z)));
+                    break 'search;
+                }
+            }
+        }
+        let Some((i, j, crossing)) = fold else {
+            return;
+        };
+        pts.splice(i + 1..=j, [crossing]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Small geometry helpers
+// ---------------------------------------------------------------------------
+
+fn intersect_lines(a: DVec2, da: DVec2, b: DVec2, db: DVec2) -> Option<DVec2> {
+    crate::model::kernel::line_line(a, da, b, db)
+}
+
+/// Intersect an unbounded line with a bounded segment; returns the point and
+/// the segment parameter. Accepts touch points up to `XY_TOL` metres past
+/// either segment endpoint.
+fn intersect_line_with_segment(
+    line_point: DVec2,
+    line_dir: DVec2,
+    seg_a: DVec2,
+    seg_b: DVec2,
+) -> Option<(DVec2, f64)> {
+    crate::model::kernel::line_segment(
+        line_point,
+        line_dir,
+        seg_a,
+        seg_b,
+        crate::model::kernel::XY_TOL,
+    )
+}
+
+/// Strict-interior XY intersection of two segments; returns point and both
+/// parameters.
+fn segment_intersection_xy(a: DVec2, b: DVec2, c: DVec2, d: DVec2) -> Option<(DVec2, f64, f64)> {
+    match crate::model::kernel::segment_segment(a, b, c, d) {
+        crate::model::kernel::SegSeg::Crossing { point, t, u } => Some((point, t, u)),
+        _ => None,
+    }
+}
+
+fn point_on_segment_xy(point: DVec3, a: DVec3, b: DVec3) -> bool {
+    crate::model::kernel::point_on_segment_interior_3d(point, a, b)
+}
+
+fn points_coincident_3d(a: DVec3, b: DVec3) -> bool {
+    crate::model::kernel::points_coincident_3d(a, b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ObjectColor, PolyVertex};
+
+    type RoadSpec<'a> = (&'a [(f64, f64, f64)], f64, f64, RoadShape);
+
+    fn road_doc(roads: &[RoadSpec<'_>]) -> Document {
+        let mut doc = Document::new();
+        let layer = doc.add_layer("test".into(), None, [1.0; 4], true, 0.0);
+        for (points, width, camber, shape) in roads {
+            let centerline: Vec<PolyVertex> = points
+                .iter()
+                .map(|&(x, y, z)| PolyVertex::straight(DVec3::new(x, y, z)))
+                .collect();
+            let (width, camber, shape) = (*width, *camber, *shape);
+            doc.add_object(move |id| Object::Road {
+                id,
+                layer,
+                color: ObjectColor::ByLayer,
+                centerline,
+                width,
+                camber_degrees: camber,
+                shape,
+            });
+        }
+        doc
+    }
+
+    fn key(document: &Document, index: usize) -> RoadKey {
+        RoadKey::Object(document.objects()[index].id())
+    }
+
+    fn add_polyline(doc: &mut Document, points: &[(f64, f64, f64)], closed: bool) {
+        let layer = doc.layers()[0].id;
+        let verts: Vec<PolyVertex> = points
+            .iter()
+            .map(|&(x, y, z)| PolyVertex::straight(DVec3::new(x, y, z)))
+            .collect();
+        doc.add_object(move |id| Object::Polyline {
+            id,
+            layer,
+            verts,
+            closed,
+            color: ObjectColor::ByLayer,
+            fill: Default::default(),
+            fill_color: None,
+            line_weight: 1.0,
+        });
+    }
+
+    /// Network invariants: all side-line points finite, and no two side-line
+    /// segments properly cross in plan (touching at shared endpoints is the
+    /// expected corner sharing and is allowed).
+    fn assert_network_valid(network: &ResolvedNetwork) {
+        let mut segments: Vec<[DVec2; 2]> = Vec::new();
+        for edge in &network.edges {
+            for side in [&edge.left, &edge.right] {
+                for point in side.iter() {
+                    assert!(
+                        point.x.is_finite() && point.y.is_finite() && point.z.is_finite(),
+                        "non-finite side-line point {point:?}"
+                    );
+                }
+                for pair in side.windows(2) {
+                    segments.push([pair[0].truncate(), pair[1].truncate()]);
+                }
+            }
+        }
+        for (i, a) in segments.iter().enumerate() {
+            for b in segments.iter().skip(i + 1) {
+                if let Some((point, t, u)) = segment_intersection_xy(a[0], a[1], b[0], b[1]) {
+                    let strict = t > 1e-4 && t < 1.0 - 1e-4 && u > 1e-4 && u < 1.0 - 1e-4;
+                    assert!(
+                        !strict,
+                        "side lines properly cross at {point:?} (t={t}, u={u})"
+                    );
+                }
+            }
+        }
+    }
+
+    fn assert_same_point(a: DVec3, b: DVec3) {
+        assert!(
+            (a - b).length() < 1e-9,
+            "expected shared corner, got {a:?} vs {b:?}"
+        );
+    }
+
+    #[test]
+    fn ghost_affected_propagates_through_shared_nodes_but_not_to_isolated_roads() {
+        // Roads 0-1-2 form a chain of seams; road 3 is isolated. A ghost
+        // crossing road 0 must mark the whole chain (its reshaped edges feed
+        // the pad/seam solves down the line) and leave road 3 alone.
+        let spec = 20.0;
+        let doc = road_doc(&[
+            (
+                &[(0.0, 0.0, 0.0), (100.0, 0.0, 0.0)],
+                spec,
+                2.0,
+                RoadShape::Crown,
+            ),
+            (
+                &[(100.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
+                spec,
+                2.0,
+                RoadShape::Crown,
+            ),
+            (
+                &[(200.0, 0.0, 0.0), (300.0, 0.0, 0.0)],
+                spec,
+                2.0,
+                RoadShape::Crown,
+            ),
+            (
+                &[(0.0, 100.0, 0.0), (100.0, 100.0, 0.0)],
+                spec,
+                2.0,
+                RoadShape::Crown,
+            ),
+        ]);
+        let ghost = GhostRoad {
+            centerline: vec![DVec3::new(50.0, -50.0, 0.0), DVec3::new(50.0, 50.0, 0.0)],
+            width: spec,
+            camber_degrees: 2.0,
+            shape: RoadShape::Crown,
+        };
+
+        assert!(resolve(&doc, None).ghost_affected.is_empty());
+
+        let network = resolve(&doc, Some(&ghost));
+        let ids = |index: usize| match key(&doc, index) {
+            RoadKey::Object(id) => id,
+            RoadKey::Ghost => unreachable!(),
+        };
+        assert_eq!(
+            network.ghost_affected,
+            vec![ids(0), ids(1), ids(2)],
+            "chain reachable from the ghost, isolated road excluded"
+        );
+    }
+
+    #[test]
+    fn e1_straight_seam_shares_exact_corners() {
+        let camber = 2.0_f64;
+        let doc = road_doc(&[
+            (
+                &[(0.0, 0.0, 0.0), (100.0, 0.0, 0.0)],
+                20.0,
+                camber,
+                RoadShape::Crown,
+            ),
+            (
+                &[(100.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
+                20.0,
+                camber,
+                RoadShape::Crown,
+            ),
+        ]);
+        let network = resolve(&doc, None);
+        assert_network_valid(&network);
+
+        let a: Vec<&EdgeGeom> = network.edges_for(key(&doc, 0)).collect();
+        let b: Vec<&EdgeGeom> = network.edges_for(key(&doc, 1)).collect();
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+
+        // Left side of travel is +Y for both; they must share one exact point.
+        let expected_z = -(20.0 / 2.0) * camber.to_radians().tan();
+        let a_end = *a[0].left.last().unwrap();
+        let b_start = b[0].left[0];
+        assert_same_point(a_end, b_start);
+        assert_same_point(a_end, DVec3::new(100.0, 10.0, expected_z));
+        let a_end_r = *a[0].right.last().unwrap();
+        let b_start_r = b[0].right[0];
+        assert_same_point(a_end_r, b_start_r);
+        assert_same_point(a_end_r, DVec3::new(100.0, -10.0, expected_z));
+    }
+
+    #[test]
+    fn e2_elbow_junction_shares_inner_and_outer_corners() {
+        let doc = road_doc(&[
+            (
+                &[(0.0, 0.0, 0.0), (100.0, 0.0, 0.0)],
+                20.0,
+                2.0,
+                RoadShape::Crown,
+            ),
+            (
+                &[(100.0, 0.0, 0.0), (100.0, 100.0, 0.0)],
+                20.0,
+                2.0,
+                RoadShape::Crown,
+            ),
+        ]);
+        let network = resolve(&doc, None);
+        assert_network_valid(&network);
+
+        let a: Vec<&EdgeGeom> = network.edges_for(key(&doc, 0)).collect();
+        let b: Vec<&EdgeGeom> = network.edges_for(key(&doc, 1)).collect();
+        // Inner corner (between the arms), camber runs off to the pad plane.
+        let a_left_end = *a[0].left.last().unwrap();
+        assert_same_point(a_left_end, b[0].left[0]);
+        assert_same_point(a_left_end, DVec3::new(90.0, 10.0, 0.0));
+        // Outer mitred corner.
+        let a_right_end = *a[0].right.last().unwrap();
+        assert_same_point(a_right_end, b[0].right[0]);
+        assert_same_point(a_right_end, DVec3::new(110.0, -10.0, 0.0));
+    }
+
+    #[test]
+    fn e3_t_junction_interrupts_near_side_and_keeps_far_side_continuous() {
+        let doc = road_doc(&[
+            (
+                &[(0.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
+                20.0,
+                2.0,
+                RoadShape::Crown,
+            ),
+            (
+                &[(100.0, 0.0, 0.0), (100.0, 100.0, 0.0)],
+                20.0,
+                2.0,
+                RoadShape::Crown,
+            ),
+        ]);
+        let network = resolve(&doc, None);
+        assert_network_valid(&network);
+
+        let through: Vec<&EdgeGeom> = network.edges_for(key(&doc, 0)).collect();
+        let joining: Vec<&EdgeGeom> = network.edges_for(key(&doc, 1)).collect();
+        assert_eq!(through.len(), 2, "through road splits at the junction");
+        assert_eq!(joining.len(), 1);
+
+        // Identify the two halves by x extent.
+        let (first, second) = if through[0].center[0].x < through[1].center[0].x {
+            (through[0], through[1])
+        } else {
+            (through[1], through[0])
+        };
+
+        // Near side (+Y): interrupted exactly between the two shared corners.
+        let mouth_left = *first.left.last().unwrap();
+        let mouth_right = second.left[0];
+        assert_same_point(mouth_left, DVec3::new(90.0, 10.0, 0.0));
+        assert_same_point(mouth_right, DVec3::new(110.0, 10.0, 0.0));
+        assert_same_point(
+            mouth_left,
+            *joining[0].left.last().map(|_| &joining[0].left[0]).unwrap(),
+        );
+        assert_same_point(mouth_right, joining[0].right[0]);
+
+        // Far side (−Y): both halves share one point — visually continuous.
+        let far_a = *first.right.last().unwrap();
+        let far_b = second.right[0];
+        assert_same_point(far_a, far_b);
+        assert_same_point(far_a, DVec3::new(100.0, -10.0, 0.0));
+    }
+
+    #[test]
+    fn e17_camber_mismatch_blends_across_seam_without_step() {
+        let doc = road_doc(&[
+            (
+                &[(0.0, 0.0, 0.0), (100.0, 0.0, 0.0)],
+                20.0,
+                2.0,
+                RoadShape::Crown,
+            ),
+            (
+                &[(100.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
+                20.0,
+                4.0,
+                RoadShape::CrossFallLeft,
+            ),
+        ]);
+        let network = resolve(&doc, None);
+        assert_network_valid(&network);
+        let a: Vec<&EdgeGeom> = network.edges_for(key(&doc, 0)).collect();
+        let b: Vec<&EdgeGeom> = network.edges_for(key(&doc, 1)).collect();
+        // Shared corners despite different shapes/cambers.
+        assert_same_point(*a[0].left.last().unwrap(), b[0].left[0]);
+        assert_same_point(*a[0].right.last().unwrap(), b[0].right[0]);
+        // Far from the seam each road is at its own full camber.
+        let drop_a = -(10.0) * 2.0_f64.to_radians().tan();
+        assert!((a[0].left[0].z - drop_a).abs() < 1e-9);
+        // CrossFallLeft drops the left edge and raises the right.
+        let drop_b = -(10.0) * 4.0_f64.to_radians().tan();
+        assert!((b[0].left.last().unwrap().z - drop_b).abs() < 1e-9);
+        assert!((b[0].right.last().unwrap().z + drop_b).abs() < 1e-9);
+    }
+
+    #[test]
+    fn x1_camber_runs_off_to_zero_at_junction_pad() {
+        let doc = road_doc(&[
+            (
+                &[(0.0, 0.0, 0.0), (100.0, 0.0, 0.0)],
+                20.0,
+                4.0,
+                RoadShape::Crown,
+            ),
+            (
+                &[(100.0, 0.0, 0.0), (100.0, 100.0, 0.0)],
+                20.0,
+                4.0,
+                RoadShape::Crown,
+            ),
+        ]);
+        let network = resolve(&doc, None);
+        assert_network_valid(&network);
+        let a: Vec<&EdgeGeom> = network.edges_for(key(&doc, 0)).collect();
+        // Free end carries full camber...
+        let drop = -(10.0) * 4.0_f64.to_radians().tan();
+        assert!((a[0].left[0].z - drop).abs() < 1e-9);
+        // ...and the junction corner sits exactly on the flat pad plane.
+        assert!((a[0].left.last().unwrap().z - 0.0).abs() < 1e-12);
+        assert!((a[0].right.last().unwrap().z - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn grade_breaks_get_flat_approaches_idempotently() {
+        let doc = road_doc(&[(
+            &[(0.0, 0.0, 0.0), (100.0, 0.0, 10.0)],
+            20.0,
+            0.0,
+            RoadShape::Crown,
+        )]);
+        let clearance = ROAD_INTERSECTION_FLAT_CLEARANCE_M;
+        let network = resolve(&doc, None);
+        let edge = &network.edges[0];
+        assert_eq!(edge.center.len(), 4, "flats inserted at both grade breaks");
+        assert!((edge.center[1].z - 0.0).abs() < 1e-9);
+        assert!((edge.center[1].x - clearance).abs() < 1e-9);
+        assert!((edge.center[2].z - 10.0).abs() < 1e-9);
+        assert!((edge.center[2].x - (100.0 - clearance)).abs() < 1e-9);
+
+        // Re-resolving a document that stored the flattened line must not
+        // insert further flats (legacy documents stay stable).
+        let flat_pts: Vec<(f64, f64, f64)> = edge.center.iter().map(|p| (p.x, p.y, p.z)).collect();
+        let doc2 = road_doc(&[(&flat_pts, 20.0, 0.0, RoadShape::Crown)]);
+        let network2 = resolve(&doc2, None);
+        assert_eq!(network2.edges[0].center.len(), 4);
+    }
+
+    #[test]
+    fn e5_e12_crossing_at_grade_joins_and_overpass_does_not() {
+        // Same elevation: a real 4-way junction; both roads split.
+        let doc = road_doc(&[
+            (
+                &[(0.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
+                20.0,
+                2.0,
+                RoadShape::Crown,
+            ),
+            (
+                &[(100.0, -100.0, 0.0), (100.0, 100.0, 0.0)],
+                20.0,
+                2.0,
+                RoadShape::Crown,
+            ),
+        ]);
+        let network = resolve(&doc, None);
+        assert_network_valid(&network);
+        assert_eq!(network.edges.len(), 4);
+
+        // 10 m above: an overpass; nothing joins, nothing is clipped.
+        let doc = road_doc(&[
+            (
+                &[(0.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
+                20.0,
+                2.0,
+                RoadShape::Crown,
+            ),
+            (
+                &[(100.0, -100.0, 10.0), (100.0, 100.0, 10.0)],
+                20.0,
+                2.0,
+                RoadShape::Crown,
+            ),
+        ]);
+        let network = resolve(&doc, None);
+        assert_eq!(network.edges.len(), 2);
+        for edge in &network.edges {
+            assert_eq!(edge.center.len(), 2, "no junction vertices inserted");
+        }
+    }
+
+    #[test]
+    fn e19_width_mismatch_tapers_across_seam() {
+        let doc = road_doc(&[
+            (
+                &[(0.0, 0.0, 0.0), (100.0, 0.0, 0.0)],
+                40.0,
+                0.0,
+                RoadShape::Crown,
+            ),
+            (
+                &[(100.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
+                20.0,
+                0.0,
+                RoadShape::Crown,
+            ),
+        ]);
+        let network = resolve(&doc, None);
+        assert_network_valid(&network);
+        let a: Vec<&EdgeGeom> = network.edges_for(key(&doc, 0)).collect();
+        let b: Vec<&EdgeGeom> = network.edges_for(key(&doc, 1)).collect();
+        // Both arrive at the seam at the averaged half-width (15).
+        let a_end = *a[0].left.last().unwrap();
+        assert_same_point(a_end, b[0].left[0]);
+        assert!((a_end.y - 15.0).abs() < 1e-9);
+        // And regain their own widths beyond the taper.
+        assert!((a[0].left[0].y - 20.0).abs() < 1e-9);
+        assert!((b[0].left.last().unwrap().y - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ramp_into_turn_gets_a_flat_pocket_so_the_corner_is_level() {
+        // A road climbs 10 m then turns hard right on the flat. The turn
+        // vertex must not coincide with the grade break: the corner has to
+        // sit in a flat pocket, otherwise the mitered side lines skew.
+        let doc = road_doc(&[(
+            &[(0.0, 0.0, 0.0), (100.0, 0.0, 10.0), (100.0, 100.0, 10.0)],
+            20.0,
+            0.0,
+            RoadShape::Crown,
+        )]);
+        let clearance = ROAD_INTERSECTION_FLAT_CLEARANCE_M;
+        let network = resolve(&doc, None);
+        assert_network_valid(&network);
+        let edge = &network.edges[0];
+
+        // The flat approach is carved out of the ramp even though the
+        // following segment is already level: a vertex `clearance` before
+        // the turn.
+        let pocket_x = 100.0 - clearance;
+        assert!(
+            edge.center.iter().any(|p| (p.x - pocket_x).abs() < 1e-6
+                && p.y.abs() < 1e-6
+                && (p.z - 10.0).abs() < 1e-9),
+            "expected flat-pocket vertex {clearance} m before the turn, got {:?}",
+            edge.center
+        );
+
+        // Every sample in the pocket — including both mitered corner points —
+        // is level at the turn elevation, so the corner cannot skew.
+        for side in [&edge.left, &edge.right] {
+            for point in side.iter().filter(|p| p.x > pocket_x - 1e-6 && p.y < 50.0) {
+                assert!(
+                    (point.z - 10.0).abs() < 1e-9,
+                    "side-line point in the turn pocket is off the flat: {point:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn e23_attachment_side_lines_end_exactly_on_the_polyline() {
+        let mut doc = road_doc(&[(
+            &[(50.0, 0.0, 5.0), (150.0, 0.0, 5.0)],
+            20.0,
+            4.0,
+            RoadShape::Crown,
+        )]);
+        // A level crest string running north–south through the road's start.
+        add_polyline(&mut doc, &[(50.0, -50.0, 5.0), (50.0, 50.0, 5.0)], false);
+        let network = resolve(&doc, None);
+        assert_network_valid(&network);
+        let edge = &network.edges[0];
+
+        // Both side lines terminate ON the polyline, at its z, camber run off.
+        assert_same_point(edge.left[0], DVec3::new(50.0, 10.0, 5.0));
+        assert_same_point(edge.right[0], DVec3::new(50.0, -10.0, 5.0));
+        // The free end carries full camber.
+        let drop = -10.0 * 4.0_f64.to_radians().tan();
+        assert!((edge.left.last().unwrap().z - (5.0 + drop)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn e24_attachment_at_a_polyline_kink_hits_the_correct_segments() {
+        let mut doc = road_doc(&[(
+            &[(50.0, 0.0, 5.0), (150.0, 0.0, 5.0)],
+            20.0,
+            2.0,
+            RoadShape::Crown,
+        )]);
+        // The boundary kinks exactly at the attachment point: the left side
+        // ray must land on the slanted segment, the right on the straight one.
+        add_polyline(
+            &mut doc,
+            &[(50.0, -50.0, 5.0), (50.0, 0.0, 5.0), (30.0, 50.0, 5.0)],
+            false,
+        );
+        let network = resolve(&doc, None);
+        assert_network_valid(&network);
+        let edge = &network.edges[0];
+        assert_same_point(edge.left[0], DVec3::new(46.0, 10.0, 5.0));
+        assert_same_point(edge.right[0], DVec3::new(50.0, -10.0, 5.0));
+    }
+
+    #[test]
+    fn e25_attachment_to_a_closed_ring_polyline() {
+        let mut doc = road_doc(&[(
+            &[(100.0, 50.0, 5.0), (200.0, 50.0, 5.0)],
+            20.0,
+            2.0,
+            RoadShape::Crown,
+        )]);
+        add_polyline(
+            &mut doc,
+            &[
+                (0.0, 0.0, 5.0),
+                (100.0, 0.0, 5.0),
+                (100.0, 100.0, 5.0),
+                (0.0, 100.0, 5.0),
+            ],
+            true,
+        );
+        let network = resolve(&doc, None);
+        assert_network_valid(&network);
+        let edge = &network.edges[0];
+        assert_same_point(edge.left[0], DVec3::new(100.0, 60.0, 5.0));
+        assert_same_point(edge.right[0], DVec3::new(100.0, 40.0, 5.0));
+    }
+
+    #[test]
+    fn e4_y_junction_every_corner_is_shared_by_exactly_two_roads() {
+        let dir120 = DVec2::new(
+            (2.0 * std::f64::consts::PI / 3.0).cos(),
+            (2.0 * std::f64::consts::PI / 3.0).sin(),
+        );
+        let dir240 = DVec2::new(
+            (4.0 * std::f64::consts::PI / 3.0).cos(),
+            (4.0 * std::f64::consts::PI / 3.0).sin(),
+        );
+        let b_end = dir120 * 100.0;
+        let c_end = dir240 * 100.0;
+        let doc = road_doc(&[
+            (
+                &[(100.0, 0.0, 0.0), (0.0, 0.0, 0.0)],
+                20.0,
+                2.0,
+                RoadShape::Crown,
+            ),
+            (
+                &[(0.0, 0.0, 0.0), (b_end.x, b_end.y, 0.0)],
+                20.0,
+                2.0,
+                RoadShape::Crown,
+            ),
+            (
+                &[(0.0, 0.0, 0.0), (c_end.x, c_end.y, 0.0)],
+                20.0,
+                2.0,
+                RoadShape::Crown,
+            ),
+        ]);
+        let network = resolve(&doc, None);
+        assert_network_valid(&network);
+        let a: Vec<&EdgeGeom> = network.edges_for(key(&doc, 0)).collect();
+        let b: Vec<&EdgeGeom> = network.edges_for(key(&doc, 1)).collect();
+        let c: Vec<&EdgeGeom> = network.edges_for(key(&doc, 2)).collect();
+
+        // Three corners, each shared by exactly two roads, all on the pad
+        // plane (z = 0).
+        let corner_ab = *a[0].right.last().unwrap();
+        assert_same_point(corner_ab, b[0].right[0]);
+        let corner_bc = b[0].left[0];
+        assert_same_point(corner_bc, c[0].right[0]);
+        let corner_ca = c[0].left[0];
+        assert_same_point(corner_ca, *a[0].left.last().unwrap());
+        for corner in [corner_ab, corner_bc, corner_ca] {
+            assert!(
+                corner.z.abs() < 1e-12,
+                "corner off the pad plane: {corner:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn e9_closed_loop_road_side_lines_close_on_shared_corners() {
+        let doc = road_doc(&[(
+            &[
+                (0.0, 0.0, 0.0),
+                (100.0, 0.0, 0.0),
+                (100.0, 100.0, 0.0),
+                (0.0, 100.0, 0.0),
+                (0.0, 0.0, 0.0),
+            ],
+            20.0,
+            2.0,
+            RoadShape::Crown,
+        )]);
+        let network = resolve(&doc, None);
+        assert_network_valid(&network);
+        assert_eq!(network.edges.len(), 1);
+        let edge = &network.edges[0];
+
+        // Both side rings close exactly: first == last, at the mitred corner.
+        assert_same_point(edge.left[0], *edge.left.last().unwrap());
+        assert_same_point(edge.left[0], DVec3::new(10.0, 10.0, 0.0));
+        assert_same_point(edge.right[0], *edge.right.last().unwrap());
+        assert_same_point(edge.right[0], DVec3::new(-10.0, -10.0, 0.0));
+        assert!(!edge.start_cap && !edge.end_cap);
+    }
+
+    #[test]
+    fn e27_switchback_on_a_grade_stays_simple() {
+        // Tight (but rule-legal, > 30° interior) climbing switchback.
+        let leg = 80.0;
+        let turn = 145.0_f64.to_radians();
+        let p1 = (100.0, 0.0, 10.0);
+        let p2 = (p1.0 + leg * turn.cos(), p1.1 + leg * turn.sin(), 18.0);
+        let doc = road_doc(&[(&[(0.0, 0.0, 0.0), p1, p2], 20.0, 2.0, RoadShape::Crown)]);
+        let network = resolve(&doc, None);
+        assert_network_valid(&network);
+    }
+
+    #[test]
+    fn e6_junction_too_close_to_a_road_end_is_refused() {
+        let doc = road_doc(&[(
+            &[(0.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
+            20.0,
+            2.0,
+            RoadShape::Crown,
+        )]);
+
+        // A ghost crossing 5 m from the road's end leaves the endpoint inside
+        // the ghost's body (half-width 10): the stub is absorbed into the
+        // junction rather than refused — it would be buried under the
+        // crossing road's pavement anyway.
+        let ghost = GhostRoad {
+            centerline: vec![DVec3::new(5.0, -100.0, 0.0), DVec3::new(5.0, 100.0, 0.0)],
+            width: 20.0,
+            camber_degrees: 2.0,
+            shape: RoadShape::Crown,
+        };
+        assert_eq!(validate_ghost(&doc, &ghost, 15.0), Ok(()));
+        let network = resolve(&doc, Some(&ghost));
+        assert_network_valid(&network);
+        assert_eq!(
+            network.edges_for(key(&doc, 0)).count(),
+            1,
+            "the 5 m stub is absorbed, leaving only the far span"
+        );
+
+        // Crossing 15 m from the end is outside the absorb range but the
+        // stub still cannot fit its junction flat clearance: refused.
+        let ghost = GhostRoad {
+            centerline: vec![DVec3::new(15.0, -100.0, 0.0), DVec3::new(15.0, 100.0, 0.0)],
+            width: 20.0,
+            camber_degrees: 2.0,
+            shape: RoadShape::Crown,
+        };
+        assert!(
+            matches!(
+                validate_ghost(&doc, &ghost, 15.0),
+                Err(RoadRuleViolation::ClearanceTooTight { .. })
+            ),
+            "expected the 15 m stub edge to be refused"
+        );
+
+        // The same crossing mid-road is fine.
+        let ghost = GhostRoad {
+            centerline: vec![
+                DVec3::new(100.0, -100.0, 0.0),
+                DVec3::new(100.0, 100.0, 0.0),
+            ],
+            width: 20.0,
+            camber_degrees: 2.0,
+            shape: RoadShape::Crown,
+        };
+        assert_eq!(validate_ghost(&doc, &ghost, 15.0), Ok(()));
+    }
+
+    #[test]
+    fn validate_ghost_reports_each_rule_violation() {
+        let doc = road_doc(&[(
+            &[(0.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
+            20.0,
+            2.0,
+            RoadShape::Crown,
+        )]);
+        let ghost = |centerline: Vec<DVec3>| GhostRoad {
+            centerline,
+            width: 20.0,
+            camber_degrees: 2.0,
+            shape: RoadShape::Crown,
+        };
+
+        // Grade above the maximum.
+        let steep = ghost(vec![
+            DVec3::new(0.0, 50.0, 0.0),
+            DVec3::new(50.0, 50.0, 25.0),
+        ]);
+        assert!(matches!(
+            validate_ghost(&doc, &steep, 15.0),
+            Err(RoadRuleViolation::SegmentTooSteep { .. })
+        ));
+
+        // 20° interior angle at the ghost's own vertex.
+        let bend = 20f64.to_radians();
+        let sharp = ghost(vec![
+            DVec3::new(0.0, 50.0, 0.0),
+            DVec3::new(50.0, 50.0, 0.0),
+            DVec3::new(50.0 - 50.0 * bend.cos(), 50.0 - 50.0 * bend.sin(), 0.0),
+        ]);
+        assert!(matches!(
+            validate_ghost(&doc, &sharp, 15.0),
+            Err(RoadRuleViolation::TurnTooSharp { .. })
+        ));
+
+        // Crossing the existing road at 20° in plan: the branch angle at the
+        // junction node is below the minimum (the old validator never saw
+        // mid-segment crossings).
+        let dir = glam::DVec2::new(bend.cos(), bend.sin()) * 100.0;
+        let skew_cross = ghost(vec![
+            DVec3::new(100.0 - dir.x, -dir.y, 0.0),
+            DVec3::new(100.0 + dir.x, dir.y, 0.0),
+        ]);
+        assert!(matches!(
+            validate_ghost(&doc, &skew_cross, 15.0),
+            Err(RoadRuleViolation::TurnTooSharp { .. })
+        ));
+
+        // A 30 m ramp cannot fit its two grade-break flat pockets.
+        let short_ramp = ghost(vec![
+            DVec3::new(0.0, 50.0, 0.0),
+            DVec3::new(30.0, 50.0, 3.0),
+        ]);
+        assert!(matches!(
+            validate_ghost(&doc, &short_ramp, 15.0),
+            Err(RoadRuleViolation::ClearanceTooTight { .. })
+        ));
+
+        // A gentle, long-enough ramp clear of the network passes.
+        let legal = ghost(vec![
+            DVec3::new(0.0, 50.0, 0.0),
+            DVec3::new(100.0, 50.0, 5.0),
+        ]);
+        assert_eq!(validate_ghost(&doc, &legal, 15.0), Ok(()));
+    }
+
+    #[test]
+    fn attach_and_continue_forms_a_junction_at_the_interior_vertex() {
+        // A stroke snapped onto an existing road and continued past it: the
+        // contact is an interior vertex of the new road, not an endpoint and
+        // not a strict segment crossing. It must still form a junction.
+        let doc = road_doc(&[
+            (
+                &[(0.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
+                20.0,
+                2.0,
+                RoadShape::Crown,
+            ),
+            (
+                &[(100.0, -100.0, 0.0), (100.0, 0.0, 0.0), (180.0, 100.0, 0.0)],
+                20.0,
+                2.0,
+                RoadShape::Crown,
+            ),
+        ]);
+        let network = resolve(&doc, None);
+        assert_network_valid(&network);
+        // Both roads split at the shared vertex: a 4-port junction.
+        assert_eq!(network.edges_for(key(&doc, 0)).count(), 2);
+        assert_eq!(network.edges_for(key(&doc, 1)).count(), 2);
+    }
+
+    #[test]
+    fn crossing_near_a_corner_snaps_to_the_corner_vertex() {
+        // A stroke drawn "through" a corner never hits the vertex exactly.
+        // Crossing 1 m before the bend must snap onto the corner and resolve
+        // as a clean shared-vertex junction, not leave the bend inside the
+        // pad.
+        let doc = road_doc(&[(
+            &[(-200.0, 0.0, 0.0), (0.0, 0.0, 0.0), (120.0, 90.0, 0.0)],
+            20.0,
+            2.0,
+            RoadShape::Crown,
+        )]);
+        let dir = DVec2::new(75f64.to_radians().cos(), 75f64.to_radians().sin());
+        let through = DVec2::new(-1.0, 0.0);
+        let ghost = GhostRoad {
+            centerline: vec![
+                DVec3::new(through.x - dir.x * 100.0, through.y - dir.y * 100.0, 0.0),
+                DVec3::new(through.x + dir.x * 100.0, through.y + dir.y * 100.0, 0.0),
+            ],
+            width: 20.0,
+            camber_degrees: 2.0,
+            shape: RoadShape::Crown,
+        };
+        assert_eq!(validate_ghost(&doc, &ghost, 15.0), Ok(()));
+
+        let network = resolve(&doc, Some(&ghost));
+        assert_network_valid(&network);
+        // Both roads split exactly at the corner: a 4-port junction.
+        assert_eq!(network.edges_for(key(&doc, 0)).count(), 2);
+        assert_eq!(network.edges_for(RoadKey::Ghost).count(), 2);
+        for edge in network.edges_for(key(&doc, 0)) {
+            let at_corner = edge.center[0].truncate().length() < 1e-9
+                || edge.center.last().unwrap().truncate().length() < 1e-9;
+            assert!(at_corner, "edge does not terminate at the corner vertex");
+        }
+    }
+
+    #[test]
+    fn crossing_a_bend_inside_the_junction_zone_is_refused() {
+        // Crossing 15 m before the corner is outside the vertex-snap range
+        // (half-width = 10 m) but leaves the bend inside the junction's
+        // straight-approach zone: refused rather than resolved into
+        // self-crossing side lines.
+        let doc = road_doc(&[(
+            &[(-200.0, 0.0, 0.0), (0.0, 0.0, 0.0), (120.0, 90.0, 0.0)],
+            20.0,
+            2.0,
+            RoadShape::Crown,
+        )]);
+        let dir = DVec2::new(75f64.to_radians().cos(), 75f64.to_radians().sin());
+        let through = DVec2::new(-15.0, 0.0);
+        let ghost = GhostRoad {
+            centerline: vec![
+                DVec3::new(through.x - dir.x * 100.0, through.y - dir.y * 100.0, 0.0),
+                DVec3::new(through.x + dir.x * 100.0, through.y + dir.y * 100.0, 0.0),
+            ],
+            width: 20.0,
+            camber_degrees: 2.0,
+            shape: RoadShape::Crown,
+        };
+        assert!(matches!(
+            validate_ghost(&doc, &ghost, 15.0),
+            Err(RoadRuleViolation::TurnTooCloseToJunction { .. })
+        ));
+    }
+
+    #[test]
+    fn endpoint_inside_a_road_body_attaches_to_it() {
+        // Snapping to the drawn line can leave a new road's endpoint slightly
+        // off the stored centerline (derived centerlines reroute through
+        // junction corners). An endpoint inside the road's body must still
+        // form a T junction, not a dangling overlap.
+        let doc = road_doc(&[
+            (
+                &[(0.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
+                20.0,
+                2.0,
+                RoadShape::Crown,
+            ),
+            (
+                &[(100.0, 3.0, 0.0), (100.0, 150.0, 0.0)],
+                20.0,
+                2.0,
+                RoadShape::Crown,
+            ),
+        ]);
+        let network = resolve(&doc, None);
+        assert_network_valid(&network);
+        // The through road splits at the attachment: a 3-port junction.
+        assert_eq!(network.edges_for(key(&doc, 0)).count(), 2);
+        let joining: Vec<&EdgeGeom> = network.edges_for(key(&doc, 1)).collect();
+        assert_eq!(joining.len(), 1);
+        // The joining edge starts on the through road's centerline, and its
+        // junction end is not capped.
+        let start = joining[0].center[0];
+        assert!(
+            start.truncate().distance(DVec2::new(100.0, 0.0)) < 1e-9,
+            "expected the joining road to start on the centerline, got {start:?}"
+        );
+        assert!(!joining[0].start_cap);
+    }
+
+    #[test]
+    fn endpoint_just_past_the_centerline_attaches_without_a_sliver() {
+        // Snapping can land the stroke's start a hair past the target
+        // centerline. That must resolve as one attachment node, not an
+        // attachment PLUS a crossing sliver next to it (whose near-parallel
+        // ports read as a 0-degree branch and refuse the stroke).
+        let doc = road_doc(&[(
+            &[(0.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
+            20.0,
+            2.0,
+            RoadShape::Crown,
+        )]);
+        for start_y in [0.0, 0.5, -0.5, 3.0, -3.0] {
+            let ghost = GhostRoad {
+                centerline: vec![
+                    DVec3::new(100.0, start_y, 0.0),
+                    DVec3::new(140.0, 100.0, 0.0),
+                ],
+                width: 20.0,
+                camber_degrees: 2.0,
+                shape: RoadShape::Crown,
+            };
+            assert_eq!(
+                validate_ghost(&doc, &ghost, 15.0),
+                Ok(()),
+                "start offset {start_y} refused"
+            );
+            let network = resolve(&doc, Some(&ghost));
+            assert_network_valid(&network);
+            assert_eq!(network.edges_for(key(&doc, 0)).count(), 2);
+            assert_eq!(network.edges_for(RoadKey::Ghost).count(), 1);
+        }
+    }
+
+    #[test]
+    fn attach_reroute_is_confined_to_the_junction_approach() {
+        // Attaching an endpoint inside a road's body pulls the derived end
+        // onto the junction node. That correction must not pivot the whole
+        // edge (drawn roads would visibly shift): away from the node the
+        // derived centerline has to lie exactly on the stored line.
+        for d in [0.0_f64, 3.0, 8.0] {
+            let doc = road_doc(&[(
+                &[(0.0, -200.0, 0.0), (0.0, 200.0, 0.0)],
+                20.0,
+                2.0,
+                RoadShape::Crown,
+            )]);
+            let stored_a = DVec2::new(-150.0, -60.0);
+            let stored_b = DVec2::new(-d, 0.0);
+            let ghost = GhostRoad {
+                centerline: vec![
+                    DVec3::new(stored_a.x, stored_a.y, 0.0),
+                    DVec3::new(stored_b.x, stored_b.y, 0.0),
+                ],
+                width: 20.0,
+                camber_degrees: 2.0,
+                shape: RoadShape::Crown,
+            };
+            assert_eq!(validate_ghost(&doc, &ghost, 15.0), Ok(()));
+            let network = resolve(&doc, Some(&ghost));
+            assert_network_valid(&network);
+            let dir = (stored_b - stored_a).normalize();
+            // Generous bound: reroute run for hw 10 plus slack.
+            let confine = 75.0;
+            for edge in network.edges_for(RoadKey::Ghost) {
+                let node = edge.center.last().unwrap().truncate();
+                for p in &edge.center {
+                    if (p.truncate() - node).length() <= confine {
+                        continue;
+                    }
+                    let rel = p.truncate() - stored_a;
+                    let off_line = (rel - dir * rel.dot(dir)).length();
+                    assert!(
+                        off_line < 1e-6,
+                        "derived center strays {off_line:.3} m off the drawn \
+                         line {:.0} m from the node (offset {d})",
+                        (p.truncate() - node).length()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dead_ends_are_capped() {
+        let doc = road_doc(&[(
+            &[(0.0, 0.0, 0.0), (100.0, 0.0, 0.0)],
+            20.0,
+            2.0,
+            RoadShape::Crown,
+        )]);
+        let network = resolve(&doc, None);
+        assert!(network.edges[0].start_cap);
+        assert!(network.edges[0].end_cap);
+    }
+}

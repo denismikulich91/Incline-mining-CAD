@@ -31,7 +31,6 @@ type OptionalScreenPointPx = Option<(f32, f32)>;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PreferencesDraft {
     pub(crate) renderer_background_color: [f32; 4],
-    pub(crate) selection_color: [f32; 4],
     pub(crate) topology_wireframes_enabled: bool,
     pub(crate) dark_mode: bool,
     pub(crate) show_console: bool,
@@ -41,14 +40,26 @@ pub(crate) struct PreferencesDraft {
     pub(crate) frame_rate_cap: u32,
     pub(crate) resize_frame_rate_cap: u32,
     pub(crate) frame_counter_enabled: bool,
-    pub(crate) topology_folder_search_depth: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MoveToLayerDialog {
+    pub(crate) object_ids: Vec<ObjectId>,
+    pub(crate) target_layer: Option<LayerId>,
+    pub(crate) copy: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MoveLayerDialog {
+    pub(crate) source_project_index: usize,
+    pub(crate) layer_id: LayerId,
+    pub(crate) target_project_index: Option<usize>,
 }
 
 impl Default for PreferencesDraft {
     fn default() -> Self {
         Self {
             renderer_background_color: crate::app::io::default_renderer_background_color(),
-            selection_color: crate::app::io::default_selection_color(),
             topology_wireframes_enabled: false,
             dark_mode: false,
             show_console: false,
@@ -58,7 +69,6 @@ impl Default for PreferencesDraft {
             frame_rate_cap: crate::app::io::default_frame_rate_cap(),
             resize_frame_rate_cap: crate::app::io::default_resize_frame_rate_cap(),
             frame_counter_enabled: false,
-            topology_folder_search_depth: crate::app::io::default_topology_folder_search_depth(),
         }
     }
 }
@@ -140,6 +150,18 @@ pub(crate) enum OreFilterMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TriCreatePhase {
     MainDialog,
+}
+
+/// A failed Create Triangulation run, retained for the failure dialog.
+#[derive(Clone, Debug)]
+pub(crate) struct TriCreateFailure {
+    pub(crate) message: String,
+    pub(crate) name: String,
+    pub(crate) object_ids: Vec<ObjectId>,
+    pub(crate) surface_type: TriSurfaceType,
+    /// True when welding endpoints at the coarse tolerance would change the
+    /// input, i.e. a retry is worth offering.
+    pub(crate) weld_retry_available: bool,
 }
 
 /// Whether the Batter Berm tool is generating a pit or a stockpile.
@@ -228,15 +250,12 @@ pub(crate) struct EditorState {
     pub(crate) show_view_cube: bool,
     /// Linear RGBA clear colour used behind the rendered scene.
     pub(crate) renderer_background_color: [f32; 4],
-    /// RGBA colour used for UI accents and selected renderer geometry.
-    pub(crate) selection_color: [f32; 4],
     /// Unsaved values currently being edited in the Preferences tab.
     pub(crate) preferences_draft: Option<PreferencesDraft>,
     pub(crate) snap_poll_rate: u32,
     pub(crate) frame_rate_cap: u32,
     pub(crate) resize_frame_rate_cap: u32,
     pub(crate) frame_counter_enabled: bool,
-    pub(crate) topology_folder_search_depth: u32,
     pub(crate) measured_fps: Option<f32>,
     pub(crate) active_tool: ActiveTool,
     pub(crate) cursor_mode: CursorMode,
@@ -298,6 +317,9 @@ pub(crate) struct EditorState {
     pub(crate) canvas_context_menu_open: bool,
     /// Physical-pixel position where the canvas context menu was opened.
     pub(crate) canvas_context_menu_px: Option<(f32, f32)>,
+    pub(crate) move_to_layer_dialog: Option<MoveToLayerDialog>,
+    pub(crate) set_selection_z_dialog: Option<crate::ui::dialogs::SetSelectionZDialog>,
+    pub(crate) move_layer_dialog: Option<MoveLayerDialog>,
     pub(crate) file_operation_dialog: Option<FileOperationDialog>,
 
     // Display overrides
@@ -453,6 +475,9 @@ pub(crate) struct EditorState {
     // Create Triangulation workflow
     pub(crate) tri_create_open: bool,
     pub(crate) tri_create_phase: TriCreatePhase,
+    /// A failed Create Triangulation run, kept so the failure dialog can
+    /// offer a coarse-weld retry with the same inputs.
+    pub(crate) tri_create_failure: Option<TriCreateFailure>,
     /// Frozen cursor position (physical px) where the picker Area was opened.
     pub(crate) tri_create_picker_px: Option<(f32, f32)>,
     /// Objects highlighted yellow on canvas during selection hover.
@@ -512,10 +537,6 @@ pub(crate) struct EditorState {
 
     // Block Models
     pub(crate) block_model_table_pages: HashMap<BlockModelId, usize>,
-    /// Decoded numeric variable values, cached per block model so the value
-    /// table and colour-scale legend don't re-walk/re-decode a variable's
-    /// raw bytes on every UI frame. `None` means decoding failed.
-    pub(crate) block_model_variable_cache: HashMap<BlockModelId, HashMap<String, Option<Vec<f64>>>>,
     pub(crate) ore_triangulation_open: bool,
     pub(crate) ore_block_model_id: Option<BlockModelId>,
     pub(crate) ore_variable: String,
@@ -533,9 +554,20 @@ pub(crate) struct EditorState {
     pub(crate) road_shape: RoadShape,
     pub(crate) road_preview_left_world: Vec<DVec3>,
     pub(crate) road_preview_right_world: Vec<DVec3>,
+    /// Resolved ghost centerline (flat pockets included), empty when invalid.
+    pub(crate) road_preview_center_world: Vec<DVec3>,
     pub(crate) road_preview_left_screen_px: Vec<OptionalScreenPointPx>,
     pub(crate) road_preview_right_screen_px: Vec<OptionalScreenPointPx>,
     pub(crate) road_preview_center_screen_px: Vec<OptionalScreenPointPx>,
+    /// Rule the current stroke + cursor violates, refreshed with the preview.
+    pub(crate) road_preview_violation: Option<crate::model::road_network::RoadRuleViolation>,
+    /// Committed roads whose geometry the ghost reshapes (sorted by id). The
+    /// static scene pass suppresses these; the dynamic pass draws them from
+    /// `road_preview_affected_edges` instead.
+    pub(crate) road_preview_affected_roads: Vec<ObjectId>,
+    /// Ghost-inclusive resolved edges for the affected committed roads,
+    /// refreshed by `update_road_preview` alongside the ghost preview.
+    pub(crate) road_preview_affected_edges: Vec<crate::model::road_network::EdgeGeom>,
 
     // Batter Berm tool
     pub(crate) batter_berm_dialog_open: bool,
@@ -579,13 +611,14 @@ pub(crate) struct EditorState {
     /// Which CP handle is hovered (0 = cp1, 1 = cp2), None if neither.
     pub(crate) bezier_hover_cp: Option<u8>,
     pub(crate) bezier_dialog_open: bool,
+    /// Determins what prefrences to show in the prefrences tab
+    pub(crate) active_prefrence_catagory: PrefrenceCatagory,
 }
 
 impl EditorState {
     pub(crate) fn current_preferences(&self) -> PreferencesDraft {
         PreferencesDraft {
             renderer_background_color: self.renderer_background_color,
-            selection_color: self.selection_color,
             topology_wireframes_enabled: self.topology_wireframes_enabled,
             dark_mode: self.dark_mode,
             show_console: self.show_console,
@@ -595,7 +628,6 @@ impl EditorState {
             frame_rate_cap: self.frame_rate_cap,
             resize_frame_rate_cap: self.resize_frame_rate_cap,
             frame_counter_enabled: self.frame_counter_enabled,
-            topology_folder_search_depth: self.topology_folder_search_depth,
         }
     }
 
@@ -615,13 +647,11 @@ impl EditorState {
             show_world_axis_gizmo: crate::app::io::default_show_world_axis_gizmo(),
             show_view_cube: crate::app::io::default_show_view_cube(),
             renderer_background_color: crate::app::io::default_renderer_background_color(),
-            selection_color: crate::app::io::default_selection_color(),
             preferences_draft: None,
             snap_poll_rate: crate::app::io::default_snap_poll_rate(),
             frame_rate_cap: crate::app::io::default_frame_rate_cap(),
             resize_frame_rate_cap: crate::app::io::default_resize_frame_rate_cap(),
             frame_counter_enabled: false,
-            topology_folder_search_depth: crate::app::io::default_topology_folder_search_depth(),
             measured_fps: None,
             active_tool: ActiveTool::None,
             cursor_mode: CursorMode::Select,
@@ -656,6 +686,9 @@ impl EditorState {
             poly_finish_dialog_px: None,
             canvas_context_menu_open: false,
             canvas_context_menu_px: None,
+            move_to_layer_dialog: None,
+            set_selection_z_dialog: None,
+            move_layer_dialog: None,
             file_operation_dialog: None,
             xray_enabled: false,
             vertical_exaggeration_dialog_open: false,
@@ -742,6 +775,7 @@ impl EditorState {
             confirm_load_all_folder: None,
             tri_create_open: false,
             tri_create_phase: TriCreatePhase::MainDialog,
+            tri_create_failure: None,
             tri_create_picker_px: None,
             tri_hover_handles: HashSet::new(),
             tri_selected_object_ids: Vec::new(),
@@ -781,7 +815,6 @@ impl EditorState {
             tri_contour_minor_color: [0.8, 0.8, 0.8, 1.0],
             tri_contour_project_index: 0,
             block_model_table_pages: HashMap::new(),
-            block_model_variable_cache: HashMap::new(),
             ore_triangulation_open: false,
             ore_block_model_id: None,
             ore_variable: String::new(),
@@ -797,9 +830,13 @@ impl EditorState {
             road_shape: RoadShape::Crown,
             road_preview_left_world: Vec::new(),
             road_preview_right_world: Vec::new(),
+            road_preview_center_world: Vec::new(),
             road_preview_left_screen_px: Vec::new(),
             road_preview_right_screen_px: Vec::new(),
             road_preview_center_screen_px: Vec::new(),
+            road_preview_violation: None,
+            road_preview_affected_roads: Vec::new(),
+            road_preview_affected_edges: Vec::new(),
             batter_berm_dialog_open: false,
             batter_berm_target_id: None,
             batter_berm_width: 5.0,
@@ -827,6 +864,7 @@ impl EditorState {
             bezier_dragging_cp: None,
             bezier_hover_cp: None,
             bezier_dialog_open: false,
+            active_prefrence_catagory: PrefrenceCatagory::Interface,
         }
     }
 
@@ -1054,6 +1092,13 @@ pub(crate) enum UiCommand {
     ClosePidbForce(usize),
     RequestDeleteLayer(usize, LayerId),
     DeleteLayer(usize, LayerId),
+    DuplicateLayer(usize, LayerId),
+    BeginMoveLayer(usize, LayerId),
+    MoveLayerToProject {
+        source_project_index: usize,
+        layer_id: LayerId,
+        target_project_index: usize,
+    },
     RenameLayer {
         project_index: usize,
         layer_id: LayerId,
@@ -1071,6 +1116,7 @@ pub(crate) enum UiCommand {
     CancelMoveDelta,
     LoadLayer(usize, LayerId),
     UnloadLayer(usize, LayerId),
+    SelectAllObjectsInLayer(usize, LayerId),
     OpenTriangulationFolder,
     ActivateTriangulation(TriangulationId),
     ToggleTriangulationVisible(TriangulationId),
@@ -1080,6 +1126,13 @@ pub(crate) enum UiCommand {
     BatchSetPolylineClosed(Vec<ObjectId>, bool),
     BatchSetObjectFill(Vec<ObjectId>, FillStyle),
     BatchSetPolylineLineWeight(Vec<ObjectId>, f32),
+    MoveObjectsToLayer {
+        project_index: usize,
+        object_ids: Vec<ObjectId>,
+        target_layer: LayerId,
+        copy: bool,
+    },
+    BatchSetZValue(Vec<ObjectId>, f64),
     CommitTextEdit(ObjectId, String, f64, f64, [f32; 4]),
     CancelTextEdit,
     SetTriangulationColor(TriangulationId, [f32; 4]),
@@ -1096,6 +1149,10 @@ pub(crate) enum UiCommand {
     SetBlockModelColorStops {
         id: BlockModelId,
         stops: Vec<ColorStop>,
+    },
+    SetBlockModelHideEmptyValues {
+        id: BlockModelId,
+        hide: bool,
     },
     SetBlockModelDefinitionFile(BlockModelId),
     SetBlockModelSourceDefinitionFile(BlockModelSource),
@@ -1144,8 +1201,17 @@ pub(crate) enum UiCommand {
     CancelBatterBerm,
     /// Open the Create Triangulation main dialog.
     OpenCreateTriangulation,
+    /// Open the Set selections to Z value.
+    OpenSetSelectionZValueDialog,
     /// Run CDT on the supplied object list and add the result as a loaded triangulation.
     ExecuteCreateTriangulation {
+        name: String,
+        object_ids: Vec<ObjectId>,
+        surface_type: TriSurfaceType,
+    },
+    /// Retry a failed Create Triangulation with breakline endpoints welded
+    /// at the coarse (cm-scale) tolerance the failure dialog offered.
+    ExecuteCreateTriangulationWithWeld {
         name: String,
         object_ids: Vec<ObjectId>,
         surface_type: TriSurfaceType,
@@ -1299,4 +1365,10 @@ pub(crate) struct UiProjectView {
     pub(crate) active_path: Option<PathBuf>,
     /// Active triangulation id and face colour, used by the context menu.
     pub(crate) active_triangulation_for_menu: Option<TriangulationMenuStyle>,
+}
+
+#[derive(PartialEq)]
+pub(crate) enum PrefrenceCatagory {
+    Interface,
+    Preformance,
 }

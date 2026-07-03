@@ -11,7 +11,7 @@ pub(crate) fn draw_console(ui: &mut egui::Ui) {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let surface_fill = egui::Color32::from_rgb(30, 30, 30);
+    let surface_fill = ui.visuals().extreme_bg_color;
     egui::Panel::bottom("Console")
         .resizable(true)
         .frame(egui::Frame::new().fill(surface_fill))

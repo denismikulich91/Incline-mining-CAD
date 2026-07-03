@@ -128,140 +128,145 @@ pub(crate) fn draw_left_toolbar(
         .resizable(false)
         .default_size(32.0)
         .show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_enabled_ui(project_active, |ui| {
-                    tool_button(
-                        ui,
-                        egui::Image::new(unthemed_icon!("new_layer.svg")),
-                        "New layer",
-                        editor,
-                        ActiveTool::NewLayer,
-                    );
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_enabled_ui(project_active, |ui| {
+                            tool_button(
+                                ui,
+                                egui::Image::new(unthemed_icon!("new_layer.svg")),
+                                "New layer",
+                                editor,
+                                ActiveTool::NewLayer,
+                            );
 
-                    ui.add_space(6.0);
-                    ui.separator();
+                            ui.add_space(6.0);
+                            ui.separator();
+                        });
+
+                        ui.add_enabled_ui(editing_enabled, |ui| {
+                            ui.add_space(6.0);
+
+                            tool_button(
+                                ui,
+                                egui::Image::new(themed_icon!(ui, "make_point.svg")),
+                                "Make Point",
+                                editor,
+                                ActiveTool::MakePoint,
+                            );
+
+                            tool_button(
+                                ui,
+                                egui::Image::new(themed_icon!(ui, "make_line.svg")),
+                                "Make Line",
+                                editor,
+                                ActiveTool::MakeLine,
+                            );
+
+                            tool_button(
+                                ui,
+                                egui::Image::new(themed_icon!(ui, "make_poly.svg")),
+                                "Make Polygon",
+                                editor,
+                                ActiveTool::MakePoly,
+                            );
+
+                            tool_button(
+                                ui,
+                                egui::Image::new(unthemed_icon!("make_text.svg")),
+                                "Make Text",
+                                editor,
+                                ActiveTool::MakeText,
+                            );
+
+                            tool_button(
+                                ui,
+                                egui::Image::new(unthemed_icon!("make_road.svg")),
+                                "Make Roads",
+                                editor,
+                                ActiveTool::MakeRoad,
+                            );
+
+                            ui.add_space(6.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+
+                            tool_button(
+                                ui,
+                                egui::Image::new(themed_icon!(ui, "pan.svg")),
+                                "Move",
+                                editor,
+                                ActiveTool::Move,
+                            );
+
+                            tool_button(
+                                ui,
+                                egui::Image::new(themed_icon!(ui, "offset.svg")),
+                                "Offset",
+                                editor,
+                                ActiveTool::OffsetElement,
+                            );
+
+                            tool_button(
+                                ui,
+                                egui::Image::new(unthemed_icon!("pit_design.svg")),
+                                "Auto-Bench",
+                                editor,
+                                ActiveTool::BatterBermOffset,
+                            );
+
+                            tool_button(
+                                ui,
+                                egui::Image::new(themed_icon!(ui, "rebase.svg")),
+                                "Relimit Line",
+                                editor,
+                                ActiveTool::RelimitLine,
+                            );
+
+                            tool_button(
+                                ui,
+                                egui::Image::new(themed_icon!(ui, "fuse.svg")),
+                                "Fuse Lines Into Polygon",
+                                editor,
+                                ActiveTool::FuseIntoPolygon,
+                            );
+
+                            tool_button(
+                                ui,
+                                egui::Image::new(themed_icon!(ui, "chamfer.svg")),
+                                "Chamfer Polygon Corners",
+                                editor,
+                                ActiveTool::Chamfer,
+                            );
+
+                            tool_button(
+                                ui,
+                                egui::Image::new(themed_icon!(ui, "bezier.svg")),
+                                "Bezier Polygon",
+                                editor,
+                                ActiveTool::Bezier,
+                            );
+
+                            tool_button(
+                                ui,
+                                egui::Image::new(unthemed_icon!("boom.svg")),
+                                "Explode Polygon to Lines",
+                                editor,
+                                ActiveTool::ExplodePolygon,
+                            );
+
+                            tool_button(
+                                ui,
+                                egui::Image::new(unthemed_icon!("delete_element.svg")),
+                                "Delete",
+                                editor,
+                                ActiveTool::DeleteElement,
+                            );
+                        });
+                    });
                 });
-
-                ui.add_enabled_ui(editing_enabled, |ui| {
-                    ui.add_space(6.0);
-
-                    tool_button(
-                        ui,
-                        egui::Image::new(themed_icon!(ui, "make_point.svg")),
-                        "Make Point",
-                        editor,
-                        ActiveTool::MakePoint,
-                    );
-
-                    tool_button(
-                        ui,
-                        egui::Image::new(themed_icon!(ui, "make_line.svg")),
-                        "Make Line",
-                        editor,
-                        ActiveTool::MakeLine,
-                    );
-
-                    tool_button(
-                        ui,
-                        egui::Image::new(themed_icon!(ui, "make_poly.svg")),
-                        "Make Polygon",
-                        editor,
-                        ActiveTool::MakePoly,
-                    );
-
-                    tool_button(
-                        ui,
-                        egui::Image::new(unthemed_icon!("make_text.svg")),
-                        "Make Text",
-                        editor,
-                        ActiveTool::MakeText,
-                    );
-
-                    tool_button(
-                        ui,
-                        egui::Image::new(unthemed_icon!("make_road.svg")),
-                        "Make Roads",
-                        editor,
-                        ActiveTool::MakeRoad,
-                    );
-
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-
-                    tool_button(
-                        ui,
-                        egui::Image::new(themed_icon!(ui, "pan.svg")),
-                        "Move",
-                        editor,
-                        ActiveTool::Move,
-                    );
-
-                    tool_button(
-                        ui,
-                        egui::Image::new(themed_icon!(ui, "offset.svg")),
-                        "Offset",
-                        editor,
-                        ActiveTool::OffsetElement,
-                    );
-
-                    tool_button(
-                        ui,
-                        egui::Image::new(unthemed_icon!("pit_design.svg")),
-                        "Auto-Bench",
-                        editor,
-                        ActiveTool::BatterBermOffset,
-                    );
-
-                    tool_button(
-                        ui,
-                        egui::Image::new(themed_icon!(ui, "rebase.svg")),
-                        "Relimit Line",
-                        editor,
-                        ActiveTool::RelimitLine,
-                    );
-
-                    tool_button(
-                        ui,
-                        egui::Image::new(themed_icon!(ui, "fuse.svg")),
-                        "Fuse Lines Into Polygon",
-                        editor,
-                        ActiveTool::FuseIntoPolygon,
-                    );
-
-                    tool_button(
-                        ui,
-                        egui::Image::new(themed_icon!(ui, "chamfer.svg")),
-                        "Chamfer Polygon Corners",
-                        editor,
-                        ActiveTool::Chamfer,
-                    );
-
-                    tool_button(
-                        ui,
-                        egui::Image::new(themed_icon!(ui, "bezier.svg")),
-                        "Bezier Polygon",
-                        editor,
-                        ActiveTool::Bezier,
-                    );
-
-                    tool_button(
-                        ui,
-                        egui::Image::new(unthemed_icon!("boom.svg")),
-                        "Explode Polygon to Lines",
-                        editor,
-                        ActiveTool::ExplodePolygon,
-                    );
-
-                    tool_button(
-                        ui,
-                        egui::Image::new(unthemed_icon!("delete_element.svg")),
-                        "Delete",
-                        editor,
-                        ActiveTool::DeleteElement,
-                    );
-                });
-            });
         })
         .response
         .rect

@@ -278,12 +278,10 @@ impl<'a> App<'a> {
                     return Ok(());
                 }
                 let entries = Self::scan_triangulation_dir(&dir);
-                let max_depth = self.editor.topology_folder_search_depth;
-                let child_dirs = Self::find_child_triangulation_dirs(&dir, 0, max_depth);
-                if entries.is_empty() && child_dirs.is_empty() {
+                if entries.is_empty() {
                     return Ok(());
                 }
-                let mut total_files = entries.len();
+                let total_files = entries.len();
                 let mut added_dirs = 0usize;
                 if !entries.is_empty() {
                     if !self.triangulation_dirs.contains(&dir) {
@@ -291,15 +289,6 @@ impl<'a> App<'a> {
                         added_dirs += 1;
                     }
                     self.triangulation_dir_entries.insert(dir.clone(), entries);
-                }
-                for (child_dir, child_files) in child_dirs {
-                    total_files += child_files.len();
-                    if !self.triangulation_dirs.contains(&child_dir) {
-                        self.triangulation_dirs.push(child_dir.clone());
-                        added_dirs += 1;
-                    }
-                    self.triangulation_dir_entries
-                        .insert(child_dir, child_files);
                 }
                 self.triangulation_dirs.sort();
                 self.triangulation_dirs.dedup();

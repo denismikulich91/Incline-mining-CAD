@@ -60,7 +60,7 @@ pub(crate) fn draw_explorer(
                                 entry.layers.iter().any(|layer| layer.id == active_layer)
                             });
                         let label = if contains_active_layer {
-                            bold(&title).color(crate::ui::selection_color(editor))
+                            bold(&title).color(crate::ui::SELECTION_COLOR)
                         } else {
                             bold(&title)
                         };
@@ -129,6 +129,14 @@ pub(crate) fn draw_explorer(
                                                     .push(UiCommand::LoadLayer(proj_idx, layer_id));
                                                 ui.close();
                                             }
+                                            if layer.is_loaded
+                                                && ui.button("Select All Objects").clicked()
+                                            {
+                                                commands.push(UiCommand::SelectAllObjectsInLayer(
+                                                    proj_idx, layer_id,
+                                                ));
+                                                ui.close();
+                                            }
                                             if ui.button("Save").clicked() {
                                                 commands.push(UiCommand::SaveProjectForLayer(
                                                     proj_idx, layer_id,
@@ -137,6 +145,18 @@ pub(crate) fn draw_explorer(
                                             }
                                             if ui.button("Rename").clicked() {
                                                 commands.push(UiCommand::BeginRenameLayer(
+                                                    proj_idx, layer_id,
+                                                ));
+                                                ui.close();
+                                            }
+                                            if ui.button("Duplicate Layer").clicked() {
+                                                commands.push(UiCommand::DuplicateLayer(
+                                                    proj_idx, layer_id,
+                                                ));
+                                                ui.close();
+                                            }
+                                            if ui.button("Move Layer...").clicked() {
+                                                commands.push(UiCommand::BeginMoveLayer(
                                                     proj_idx, layer_id,
                                                 ));
                                                 ui.close();

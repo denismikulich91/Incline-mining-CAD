@@ -19,7 +19,7 @@ pub(crate) const APP_NAME: &str = "Incline";
 /// Internal name of the design software
 pub(crate) const APP_ID: &str = "incline-mine-designer";
 /// Version of release
-pub(crate) const APP_RELEASE: &str = "0.1.0";
+pub(crate) const APP_RELEASE: &str = "0.1.1";
 
 fn main() -> Result<()> {
     logging::init();

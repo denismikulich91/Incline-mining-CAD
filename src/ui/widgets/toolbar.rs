@@ -145,19 +145,26 @@ fn hatch_picker_row(
 fn draw_hatch_swatch(ui: &Ui, rect: egui::Rect, hatch: ToolHatch, _color: Color32) {
     let painter = ui.painter();
 
-    let bg = ui.visuals().extreme_bg_color;
+    let bg = if ui.visuals().dark_mode {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
+    };
+    let preview_color = if ui.visuals().dark_mode {
+        Color32::WHITE
+    } else {
+        Color32::BLACK
+    };
     let border = Stroke::new(1.0, Color32::BLACK);
 
     painter.rect_filled(rect, 0.0, bg);
     painter.rect_stroke(rect, 0.0, border, egui::StrokeKind::Inside);
 
-    let preview_color = Color32::BLACK;
-
     match hatch {
         ToolHatch::Clear => {}
 
         ToolHatch::Solid => {
-            painter.rect_filled(rect, 0.0, Color32::BLACK);
+            painter.rect_filled(rect, 0.0, preview_color);
         }
 
         ToolHatch::Slashes => {

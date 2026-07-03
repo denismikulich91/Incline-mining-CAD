@@ -61,12 +61,17 @@ Files with indices outside either range are rejected.
 A compressed `.00t` starts with the `vulZ` magic bytes above. The total expanded
 raw length is stored as a little-endian `u32` at offset `0x20`.
 
-The compressed stream is stored in FastLZ level-1 pages. Incline expects each
-expanded page to be 25,600 bytes and appends pages until the total expanded
-length has been reconstructed. Table-of-contents blocks are 0x800 bytes; a
-little-endian pointer at offset `0x3c` points to the next block. When that
-pointer no longer equals the next 0x800-byte block, scanning begins for the
-first compressed page.
+The compressed stream is stored in FastLZ pages. Older samples use level 1 and
+25,600-byte expanded pages; newer observed files can use FastLZ level 2 and a
+different, but consistent, expanded page size. Incline locks onto the first
+accepted page size, appends pages until the advertised total expanded length is
+reconstructed, and keeps `.00t` decoding strict if the stream ends early.
+
+Table-of-contents blocks are 0x800 bytes. A little-endian pointer at offset
+`0x3c` points to the next block during the initial TOC chain; when that pointer
+no longer equals the next 0x800-byte block, scanning begins for the first
+compressed page. Large files can also insert linked TOC chains between page
+runs; Incline skips those chains and resumes at the next compressed page run.
 
 ## Writing
 

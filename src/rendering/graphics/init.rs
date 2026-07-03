@@ -542,6 +542,18 @@ impl<'a> Graphics<'a> {
             std::mem::size_of::<u32>(),
             wgpu::BufferUsages::INDEX,
         );
+        let dynamic_vertex_gpu = Self::create_stream_buffer(
+            &device,
+            "Dynamic Scene Vertex Buffer",
+            std::mem::size_of::<StrokeVertex>(),
+            wgpu::BufferUsages::VERTEX,
+        );
+        let dynamic_index_gpu = Self::create_stream_buffer(
+            &device,
+            "Dynamic Scene Index Buffer",
+            std::mem::size_of::<u32>(),
+            wgpu::BufferUsages::INDEX,
+        );
 
         let font_system = FontSystem::new();
         let swash_cache = SwashCache::new();
@@ -588,6 +600,8 @@ impl<'a> Graphics<'a> {
             stroke_index_gpu,
             overlay_vertex_gpu,
             overlay_index_gpu,
+            dynamic_vertex_gpu,
+            dynamic_index_gpu,
             camera_buffer,
             camera_bind_group,
             msaa_color,
@@ -619,6 +633,10 @@ impl<'a> Graphics<'a> {
             overlay_index_buf: Vec::new(),
             overlay_vertex_capacity: 1,
             overlay_index_capacity: 1,
+            dynamic_vertex_buf: Vec::new(),
+            dynamic_index_buf: Vec::new(),
+            dynamic_vertex_capacity: 1,
+            dynamic_index_capacity: 1,
             cached_textareas: Vec::new(),
             textarea_depths: Vec::new(),
             frame_index: 0,

@@ -230,11 +230,7 @@ fn tab_entry(ui: &mut egui::Ui, tab: &Tab, rect: egui::Rect, selected: bool) -> 
     };
     ui.painter().rect_filled(rect, 0.0, background);
     if selected {
-        let fill_color = if ui.visuals().dark_mode {
-            egui::Color32::from_rgb(21, 21, 21)
-        } else {
-            egui::Color32::from_rgb(240, 240, 240)
-        };
+        let fill_color = ui.visuals().code_bg_color;
         ui.painter().rect_filled(rect, 3., fill_color);
     }
 

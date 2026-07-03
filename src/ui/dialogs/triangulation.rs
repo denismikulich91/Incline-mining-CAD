@@ -162,6 +162,64 @@ pub(crate) fn draw_tri_create_main_dialog(
     }
 }
 
+/// Shown when Create Triangulation fails: the error, and — when nearby
+/// breakline endpoints are the likely cause — a "Weld & Retry" action that
+/// spells out what accepting it does.
+pub(crate) fn draw_tri_create_failure_dialog(
+    ui: &mut egui::Ui,
+    editor: &mut EditorState,
+    commands: &mut Vec<UiCommand>,
+) {
+    let Some(failure) = editor.tri_create_failure.clone() else {
+        return;
+    };
+
+    let mut open = true;
+    let mut dismiss = false;
+    DragableMenu::new("Triangulation Failed")
+        .open(&mut open)
+        .min_width(340.0)
+        .show(ui.ctx(), |ui| {
+            ui.colored_label(egui::Color32::LIGHT_RED, &failure.message);
+            if failure.weld_retry_available {
+                ui.add_space(6.0);
+                ui.separator();
+                ui.label(
+                    "Some breakline vertices sit within 5 cm of each other — likely one \
+                     intended shared point digitized independently.",
+                );
+                ui.add_space(4.0);
+                ui.colored_label(
+                    egui::Color32::GRAY,
+                    "Weld & Retry treats vertices within 5 cm (in XY and Z) as one shared \
+                     point when building this triangulation. The surface near those points \
+                     will follow the welded position, not each original vertex. The selected \
+                     polylines themselves are not modified.",
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Weld & Retry").clicked() {
+                        commands.push(UiCommand::ExecuteCreateTriangulationWithWeld {
+                            name: failure.name.clone(),
+                            object_ids: failure.object_ids.clone(),
+                            surface_type: failure.surface_type,
+                        });
+                        dismiss = true;
+                    }
+                    if ui.button("Close").clicked() {
+                        dismiss = true;
+                    }
+                });
+            } else if ui.button("Close").clicked() {
+                dismiss = true;
+            }
+        });
+
+    if dismiss || !open {
+        editor.tri_create_failure = None;
+    }
+}
+
 pub(crate) fn draw_cut_poly_dialog(
     ui: &mut egui::Ui,
     editor: &mut EditorState,

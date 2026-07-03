@@ -9,7 +9,7 @@ pub(crate) mod view; /* Handles resetting camera view, , etc. commands */
 
 use anyhow::Result;
 
-use crate::ui::state::{FileOperationKind, TriCreatePhase, UiCommand}; // TriSurfaceType comes through UiCommand destructuring
+use crate::ui::state::{FileOperationKind, MoveLayerDialog, TriCreatePhase, UiCommand}; // TriSurfaceType comes through UiCommand destructuring
 use crate::{app::App, userspace_warn};
 
 impl<'a> App<'a> {
@@ -176,6 +176,33 @@ impl<'a> App<'a> {
             UiCommand::DeleteLayer(project_index, layer_id) => {
                 self.delete_layer(project_index, layer_id)
             }
+            UiCommand::DuplicateLayer(project_index, layer_id) => {
+                self.duplicate_layer(project_index, layer_id);
+                Ok(())
+            }
+            UiCommand::BeginMoveLayer(project_index, layer_id) => {
+                let target_project_index = self
+                    .workspace
+                    .projects
+                    .iter()
+                    .enumerate()
+                    .find(|(index, _)| *index != project_index)
+                    .map(|(index, _)| index);
+                self.editor.move_layer_dialog = Some(MoveLayerDialog {
+                    source_project_index: project_index,
+                    layer_id,
+                    target_project_index,
+                });
+                Ok(())
+            }
+            UiCommand::MoveLayerToProject {
+                source_project_index,
+                layer_id,
+                target_project_index,
+            } => {
+                self.move_layer_to_project(source_project_index, layer_id, target_project_index);
+                Ok(())
+            }
             UiCommand::BeginRenameLayer(project_index, layer_id) => {
                 let current_name = self
                     .workspace
@@ -255,6 +282,10 @@ impl<'a> App<'a> {
                 self.try_unload_layer(project, layer);
                 Ok(())
             }
+            UiCommand::SelectAllObjectsInLayer(project, layer) => {
+                self.select_all_objects_in_layer(project, layer);
+                Ok(())
+            }
             UiCommand::UnloadLayerConfirmed(project, layer) => {
                 self.unload_layer_discarding_changes(project, layer);
                 Ok(())
@@ -302,6 +333,10 @@ impl<'a> App<'a> {
             }
             UiCommand::SetBlockModelColorStops { id, stops } => {
                 self.set_block_model_color_stops(id, stops);
+                Ok(())
+            }
+            UiCommand::SetBlockModelHideEmptyValues { id, hide } => {
+                self.set_block_model_hide_empty_values(id, hide);
                 Ok(())
             }
             UiCommand::SetBlockModelDefinitionFile(id) => {
@@ -449,6 +484,19 @@ impl<'a> App<'a> {
                 self.batch_set_polyline_line_weight(ids, weight);
                 Ok(())
             }
+            UiCommand::BatchSetZValue(ids, weight) => {
+                self.batch_set_z_value(ids, weight);
+                Ok(())
+            }
+            UiCommand::MoveObjectsToLayer {
+                project_index,
+                object_ids,
+                target_layer,
+                copy,
+            } => {
+                self.move_objects_to_layer(project_index, object_ids, target_layer, copy);
+                Ok(())
+            }
             UiCommand::SetTriangulationColor(tri_id, new_color) => {
                 self.set_triangulation_color(tri_id, new_color);
                 Ok(())
@@ -490,6 +538,30 @@ impl<'a> App<'a> {
                 self.open_batter_berm_dialog();
                 Ok(())
             }
+            UiCommand::OpenSetSelectionZValueDialog => {
+                let selected_objects: Vec<crate::model::ObjectId> = self
+                    .editor
+                    .selected_handles
+                    .iter()
+                    .filter_map(|&handle| match handle {
+                        crate::model::SceneEntityId::Object(id) => Some(id),
+                        crate::model::SceneEntityId::Triangulation(_)
+                        | crate::model::SceneEntityId::BlockModel(_) => None,
+                    })
+                    .collect();
+
+                if selected_objects.is_empty() {
+                    userspace_warn!("Select one or more objects before setting Z");
+                    return Ok(());
+                }
+
+                self.editor.set_selection_z_dialog =
+                    Some(crate::ui::dialogs::SetSelectionZDialog {
+                        object_ids: selected_objects,
+                        z_input: self.editor.z_input.clone(),
+                    });
+                Ok(())
+            }
             UiCommand::CommitBatterBerm => {
                 self.commit_batter_berm();
                 Ok(())
@@ -520,7 +592,12 @@ impl<'a> App<'a> {
                 name,
                 object_ids,
                 surface_type,
-            } => self.create_triangulation_from_objects(name, object_ids, surface_type),
+            } => self.run_create_triangulation(name, object_ids, surface_type, false),
+            UiCommand::ExecuteCreateTriangulationWithWeld {
+                name,
+                object_ids,
+                surface_type,
+            } => self.run_create_triangulation(name, object_ids, surface_type, true),
             UiCommand::ConfirmLoadAllTriangulationsInFolder(path) => {
                 self.editor.confirm_load_all_folder = Some(path);
                 Ok(())

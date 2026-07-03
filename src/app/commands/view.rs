@@ -9,12 +9,10 @@ impl<'a> App<'a> {
             show_world_axis_gizmo: self.editor.show_world_axis_gizmo,
             show_view_cube: self.editor.show_view_cube,
             renderer_background_color: self.editor.renderer_background_color,
-            selection_color: self.editor.selection_color,
             snap_poll_rate: self.editor.snap_poll_rate,
             frame_rate_cap: self.editor.frame_rate_cap,
             resize_frame_rate_cap: self.editor.resize_frame_rate_cap,
             frame_counter_enabled: self.editor.frame_counter_enabled,
-            topology_folder_search_depth: self.editor.topology_folder_search_depth,
         })?;
         Ok(())
     }
@@ -85,46 +83,35 @@ impl<'a> App<'a> {
             show_world_axis_gizmo: preferences.show_world_axis_gizmo,
             show_view_cube: preferences.show_view_cube,
             renderer_background_color: preferences.renderer_background_color,
-            selection_color: preferences.selection_color,
             snap_poll_rate: preferences.snap_poll_rate.clamp(5, 1000),
             frame_rate_cap: preferences.frame_rate_cap.clamp(20, 1000),
             resize_frame_rate_cap: preferences.resize_frame_rate_cap.clamp(20, 1000),
             frame_counter_enabled: preferences.frame_counter_enabled,
-            topology_folder_search_depth: preferences.topology_folder_search_depth.clamp(0, 10),
         })?;
 
-        let selection_changed = self.editor.selection_color != preferences.selection_color;
         self.editor.topology_wireframes_enabled = preferences.topology_wireframes_enabled;
         self.editor.dark_mode = preferences.dark_mode;
         self.editor.show_console = preferences.show_console;
         self.editor.show_world_axis_gizmo = preferences.show_world_axis_gizmo;
         self.editor.show_view_cube = preferences.show_view_cube;
         self.editor.renderer_background_color = preferences.renderer_background_color;
-        self.editor.selection_color = preferences.selection_color;
         self.editor.snap_poll_rate = preferences.snap_poll_rate.clamp(5, 1000);
         self.editor.frame_rate_cap = preferences.frame_rate_cap.clamp(20, 1000);
         self.editor.resize_frame_rate_cap = preferences.resize_frame_rate_cap.clamp(20, 1000);
         self.editor.frame_counter_enabled = preferences.frame_counter_enabled;
-        self.editor.topology_folder_search_depth =
-            preferences.topology_folder_search_depth.clamp(0, 10);
         if !preferences.frame_counter_enabled {
             self.editor.measured_fps = None;
         }
         self.editor.preferences_draft = Some(preferences);
         userspace_log!(
-            "Applied preferences (wireframes={}, dark_mode={}, snap_rate={}, fps_cap={}, search_depth={}, frame_counter={})",
+            "Applied preferences (wireframes={}, dark_mode={}, snap_rate={}, fps_cap={}, frame_counter={})",
             preferences.topology_wireframes_enabled,
             preferences.dark_mode,
             preferences.snap_poll_rate,
             preferences.frame_rate_cap,
-            preferences.topology_folder_search_depth,
             preferences.frame_counter_enabled
         );
-        if selection_changed {
-            self.invalidate_geometry();
-        } else {
-            self.redraw_requested = true;
-        }
+        self.redraw_requested = true;
         Ok(())
     }
 

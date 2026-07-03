@@ -212,14 +212,20 @@ impl<'a> App<'a> {
 
         let mut candidates: Vec<RelimitCandidate> = Vec::new();
 
+        // The trim/extend split is offset by a small slack in t (XY_TOL metres
+        // expressed as a fraction of the source span) so a crossing that lands
+        // right at (or a hair past) an endpoint — e.g. the other line was
+        // already relimited to touch here — is treated as a (near zero-length)
+        // trim rather than falling into neither bucket.
+        let touch_t = {
+            use crate::model::kernel;
+            kernel::XY_TOL / (b_xy - a_xy).length().max(kernel::XY_TOL)
+        };
+
         // A-extend: nearest crossing with t < 0 (closest to A from outside).
-        // The trim/extend split is offset by TOUCH_EPSILON so a crossing that
-        // lands right at (or a hair past) A's current endpoint — e.g. the other
-        // line was already relimited to touch here — is treated as a (near
-        // zero-length) trim rather than falling into neither bucket.
         if let Some(&(_, world)) = crossings
             .iter()
-            .filter(|(t, _)| *t < -TOUCH_EPSILON)
+            .filter(|(t, _)| *t < -touch_t)
             .max_by(|(t1, _), (t2, _)| t1.total_cmp(t2))
         {
             candidates.push(RelimitCandidate {
@@ -232,7 +238,7 @@ impl<'a> App<'a> {
         // A-trim: nearest interior crossing (smallest t in (0,1), closest to A).
         if let Some(&(_, world)) = crossings
             .iter()
-            .filter(|(t, _)| *t > -TOUCH_EPSILON && *t < 1.0)
+            .filter(|(t, _)| *t > -touch_t && *t < 1.0)
             .min_by(|(t1, _), (t2, _)| t1.total_cmp(t2))
         {
             candidates.push(RelimitCandidate {
@@ -245,7 +251,7 @@ impl<'a> App<'a> {
         // B-trim: nearest interior crossing (largest t in (0,1), closest to B).
         if let Some(&(_, world)) = crossings
             .iter()
-            .filter(|(t, _)| *t > 0.0 && *t < 1.0 + TOUCH_EPSILON)
+            .filter(|(t, _)| *t > 0.0 && *t < 1.0 + touch_t)
             .max_by(|(t1, _), (t2, _)| t1.total_cmp(t2))
         {
             candidates.push(RelimitCandidate {
@@ -258,7 +264,7 @@ impl<'a> App<'a> {
         // B-extend: nearest crossing with t > 1 (closest to B from outside).
         if let Some(&(_, world)) = crossings
             .iter()
-            .filter(|(t, _)| *t > 1.0 + TOUCH_EPSILON)
+            .filter(|(t, _)| *t > 1.0 + touch_t)
             .min_by(|(t1, _), (t2, _)| t1.total_cmp(t2))
         {
             candidates.push(RelimitCandidate {
@@ -514,36 +520,22 @@ impl<'a> App<'a> {
 // World-space (XY plane) line intersection helper (outside the impl)
 // -------------------------------------------------------------------------
 
-/// Relative slack allowed on the target segment parameter `u` beyond `[0, 1]` so
-/// that two lines which already *touch* at a point (e.g. one endpoint sitting
-/// exactly on the other line, perhaps from a prior relimit) still count as
-/// intersecting there, rather than being rejected by floating-point drift that
-/// pushes the computed `u` a hair outside the exact boundary.
-const TOUCH_EPSILON: f64 = 1e-6;
-
 /// Intersect the *infinite* line through `a`,`b` with the *segment* `c`–`d`.
 /// Returns the parameter `t` along `a`→`b` (any value), but only when the hit
-/// lies on (or within `TOUCH_EPSILON` of) the actual `c`–`d` segment — so a
+/// lies on (or within `XY_TOL` metres of) the actual `c`–`d` segment — so a
 /// polygon edge is never extended to an arbitrary off-edge point, while a
-/// touching endpoint still resolves.
+/// touch point that drifted off the end by floating-point noise (e.g. from a
+/// prior relimit) still resolves.
 fn line_line_intersect_t(
     a: glam::DVec2,
     b: glam::DVec2,
     c: glam::DVec2,
     d: glam::DVec2,
 ) -> Option<f64> {
+    use crate::model::kernel;
+    let (point, _) = kernel::line_segment(a, b - a, c, d, kernel::XY_TOL)?;
     let r = b - a;
-    let s = d - c;
-    let denom = r.x * s.y - r.y * s.x;
-    if denom.abs() < 1e-9 {
-        return None;
-    }
-    let t = ((c.x - a.x) * s.y - (c.y - a.y) * s.x) / denom;
-    let u = ((c.x - a.x) * r.y - (c.y - a.y) * r.x) / denom;
-    if !(-TOUCH_EPSILON..=1.0 + TOUCH_EPSILON).contains(&u) {
-        return None;
-    }
-    Some(t)
+    Some((point - a).dot(r) / r.length_squared())
 }
 
 #[cfg(test)]

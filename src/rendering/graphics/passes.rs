@@ -226,6 +226,19 @@ impl<'a> Graphics<'a> {
             render_pass.draw_indexed(0..self.stroke_index_buf.len() as u32, 0, 0..1);
         }
 
+        if !self.dynamic_vertex_buf.is_empty() && !self.dynamic_index_buf.is_empty() {
+            render_pass.set_pipeline(if editor.xray_enabled {
+                &self.overlay_render_pipeline
+            } else {
+                &self.stroke_render_pipeline
+            });
+            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.dynamic_vertex_gpu.slice(..));
+            render_pass
+                .set_index_buffer(self.dynamic_index_gpu.slice(..), wgpu::IndexFormat::Uint32);
+            render_pass.draw_indexed(0..self.dynamic_index_buf.len() as u32, 0, 0..1);
+        }
+
         render_pass.set_pipeline(&self.edge_render_pipeline);
         render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
         for triangulation in triangulations {

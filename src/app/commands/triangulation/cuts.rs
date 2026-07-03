@@ -69,7 +69,8 @@ impl<'a> App<'a> {
         };
 
         let pit_shell = prepare_pit_shell_surface(&pit_shell_mesh)?;
-        let (new_verts, new_faces) = clip_topology_to_pit_shell(&topology_mesh, &pit_shell);
+        let envelope = build_pit_shell_lower_envelope(&pit_shell)?;
+        let (new_verts, new_faces) = clip_topology_to_pit_shell(&topology_mesh, &envelope);
 
         if new_faces.is_empty() {
             anyhow::bail!("No topology geometry falls outside the pit shell");
@@ -221,18 +222,12 @@ pub(super) fn clip_triangle_by_polygon_concave(
         if n < 3 {
             continue;
         }
-        // Build a flat [x0, y0, x1, y1, ...] array for earcutr
-        let flat: Vec<f64> = exterior[..n].iter().flat_map(|c| [c.x, c.y]).collect();
-        let Ok(indices) = earcutr::earcut(&flat, &[], 2) else {
-            continue;
-        };
-        for tri_idx in indices.chunks(3) {
-            if tri_idx.len() < 3 {
-                continue;
-            }
+        let flat: Vec<[f64; 2]> = exterior[..n].iter().map(|c| [c.x, c.y]).collect();
+        let mut indices: Vec<usize> = Vec::new();
+        earcut::Earcut::new().earcut(flat.iter().copied(), &[], &mut indices);
+        for tri_idx in indices.chunks_exact(3) {
             let make_vert = |i: usize| {
-                let x = flat[i * 2];
-                let y = flat[i * 2 + 1];
+                let [x, y] = flat[i];
                 tri00t::Vertex::new(x, y, bary_z(x, y, v))
             };
             output.push([
@@ -380,24 +375,24 @@ pub(super) fn clip_mesh_by_surface(
 /// pit shell fills the removed area and the two meshes meet along their true 3D contact
 /// line (where the shell surface crosses the terrain) rather than a fixed design polygon.
 ///
-/// For each topology triangle, every overlapping pit-shell face contributes the XY
-/// sub-region where the topology lies *at or above* that face — i.e. where the shell digs
-/// below the ground and genuinely removes material. Their union (across faces this is the
-/// region above the shell's *lower* envelope) is removed; the rest is kept. Crucially,
-/// where the shell floats *above* the terrain — e.g. a flat design crest standing over
-/// undulating ground near the rim — the topology underneath is **kept**, so the cut is
-/// flush with the real contact line instead of the shell's widest XY extent. Because a
-/// point is removed as soon as *any* shell face there is below it, a watertight solid's
-/// flat crest cap never forces removal on its own. Triangles with no XY overlap against
-/// the shell pass through unchanged. A final cleanup pass (`trim_triangles_inside_void`)
-/// clips away any excavated triangle portions the per-face clipping missed over near-vertical
-/// walls.
+/// `envelope` must be the shell's lower envelope (see `build_pit_shell_lower_envelope`):
+/// a single-valued 2.5D surface giving, at every XY point of the shell's footprint, the
+/// lowest shell surface there. A topology point is excavated exactly when it lies at or
+/// above that envelope. Because the envelope cells tile the plane, each topology triangle
+/// is rebuilt cell by cell: the overlap with an open cell is kept whole, and the overlap
+/// with a covered cell keeps only the part below the cell's plane. Every fragment is a
+/// convex polygon (a triangle–triangle overlap split by one half-plane), so emission is a
+/// simple fan — no polygon booleans or ear-cutting, whose floating-point failure modes on
+/// production data motivated this design. Where the shell floats *above* the terrain —
+/// e.g. a flat design crest standing over undulating ground near the rim — the topology is
+/// below the envelope and is **kept**, so the cut is flush with the real contact line
+/// instead of the shell's widest XY extent. Because the lower envelope of a watertight
+/// solid is its floor, a flat crest cap never forces removal on its own. Triangles that
+/// touch no excavated region pass through unchanged and unfragmented.
 pub(super) fn clip_topology_to_pit_shell(
     topology: &tri00t::Triangulation,
-    pit_shell: &PreparedReferenceSurface,
+    envelope: &PitShellLowerEnvelope,
 ) -> (Vec<tri00t::Vertex>, Vec<[u32; 3]>) {
-    use geo::{BooleanOps, unary_union};
-
     let topology_vertices = topology.vertices();
     let mut output_vertices = Vec::new();
     let mut output_faces = Vec::new();
@@ -417,452 +412,71 @@ pub(super) fn clip_topology_to_pit_shell(
             topology_vertices[face[2]],
         ];
         let bounds = triangle_xy_bounds(target);
-        let candidates: Vec<[tri00t::Vertex; 3]> = pit_shell
-            .spatial
-            .xy_bounds_candidate_indices(&pit_shell.mesh, bounds.0, bounds.1)
-            .into_iter()
-            .map(|index| pit_shell.triangles[index])
-            .collect();
+        let candidates =
+            envelope
+                .spatial
+                .xy_bounds_candidate_indices(&envelope.mesh, bounds.0, bounds.1);
 
         if candidates.is_empty() {
-            // Outside the pit shell's footprint entirely: keep the original geometry.
+            // Beyond even the envelope's padding: keep the original geometry.
             pass_through(&target, &mut output_vertices, &mut output_faces);
             continue;
         }
 
-        // For each candidate, the sub-region of `target` within the candidate's XY footprint
-        // AND at or above the candidate's surface there — the part the shell excavates. Each
-        // region is a convex overlap split by one half-plane, so it stays a simple polygon.
-        let mut removed_polygons: Vec<geo::Polygon<f64>> = Vec::new();
-        for candidate in &candidates {
-            let overlap = clip_target_triangle_to_reference_xy(target, *candidate);
+        // Fragment the triangle across the overlapping cells. `height_delta` is linear over
+        // each fragment, so a positive delta at some overlap vertex is exactly the condition
+        // for that cell to excavate part of the triangle.
+        let mut fragments: Vec<Vec<SurfaceClipVertex>> = Vec::new();
+        let mut any_excavated = false;
+        for index in candidates {
+            let cell = envelope.triangles[index];
+            let overlap = clip_target_triangle_to_reference_xy(target, cell);
             if overlap.len() < 3 {
+                continue;
+            }
+            if !envelope.covered[index] {
+                fragments.push(
+                    overlap
+                        .into_iter()
+                        .map(|point| SurfaceClipVertex {
+                            point,
+                            height_delta: 0.0,
+                        })
+                        .collect(),
+                );
                 continue;
             }
             let polygon: Vec<SurfaceClipVertex> = overlap
                 .into_iter()
                 .map(|point| {
-                    let reference_z = bary_z(point.x, point.y, *candidate);
+                    let reference_z = bary_z(point.x, point.y, cell);
                     SurfaceClipVertex {
                         point,
                         height_delta: point.z - reference_z,
                     }
                 })
                 .collect();
-            // Keep the part where the topology is at or above the shell (height_delta >= 0):
-            // that is where the shell has cut below the ground and removes material.
-            let removed = clip_surface_polygon(polygon, TriSurfaceCutSide::CutBottom);
-            if overlay_removed_region_is_true_void(pit_shell, target, &removed)
-                && let Some(geo_polygon) = surface_clip_polygon_to_geo(&removed)
-            {
-                removed_polygons.push(geo_polygon);
+            if polygon.iter().any(|vertex| vertex.height_delta > 1e-9) {
+                any_excavated = true;
             }
+            // Keep the part below the envelope (height_delta <= 0): the shell floats above
+            // the terrain there and removes nothing.
+            fragments.push(clip_surface_polygon(polygon, TriSurfaceCutSide::CutTop));
         }
 
-        if removed_polygons.is_empty() {
-            // The shell floats above the topology everywhere it overlaps here (or there is no
-            // real overlap): nothing is excavated, so keep the whole triangle.
+        if !any_excavated {
+            // Nothing under this triangle is excavated (open cells only, or the shell
+            // floats above the terrain everywhere here): keep it whole and unfragmented.
             pass_through(&target, &mut output_vertices, &mut output_faces);
             continue;
         }
 
-        let removed_union = unary_union(&removed_polygons);
-        let target_polygon = triangle_to_geo_polygon(target);
-        let kept = target_polygon.difference(&removed_union);
-
-        for polygon in &kept {
-            emit_earcut_polygon(polygon, target, &mut output_vertices, &mut output_faces);
+        for fragment in &fragments {
+            append_surface_clip_polygon(fragment, &mut output_vertices, &mut output_faces);
         }
     }
-
-    // Cleanup pass: trim surviving triangles against the pit shell's lower envelope. The
-    // per-face XY clipping above can miss geometry when its only overlapping shell faces are
-    // near-vertical walls, whose XY projection is a degenerate sliver that Sutherland–Hodgman
-    // collapses to nothing. A point-in-triangle query against the shell is robust for those
-    // thin faces, and clipping (rather than dropping by centroid) removes partial seam lips.
-    trim_triangles_inside_void(pit_shell, &mut output_vertices, &mut output_faces);
 
     (output_vertices, output_faces)
-}
-
-/// Numerical tolerance (metres) for trimming surviving topology against the pit shell's
-/// lower envelope. This is deliberately tiny: the cleanup clips partial lips at the contact
-/// line, while genuinely floating terrain is preserved because it is below the shell.
-const VOID_CLEANUP_TOLERANCE: f64 = 1e-6;
-
-/// Clip triangles against the pit shell's lower envelope, keeping only topology that is not
-/// above the shell (plus a tiny numerical tolerance). Rebuilds the vertex/face buffers in
-/// place, trimming partial seam lips instead of keeping/dropping whole triangles by centroid.
-fn trim_triangles_inside_void(
-    pit_shell: &PreparedReferenceSurface,
-    vertices: &mut Vec<tri00t::Vertex>,
-    faces: &mut Vec<[u32; 3]>,
-) {
-    trim_triangles_by_shell_face_overlays(pit_shell, vertices, faces);
-    trim_triangles_by_envelope_samples(pit_shell, vertices, faces);
-}
-
-/// Re-clip emitted topology triangles against every overlapping shell face. This catches
-/// triangles whose vertices look safe but whose interior crosses a bench/wall edge in the
-/// shell lower envelope.
-fn trim_triangles_by_shell_face_overlays(
-    pit_shell: &PreparedReferenceSurface,
-    vertices: &mut Vec<tri00t::Vertex>,
-    faces: &mut Vec<[u32; 3]>,
-) {
-    use geo::{BooleanOps, unary_union};
-
-    let mut kept_vertices = Vec::with_capacity(vertices.len());
-    let mut kept_faces = Vec::with_capacity(faces.len());
-    for face in faces.iter() {
-        let triangle = [
-            vertices[face[0] as usize],
-            vertices[face[1] as usize],
-            vertices[face[2] as usize],
-        ];
-        let bounds = triangle_xy_bounds(triangle);
-        let mut removed_polygons: Vec<geo::Polygon<f64>> = Vec::new();
-        for index in
-            pit_shell
-                .spatial
-                .xy_bounds_candidate_indices(&pit_shell.mesh, bounds.0, bounds.1)
-        {
-            let shell_triangle = pit_shell.triangles[index];
-            let overlap = clip_target_triangle_to_reference_xy(triangle, shell_triangle);
-            if overlap.len() < 3 {
-                continue;
-            }
-            let polygon: Vec<SurfaceClipVertex> = overlap
-                .into_iter()
-                .map(|point| {
-                    let reference_z = bary_z(point.x, point.y, shell_triangle);
-                    SurfaceClipVertex {
-                        point,
-                        height_delta: point.z - reference_z - VOID_CLEANUP_TOLERANCE,
-                    }
-                })
-                .collect();
-            let removed = clip_surface_polygon(polygon, TriSurfaceCutSide::CutBottom);
-            if overlay_removed_region_is_true_void(pit_shell, triangle, &removed)
-                && let Some(geo_polygon) = surface_clip_polygon_to_geo(&removed)
-            {
-                removed_polygons.push(geo_polygon);
-            }
-        }
-
-        if removed_polygons.is_empty() {
-            let base = kept_vertices.len() as u32;
-            kept_vertices.extend_from_slice(&triangle);
-            kept_faces.push([base, base + 1, base + 2]);
-            continue;
-        }
-
-        let removed_union = unary_union(&removed_polygons);
-        let target_polygon = triangle_to_geo_polygon(triangle);
-        let kept = target_polygon.difference(&removed_union);
-        for polygon in &kept {
-            emit_earcut_polygon(polygon, triangle, &mut kept_vertices, &mut kept_faces);
-        }
-    }
-    *vertices = kept_vertices;
-    *faces = kept_faces;
-}
-
-/// The face-overlay pass can propose removals from a single shell face even in regions
-/// where the true lower envelope still floats above the terrain. Validate each proposed
-/// removal against the lower envelope at a representative point before cutting it away.
-fn overlay_removed_region_is_true_void(
-    pit_shell: &PreparedReferenceSurface,
-    target: [tri00t::Vertex; 3],
-    removed: &[SurfaceClipVertex],
-) -> bool {
-    let Some(point) = polygon_representative_xy(removed) else {
-        return false;
-    };
-    let topo_z = bary_z(point.x, point.y, target);
-    shell_lower_envelope_z_strict(pit_shell, point.x, point.y)
-        .is_some_and(|shell_z| topo_z > shell_z + VOID_CLEANUP_TOLERANCE)
-}
-
-fn polygon_representative_xy(polygon: &[SurfaceClipVertex]) -> Option<glam::DVec2> {
-    if polygon.len() < 3 {
-        return None;
-    }
-    let sum = polygon.iter().fold(glam::DVec2::ZERO, |sum, vertex| {
-        sum + glam::DVec2::new(vertex.point.x, vertex.point.y)
-    });
-    Some(sum / polygon.len() as f64)
-}
-
-/// Final point-query cleanup for near-vertical shell faces whose XY projections can be too
-/// thin for polygon clipping.
-fn trim_triangles_by_envelope_samples(
-    pit_shell: &PreparedReferenceSurface,
-    vertices: &mut Vec<tri00t::Vertex>,
-    faces: &mut Vec<[u32; 3]>,
-) {
-    let mut kept_vertices = Vec::with_capacity(vertices.len());
-    let mut kept_faces = Vec::with_capacity(faces.len());
-    for face in faces.iter() {
-        let triangle = [
-            vertices[face[0] as usize],
-            vertices[face[1] as usize],
-            vertices[face[2] as usize],
-        ];
-        let mut has_shell_coverage = false;
-        let polygon: Vec<SurfaceClipVertex> = triangle
-            .iter()
-            .map(|vertex| {
-                let height_delta = shell_lower_envelope_z_strict(pit_shell, vertex.x, vertex.y)
-                    .map(|shell_z| {
-                        has_shell_coverage = true;
-                        vertex.z - shell_z - VOID_CLEANUP_TOLERANCE
-                    })
-                    .unwrap_or(0.0);
-                SurfaceClipVertex {
-                    point: glam::DVec3::new(vertex.x, vertex.y, vertex.z),
-                    height_delta,
-                }
-            })
-            .collect();
-
-        if !has_shell_coverage {
-            let cx = (triangle[0].x + triangle[1].x + triangle[2].x) / 3.0;
-            let cy = (triangle[0].y + triangle[1].y + triangle[2].y) / 3.0;
-            let cz = (triangle[0].z + triangle[1].z + triangle[2].z) / 3.0;
-            if let Some(shell_z) = shell_lower_envelope_z_strict(pit_shell, cx, cy)
-                && cz > shell_z + VOID_CLEANUP_TOLERANCE
-            {
-                continue;
-            }
-            let base = kept_vertices.len() as u32;
-            kept_vertices.extend_from_slice(&triangle);
-            kept_faces.push([base, base + 1, base + 2]);
-            continue;
-        }
-
-        let clipped = clip_surface_polygon(polygon, TriSurfaceCutSide::CutTop);
-        append_surface_clip_polygon(&clipped, &mut kept_vertices, &mut kept_faces);
-    }
-    *vertices = kept_vertices;
-    *faces = kept_faces;
-}
-
-/// Lower envelope for cleanup clipping, excluding points that lie only on shell XY
-/// boundaries. Those boundary vertices are often the already-correct cut seam emitted by
-/// the boolean difference pass; trimming them again shrinks the retained outside topology.
-fn shell_lower_envelope_z_strict(
-    pit_shell: &PreparedReferenceSurface,
-    x: f64,
-    y: f64,
-) -> Option<f64> {
-    let point = glam::DVec2::new(x, y);
-    let mut lowest = f64::INFINITY;
-    for index in pit_shell
-        .spatial
-        .xy_bounds_candidate_indices(&pit_shell.mesh, point, point)
-    {
-        if let Some(z) = point_strictly_in_triangle_bary_z(x, y, pit_shell.triangles[index]) {
-            lowest = lowest.min(z);
-        }
-    }
-    lowest.is_finite().then_some(lowest)
-}
-
-/// Barycentric Z of `(x, y)` on triangle `v`, excluding XY edges.
-fn point_strictly_in_triangle_bary_z(x: f64, y: f64, v: [tri00t::Vertex; 3]) -> Option<f64> {
-    let denom = (v[1].y - v[2].y) * (v[0].x - v[2].x) + (v[2].x - v[1].x) * (v[0].y - v[2].y);
-    if denom.abs() < 1e-12 {
-        return None;
-    }
-    let w0 = ((v[1].y - v[2].y) * (x - v[2].x) + (v[2].x - v[1].x) * (y - v[2].y)) / denom;
-    let w1 = ((v[2].y - v[0].y) * (x - v[2].x) + (v[0].x - v[2].x) * (y - v[2].y)) / denom;
-    let w2 = 1.0 - w0 - w1;
-    if w0 <= 1e-9 || w1 <= 1e-9 || w2 <= 1e-9 {
-        return None;
-    }
-    Some(w0 * v[0].z + w1 * v[1].z + w2 * v[2].z)
-}
-
-/// Convert a clipped surface polygon to a geo polygon, normalized to CCW winding so
-/// `geo`'s boolean ops treat it as a positive-area region. Returns `None` for polygons
-/// with fewer than three points or no XY area.
-fn surface_clip_polygon_to_geo(polygon: &[SurfaceClipVertex]) -> Option<geo::Polygon<f64>> {
-    use geo::{Coord, LineString, Polygon as GeoPoly};
-    if polygon.len() < 3 {
-        return None;
-    }
-    let signed_area: f64 = (0..polygon.len())
-        .map(|index| {
-            let a = polygon[index].point;
-            let b = polygon[(index + 1) % polygon.len()].point;
-            a.x * b.y - b.x * a.y
-        })
-        .sum();
-    if signed_area.abs() < 1e-12 {
-        return None;
-    }
-    let mut coords: Vec<Coord<f64>> = polygon
-        .iter()
-        .map(|vertex| Coord {
-            x: vertex.point.x,
-            y: vertex.point.y,
-        })
-        .collect();
-    if signed_area < 0.0 {
-        coords.reverse();
-    }
-    coords.push(coords[0]);
-    Some(GeoPoly::new(LineString::new(coords), vec![]))
-}
-
-/// Build a geo polygon from a triangle's XY projection, normalized to CCW winding so
-/// `geo`'s boolean ops treat it as a positive-area region regardless of the triangle's
-/// original 3D orientation.
-fn triangle_to_geo_polygon(v: [tri00t::Vertex; 3]) -> geo::Polygon<f64> {
-    use geo::{Coord, LineString, Polygon as GeoPoly};
-    let ccw = if triangle_xy_area(v) >= 0.0 {
-        [v[0], v[1], v[2]]
-    } else {
-        [v[0], v[2], v[1]]
-    };
-    let mut coords: Vec<Coord<f64>> = ccw.iter().map(|p| Coord { x: p.x, y: p.y }).collect();
-    coords.push(coords[0]);
-    GeoPoly::new(LineString::new(coords), vec![])
-}
-
-/// Triangulate a (possibly holed) XY polygon via earcut, sampling Z from `target`'s plane
-/// for every output vertex (valid because every point in `polygon` was derived purely from
-/// XY set operations plus linear crossings on `target`'s own plane).
-fn emit_earcut_polygon(
-    polygon: &geo::Polygon<f64>,
-    target: [tri00t::Vertex; 3],
-    vertices: &mut Vec<tri00t::Vertex>,
-    faces: &mut Vec<[u32; 3]>,
-) {
-    // Earcut in coordinates local to the polygon's first vertex. At real-world (UTM-scale)
-    // magnitudes the absolute coordinates swamp f32-like precision inside the triangulator;
-    // shifting to a local origin keeps the working range small and robust.
-    let origin = polygon.exterior().0.first().copied();
-    let Some(origin) = origin else {
-        return;
-    };
-
-    let mut flat: Vec<f64> = Vec::new();
-    let mut hole_indices: Vec<usize> = Vec::new();
-    let exterior_len = push_seam_ring(polygon.exterior(), origin, &mut flat);
-    if exterior_len < 3 {
-        // The exterior collapsed to a sliver thinner than the seam tolerance: drop it. Any
-        // gap is sub-millimetre and lies on the contact line, hidden by the pit shell.
-        return;
-    }
-    for interior in polygon.interiors() {
-        let start = flat.len() / 2;
-        let hole_len = push_seam_ring(interior, origin, &mut flat);
-        if hole_len >= 3 {
-            hole_indices.push(start);
-        } else {
-            flat.truncate(start * 2);
-        }
-    }
-
-    let mut emit_tri = |ia: usize, ib: usize, ic: usize| {
-        let make_vert = |i: usize| {
-            let x = flat[i * 2] + origin.x;
-            let y = flat[i * 2 + 1] + origin.y;
-            tri00t::Vertex::new(x, y, bary_z(x, y, target))
-        };
-        let a = make_vert(ia);
-        let b = make_vert(ib);
-        let c = make_vert(ic);
-        // Drop needle triangles: sliver artefacts of clipping a triangle against the jagged
-        // contact line. A triangle thinner than SEAM_TOLERANCE in its narrow dimension renders
-        // as a floating edge but carries no visible area, so skipping it is purely cosmetic.
-        let ab = glam::DVec2::new(b.x - a.x, b.y - a.y);
-        let ac = glam::DVec2::new(c.x - a.x, c.y - a.y);
-        let double_area = (ab.x * ac.y - ab.y * ac.x).abs();
-        let longest_edge = (b.x - a.x)
-            .hypot(b.y - a.y)
-            .max((c.x - b.x).hypot(c.y - b.y))
-            .max((a.x - c.x).hypot(a.y - c.y));
-        if longest_edge <= 0.0 || double_area / longest_edge < SEAM_TOLERANCE {
-            return;
-        }
-        let base = vertices.len() as u32;
-        vertices.push(a);
-        vertices.push(b);
-        vertices.push(c);
-        faces.push([base, base + 1, base + 2]);
-    };
-
-    match earcutr::earcut(&flat, &hole_indices, 2) {
-        Ok(indices) => {
-            for tri_idx in indices.chunks(3) {
-                if tri_idx.len() == 3 {
-                    emit_tri(tri_idx[0], tri_idx[1], tri_idx[2]);
-                }
-            }
-        }
-        Err(_) => {
-            // Rather than silently dropping the polygon (which would leave a hole/floating
-            // edge in the seam), fall back to a triangle fan over the exterior ring. This is
-            // only exact for convex rings, but every clipped topology sub-polygon starts from
-            // a single triangle, so its exterior is convex or near-convex in practice.
-            for i in 1..exterior_len.saturating_sub(1) {
-                emit_tri(0, i, i + 1);
-            }
-        }
-    }
-}
-
-/// Tolerance (metres) for treating seam geometry as degenerate: vertices within this
-/// distance of the line through their neighbours are dropped, and triangles thinner than
-/// this are skipped. Well below any real mine-surface detail, so this only removes the
-/// numerical slivers produced by clipping topology triangles against the jagged 3D contact
-/// line — the source of "floating edge" artefacts along the cut.
-const SEAM_TOLERANCE: f64 = 1e-3;
-
-/// Push a ring's vertices (translated to `origin`) into `flat` as `[x, y, ...]`, dropping
-/// vertices that are within `SEAM_TOLERANCE` of the segment joining their neighbours. This
-/// collapses the redundant, near-collinear points left along the contact line by unioning
-/// many per-face clip polygons, which would otherwise make earcut emit needle triangles.
-/// Returns the number of vertices kept.
-fn push_seam_ring(
-    ring: &geo::LineString<f64>,
-    origin: geo::Coord<f64>,
-    flat: &mut Vec<f64>,
-) -> usize {
-    let coords: Vec<geo::Coord<f64>> = ring.coords().copied().collect();
-    let n = coords.len().saturating_sub(1); // geo rings repeat the first point at the end
-    if n < 3 {
-        return 0;
-    }
-    let keep: Vec<bool> = (0..n)
-        .map(|i| {
-            let prev = coords[(i + n - 1) % n];
-            let cur = coords[i];
-            let next = coords[(i + 1) % n];
-            let dx = next.x - prev.x;
-            let dy = next.y - prev.y;
-            let len = dx.hypot(dy);
-            if len < 1e-9 {
-                return true;
-            }
-            let perp = ((cur.x - prev.x) * dy - (cur.y - prev.y) * dx).abs() / len;
-            perp >= SEAM_TOLERANCE
-        })
-        .collect();
-    let kept = keep.iter().filter(|&&k| k).count();
-    if kept < 3 {
-        return 0;
-    }
-    for (i, c) in coords[..n].iter().enumerate() {
-        if keep[i] {
-            flat.push(c.x - origin.x);
-            flat.push(c.y - origin.y);
-        }
-    }
-    kept
 }
 
 #[derive(Debug)]
@@ -929,11 +543,12 @@ fn overlap_z_delta(a: [tri00t::Vertex; 3], b: [tri00t::Vertex; 3], overlap: &[gl
         .fold(0.0, f64::max)
 }
 
-/// Prepare a pit shell mesh as a candidate-matching surface for `clip_topology_to_pit_shell`.
-/// Unlike `prepare_reference_surface_relaxed`, this keeps near-vertical wall faces — they
-/// have little or no XY-projected area but are exactly the geometry that determines how far
-/// in from the rim the topology needs to be removed as depth increases. Only genuinely
-/// degenerate faces (zero area in 3D — duplicate or collinear points) are dropped.
+/// Prepare a pit shell mesh as input to `build_pit_shell_lower_envelope`. Unlike
+/// `prepare_reference_surface_relaxed`, this keeps vertical and near-vertical wall faces —
+/// they have little or no XY-projected area, but their edges are exactly the boundaries the
+/// envelope arrangement must respect (bench crests, wall toes), and their surfaces define
+/// the envelope over wall bands. Only genuinely degenerate faces (zero area in 3D —
+/// duplicate or collinear points) are dropped.
 pub(super) fn prepare_pit_shell_surface(
     pit_shell: &tri00t::Triangulation,
 ) -> Result<PreparedReferenceSurface> {
@@ -976,6 +591,158 @@ fn triangle_area_3d(triangle: [tri00t::Vertex; 3]) -> f64 {
     let b = glam::DVec3::new(triangle[1].x, triangle[1].y, triangle[1].z);
     let c = glam::DVec3::new(triangle[2].x, triangle[2].y, triangle[2].z);
     (b - a).cross(c - a).length() * 0.5
+}
+
+/// The pit shell's lower envelope: a triangulated planar subdivision that tiles all of XY.
+/// Cells with `covered[i] == true` carry the lowest shell surface over their footprint in
+/// their vertex Z; open cells (outside the shell footprint, or padding around it) never
+/// remove topology and carry no meaningful Z.
+#[derive(Debug)]
+pub(super) struct PitShellLowerEnvelope {
+    mesh: tri00t::Triangulation,
+    triangles: Vec<[tri00t::Vertex; 3]>,
+    covered: Vec<bool>,
+    spatial: crate::model::spatial::TriangleBvh,
+}
+
+/// How far beyond the shell bounds the envelope's open padding cells extend (metres).
+/// Larger than any real survey extent, so every topology triangle lands inside the padded
+/// triangulation and is handled by the same per-cell path.
+const ENVELOPE_PADDING: f64 = 1.0e7;
+
+/// Build the pit shell's lower envelope: the single-valued 2.5D surface giving, at every
+/// XY point of the shell's footprint, the lowest shell surface there. This reduces the
+/// multi-valued shell (walls, benches, watertight solids) to the one surface that decides
+/// excavation — a topology point is excavated exactly when it lies above the lower envelope.
+///
+/// The construction is exact, not sampled. Every shell triangle edge is projected to XY and
+/// inserted as a CDT constraint (splitting where edges cross), so no output cell interior
+/// crosses the projected boundary of any shell face. Within one cell the set of covering
+/// shell faces is therefore constant, and — because a valid shell does not self-intersect,
+/// so faces overlapping in XY never cross in 3D — their vertical order is constant too.
+/// One interior sample per cell then identifies the lowest covering face exactly, and that
+/// face's plane supplies the cell's corner elevations. Exactly vertical faces contribute
+/// their edges as constraints (bench crests and wall toes land on cell boundaries, where
+/// the envelope legitimately jumps) but never supply elevations. Cells with no covering
+/// face — outside the shell's (possibly concave) footprint, or in the far padding — are
+/// kept as open cells so the envelope tiles the whole plane.
+pub(super) fn build_pit_shell_lower_envelope(
+    pit_shell: &PreparedReferenceSurface,
+) -> Result<PitShellLowerEnvelope> {
+    use spade::{ConstrainedDelaunayTriangulation, Point2};
+
+    // Work in coordinates local to the shell's minimum corner: at real-world (UTM-scale)
+    // magnitudes the absolute coordinates would erode the precision of the CDT's
+    // constraint-splitting intersection points.
+    let bounds = pit_shell.mesh.bounds();
+    let origin = glam::DVec2::new(bounds.min.x, bounds.min.y);
+    let extent = glam::DVec2::new(bounds.max.x - bounds.min.x, bounds.max.y - bounds.min.y);
+
+    let mut cdt: ConstrainedDelaunayTriangulation<Point2<f64>> =
+        ConstrainedDelaunayTriangulation::new();
+    for (corner_x, corner_y) in [
+        (-ENVELOPE_PADDING, -ENVELOPE_PADDING),
+        (extent.x + ENVELOPE_PADDING, -ENVELOPE_PADDING),
+        (extent.x + ENVELOPE_PADDING, extent.y + ENVELOPE_PADDING),
+        (-ENVELOPE_PADDING, extent.y + ENVELOPE_PADDING),
+    ] {
+        cdt.insert(Point2::new(corner_x, corner_y))
+            .map_err(|error| anyhow::anyhow!("Pit shell CDT insert failed: {error:?}"))?;
+    }
+    for triangle in &pit_shell.triangles {
+        let mut handles = Vec::with_capacity(3);
+        for point in triangle {
+            if !point.x.is_finite() || !point.y.is_finite() {
+                anyhow::bail!("Pit shell contains non-finite coordinates");
+            }
+            let handle = cdt
+                .insert(Point2::new(point.x - origin.x, point.y - origin.y))
+                .map_err(|error| anyhow::anyhow!("Pit shell CDT insert failed: {error:?}"))?;
+            handles.push(handle);
+        }
+        for i in 0..3 {
+            let a = handles[i];
+            let b = handles[(i + 1) % 3];
+            if a != b {
+                cdt.add_constraint_and_split(a, b, |point| point);
+            }
+        }
+    }
+
+    let mut vertices = Vec::new();
+    let mut faces = Vec::new();
+    let mut triangles = Vec::new();
+    let mut covered = Vec::new();
+    for face in cdt.inner_faces() {
+        let corners = face.vertices().map(|vertex| {
+            let position = vertex.position();
+            glam::DVec2::new(position.x + origin.x, position.y + origin.y)
+        });
+        let centroid = (corners[0] + corners[1] + corners[2]) / 3.0;
+        let lowest = lowest_covering_shell_triangle(pit_shell, centroid);
+        let cell = corners.map(|corner| {
+            let z = lowest.map_or(0.0, |lowest| bary_z(corner.x, corner.y, lowest));
+            tri00t::Vertex::new(corner.x, corner.y, z)
+        });
+        if triangle_xy_area(cell).abs() <= 1e-12 {
+            continue;
+        }
+        let base = vertices.len() as u32;
+        vertices.extend_from_slice(&cell);
+        faces.push([base, base + 1, base + 2]);
+        triangles.push(cell);
+        covered.push(lowest.is_some());
+    }
+
+    if !covered.iter().any(|&is_covered| is_covered) {
+        anyhow::bail!("Pit shell has no XY footprint to build a lower envelope from");
+    }
+
+    let mesh = tri00t::Triangulation::from_vertices_and_faces(vertices, faces);
+    let spatial = crate::model::spatial::TriangleBvh::build(&mesh);
+    Ok(PitShellLowerEnvelope {
+        mesh,
+        triangles,
+        covered,
+        spatial,
+    })
+}
+
+/// The lowest shell face covering `point` in XY. Inclusive of face edges; exactly vertical
+/// faces (degenerate XY projection) never match.
+fn lowest_covering_shell_triangle(
+    pit_shell: &PreparedReferenceSurface,
+    point: glam::DVec2,
+) -> Option<[tri00t::Vertex; 3]> {
+    let mut lowest: Option<(f64, [tri00t::Vertex; 3])> = None;
+    for index in pit_shell
+        .spatial
+        .xy_bounds_candidate_indices(&pit_shell.mesh, point, point)
+    {
+        let triangle = pit_shell.triangles[index];
+        if let Some(z) = point_in_triangle_bary_z(point.x, point.y, triangle)
+            && lowest.is_none_or(|(lowest_z, _)| z < lowest_z)
+        {
+            lowest = Some((z, triangle));
+        }
+    }
+    lowest.map(|(_, triangle)| triangle)
+}
+
+/// Barycentric Z of `(x, y)` on triangle `v`, inclusive of XY edges. `None` outside the
+/// triangle or when its XY projection is degenerate.
+fn point_in_triangle_bary_z(x: f64, y: f64, v: [tri00t::Vertex; 3]) -> Option<f64> {
+    let denom = (v[1].y - v[2].y) * (v[0].x - v[2].x) + (v[2].x - v[1].x) * (v[0].y - v[2].y);
+    if denom.abs() < 1e-12 {
+        return None;
+    }
+    let w0 = ((v[1].y - v[2].y) * (x - v[2].x) + (v[2].x - v[1].x) * (y - v[2].y)) / denom;
+    let w1 = ((v[2].y - v[0].y) * (x - v[2].x) + (v[0].x - v[2].x) * (y - v[2].y)) / denom;
+    let w2 = 1.0 - w0 - w1;
+    if w0 < -1e-9 || w1 < -1e-9 || w2 < -1e-9 {
+        return None;
+    }
+    Some(w0 * v[0].z + w1 * v[1].z + w2 * v[2].z)
 }
 
 pub(super) fn prepare_reference_surface_relaxed(
@@ -1103,19 +870,25 @@ pub(super) fn clip_polygon_3d_by_xy_edge(
     if polygon.is_empty() {
         return Vec::new();
     }
-    let edge = edge_b - edge_a;
+    // Signed distance in metres (scale-independent of edge length), so the
+    // on-boundary tolerance means the same thing for every clip edge.
     let signed_distance = |point: glam::DVec3| {
-        let cross = edge.x * (point.y - edge_a.y) - edge.y * (point.x - edge_a.x);
-        if clip_ccw { cross } else { -cross }
+        let d = crate::model::kernel::signed_distance_to_line(
+            glam::DVec2::new(point.x, point.y),
+            edge_a,
+            edge_b,
+        );
+        if clip_ccw { d } else { -d }
     };
+    const INSIDE_TOL: f64 = crate::model::kernel::XY_TOL;
 
     let mut output = Vec::new();
     let mut previous = polygon[polygon.len() - 1];
     let mut previous_distance = signed_distance(previous);
-    let mut previous_inside = previous_distance >= -1e-10;
+    let mut previous_inside = previous_distance >= -INSIDE_TOL;
     for &current in polygon {
         let current_distance = signed_distance(current);
-        let current_inside = current_distance >= -1e-10;
+        let current_inside = current_distance >= -INSIDE_TOL;
         if current_inside != previous_inside {
             let denominator = previous_distance - current_distance;
             if denominator.abs() > 1e-20 {
@@ -1151,19 +924,21 @@ pub(super) fn clip_polygon_by_xy_edge(
     if polygon.is_empty() {
         return Vec::new();
     }
-    let edge = edge_b - edge_a;
+    // Signed distance in metres (scale-independent of edge length), so the
+    // on-boundary tolerance means the same thing for every clip edge.
     let signed_distance = |point: glam::DVec2| {
-        let cross = edge.x * (point.y - edge_a.y) - edge.y * (point.x - edge_a.x);
-        if clip_ccw { cross } else { -cross }
+        let d = crate::model::kernel::signed_distance_to_line(point, edge_a, edge_b);
+        if clip_ccw { d } else { -d }
     };
+    const INSIDE_TOL: f64 = crate::model::kernel::XY_TOL;
 
     let mut output = Vec::new();
     let mut previous = *polygon.last().expect("polygon is non-empty");
     let mut previous_distance = signed_distance(previous);
-    let mut previous_inside = previous_distance >= -1e-10;
+    let mut previous_inside = previous_distance >= -INSIDE_TOL;
     for &current in polygon {
         let current_distance = signed_distance(current);
-        let current_inside = current_distance >= -1e-10;
+        let current_inside = current_distance >= -INSIDE_TOL;
         if current_inside != previous_inside {
             let denominator = previous_distance - current_distance;
             if denominator.abs() > 1e-20 {
@@ -1285,26 +1060,22 @@ mod tests {
             .find_map(|index| {
                 let face = mesh.face_vertex_indices(index)?;
                 let triangle = [vertices[face[0]], vertices[face[1]], vertices[face[2]]];
-                point_in_triangle_bary_z_inclusive_for_test(x, y, triangle)
+                point_in_triangle_bary_z(x, y, triangle)
             })
     }
 
-    fn point_in_triangle_bary_z_inclusive_for_test(
-        x: f64,
-        y: f64,
-        v: [tri00t::Vertex; 3],
-    ) -> Option<f64> {
-        let denom = (v[1].y - v[2].y) * (v[0].x - v[2].x) + (v[2].x - v[1].x) * (v[0].y - v[2].y);
-        if denom.abs() < 1e-12 {
-            return None;
-        }
-        let w0 = ((v[1].y - v[2].y) * (x - v[2].x) + (v[2].x - v[1].x) * (y - v[2].y)) / denom;
-        let w1 = ((v[2].y - v[0].y) * (x - v[2].x) + (v[0].x - v[2].x) * (y - v[2].y)) / denom;
-        let w2 = 1.0 - w0 - w1;
-        if w0 < -1e-9 || w1 < -1e-9 || w2 < -1e-9 {
-            return None;
-        }
-        Some(w0 * v[0].z + w1 * v[1].z + w2 * v[2].z)
+    fn envelope_of(pit_shell_mesh: &tri00t::Triangulation) -> PitShellLowerEnvelope {
+        build_pit_shell_lower_envelope(&prepare_pit_shell_surface(pit_shell_mesh).unwrap()).unwrap()
+    }
+
+    fn envelope_z(envelope: &PitShellLowerEnvelope, x: f64, y: f64) -> Option<f64> {
+        let point = glam::DVec2::new(x, y);
+        envelope
+            .spatial
+            .xy_bounds_candidate_indices(&envelope.mesh, point, point)
+            .into_iter()
+            .filter(|&index| envelope.covered[index])
+            .find_map(|index| point_in_triangle_bary_z(x, y, envelope.triangles[index]))
     }
 
     #[test]
@@ -1332,8 +1103,8 @@ mod tests {
             vec![[0, 1, 2], [0, 2, 3]],
         );
 
-        let pit_shell = prepare_pit_shell_surface(&pit_shell_mesh).unwrap();
-        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &pit_shell);
+        let envelope = envelope_of(&pit_shell_mesh);
+        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &envelope);
 
         assert!(!faces.is_empty());
         // 900 topology - 50 removed (rectangle x:[5,10], y:[0,10]).
@@ -1357,9 +1128,9 @@ mod tests {
 
     #[test]
     fn clip_topology_to_pit_shell_closed_solid_cap_does_not_cancel_footprint() {
-        // Regression: a watertight solid whose up-facing crest cap and down-facing floor
-        // project onto the same XY footprint with opposite winding. Without CCW
-        // normalization these cancel in the union, leaving nothing removed.
+        // A watertight solid whose up-facing crest cap and down-facing floor project onto
+        // the same XY footprint. The lower envelope must resolve to the floor, and the
+        // topology above it must be removed over the full footprint.
         let r0 = tri00t::Vertex::new(0.0, 0.0, 0.0);
         let r1 = tri00t::Vertex::new(10.0, 0.0, 0.0);
         let r2 = tri00t::Vertex::new(10.0, 10.0, 0.0);
@@ -1398,8 +1169,8 @@ mod tests {
             vec![[0, 1, 2], [0, 2, 3]],
         );
 
-        let pit_shell = prepare_pit_shell_surface(&pit_shell_mesh).unwrap();
-        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &pit_shell);
+        let envelope = envelope_of(&pit_shell_mesh);
+        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &envelope);
         let total_area = kept_area(&verts, &faces);
         assert!(
             (total_area - 800.0).abs() < 1e-6,
@@ -1408,76 +1179,77 @@ mod tests {
     }
 
     #[test]
-    fn emit_earcut_polygon_drops_needle_slivers_but_keeps_real_area() {
-        use geo::{Coord, LineString, Polygon as GeoPoly};
-        let target = [
-            tri00t::Vertex::new(0.0, 0.0, 0.0),
-            tri00t::Vertex::new(10.0, 0.0, 0.0),
-            tri00t::Vertex::new(0.0, 10.0, 0.0),
-        ];
+    fn lower_envelope_of_closed_solid_is_the_floor() {
+        // Same watertight box as above: crest cap at z=0, floor at z=-10 over [0,10]^2,
+        // exactly vertical walls. The envelope must be the floor everywhere inside the
+        // footprint and absent outside it.
+        let r0 = tri00t::Vertex::new(0.0, 0.0, 0.0);
+        let r1 = tri00t::Vertex::new(10.0, 0.0, 0.0);
+        let r2 = tri00t::Vertex::new(10.0, 10.0, 0.0);
+        let r3 = tri00t::Vertex::new(0.0, 10.0, 0.0);
+        let f0 = tri00t::Vertex::new(0.0, 0.0, -10.0);
+        let f1 = tri00t::Vertex::new(10.0, 0.0, -10.0);
+        let f2 = tri00t::Vertex::new(10.0, 10.0, -10.0);
+        let f3 = tri00t::Vertex::new(0.0, 10.0, -10.0);
+        let pit_shell_mesh = tri00t::Triangulation::from_vertices_and_faces(
+            vec![r0, r1, r2, r3, f0, f1, f2, f3],
+            vec![
+                [0, 1, 2],
+                [0, 2, 3],
+                [4, 6, 5],
+                [4, 7, 6],
+                [0, 5, 1],
+                [0, 4, 5],
+                [1, 6, 2],
+                [1, 5, 6],
+                [2, 7, 3],
+                [2, 6, 7],
+                [3, 4, 0],
+                [3, 7, 4],
+            ],
+        );
 
-        // A 10m-long sliver only 0.1mm wide (below SEAM_TOLERANCE): the "floating edge"
-        // artefact. It must not emit any faces.
-        let needle = GeoPoly::new(
-            LineString::new(vec![
-                Coord { x: 0.0, y: 1.0 },
-                Coord { x: 10.0, y: 1.0 },
-                Coord { x: 10.0, y: 1.0001 },
-                Coord { x: 0.0, y: 1.0001 },
-                Coord { x: 0.0, y: 1.0 },
-            ]),
-            vec![],
-        );
-        let mut verts = Vec::new();
-        let mut faces = Vec::new();
-        emit_earcut_polygon(&needle, target, &mut verts, &mut faces);
-        assert!(
-            faces.is_empty(),
-            "needle sliver should emit no faces, got {}",
-            faces.len()
-        );
-
-        // A real 4x4 square with a redundant near-collinear midpoint on one edge triangulates
-        // to its full area with no needle triangles.
-        let square = GeoPoly::new(
-            LineString::new(vec![
-                Coord { x: 0.0, y: 0.0 },
-                Coord { x: 2.0, y: 0.00005 }, // near-collinear midpoint on the bottom edge
-                Coord { x: 4.0, y: 0.0 },
-                Coord { x: 4.0, y: 4.0 },
-                Coord { x: 0.0, y: 4.0 },
-                Coord { x: 0.0, y: 0.0 },
-            ]),
-            vec![],
-        );
-        let mut verts = Vec::new();
-        let mut faces = Vec::new();
-        emit_earcut_polygon(&square, target, &mut verts, &mut faces);
-        let area = kept_area(&verts, &faces);
-        assert!((area - 16.0).abs() < 1e-3, "expected area ~16, got {area}");
-        for face in &faces {
-            let tri = [
-                verts[face[0] as usize],
-                verts[face[1] as usize],
-                verts[face[2] as usize],
-            ];
-            let ar = triangle_xy_area(tri).abs() * 2.0;
-            let longest = {
-                let e = |p: tri00t::Vertex, q: tri00t::Vertex| (p.x - q.x).hypot(p.y - q.y);
-                e(tri[0], tri[1])
-                    .max(e(tri[1], tri[2]))
-                    .max(e(tri[2], tri[0]))
-            };
+        let envelope = envelope_of(&pit_shell_mesh);
+        for (x, y) in [(5.0, 5.0), (0.5, 0.5), (9.5, 9.5), (5.0, 0.5)] {
+            let z = envelope_z(&envelope, x, y);
             assert!(
-                ar / longest >= 1e-3,
-                "no needle triangles should be emitted"
+                z.is_some_and(|z| (z - -10.0).abs() < 1e-9),
+                "envelope at ({x}, {y}) should be the floor (-10), got {z:?}"
             );
         }
+        assert!(
+            envelope_z(&envelope, -1.0, 5.0).is_none(),
+            "envelope should not extend outside the shell footprint"
+        );
     }
 
     #[test]
-    fn trim_triangles_inside_void_deletes_floaters_but_keeps_the_floating_band() {
-        // Pit shell: crest at z=0 over [0,10]^2 sloping down to a floor at z=-10 over [3,7]^2.
+    fn lower_envelope_of_frustum_follows_walls_down_to_the_floor() {
+        // Frustum: crest rim at z=0 over [0,10]^2 sloping down to a floor at z=-10 over
+        // [3,7]^2 (walls only, no crest cap). The envelope is the wall surface over the
+        // wall band and the floor inside it.
+        let pit_shell_mesh = frustum_pit_shell();
+        let envelope = envelope_of(&pit_shell_mesh);
+
+        // Floor.
+        let z = envelope_z(&envelope, 5.0, 5.0);
+        assert!(
+            z.is_some_and(|z| (z - -10.0).abs() < 1e-9),
+            "envelope at the pit centre should be the floor (-10), got {z:?}"
+        );
+        // Front wall band: the wall plane there is z = -10 * (y / 3).
+        let z = envelope_z(&envelope, 5.0, 1.5);
+        assert!(
+            z.is_some_and(|z| (z - -5.0).abs() < 1e-9),
+            "envelope on the front wall band should be -5, got {z:?}"
+        );
+        // Outside the rim.
+        assert!(envelope_z(&envelope, 12.0, 5.0).is_none());
+    }
+
+    /// Frustum pit shell: crest rim at z=0 over [0,10]^2 sloping down to a floor at z=-10
+    /// over [3,7]^2 (walls + floor, no crest cap).
+    fn frustum_pit_shell() -> tri00t::Triangulation {
         let r0 = tri00t::Vertex::new(0.0, 0.0, 0.0);
         let r1 = tri00t::Vertex::new(10.0, 0.0, 0.0);
         let r2 = tri00t::Vertex::new(10.0, 10.0, 0.0);
@@ -1486,7 +1258,7 @@ mod tests {
         let f1 = tri00t::Vertex::new(7.0, 3.0, -10.0);
         let f2 = tri00t::Vertex::new(7.0, 7.0, -10.0);
         let f3 = tri00t::Vertex::new(3.0, 7.0, -10.0);
-        let pit_shell_mesh = tri00t::Triangulation::from_vertices_and_faces(
+        tri00t::Triangulation::from_vertices_and_faces(
             vec![r0, r1, r2, r3, f0, f1, f2, f3],
             vec![
                 [0, 1, 5],
@@ -1500,22 +1272,25 @@ mod tests {
                 [4, 5, 6],
                 [4, 6, 7],
             ],
-        );
-        let pit_shell = prepare_pit_shell_surface(&pit_shell_mesh).unwrap();
+        )
+    }
 
-        // Three planted triangles, each a small square split into two:
+    #[test]
+    fn clip_topology_to_pit_shell_removes_floaters_but_keeps_outside_geometry() {
+        let envelope = envelope_of(&frustum_pit_shell());
+
+        // Three planted quads (two triangles each):
         //   A) at the pit centre, z=-5 — above the floor (-10): inside the void, must be dropped.
-        //   B) near the rim, z=+2 — above the crest but the shell (0) is below +2 there: this is
-        //      excavated too, must be dropped.
+        //   B) near the rim, z=+2 — above the wall band there: excavated too, must be dropped.
         //   C) outside the footprint entirely: must be kept.
         let planted = [
-            ([4.0, 4.0], -5.0, false), // A: void
-            ([1.0, 1.0], 2.0, false),  // B: excavated near rim
-            ([20.0, 20.0], 5.0, true), // C: outside, keep
+            ([4.0, 4.0], -5.0),  // A: void
+            ([1.0, 1.0], 2.0),   // B: excavated near rim
+            ([20.0, 20.0], 5.0), // C: outside, keep
         ];
         let mut vertices = Vec::new();
         let mut faces = Vec::new();
-        for ([x, y], z, _keep) in planted {
+        for ([x, y], z) in planted {
             let quad = [
                 tri00t::Vertex::new(x, y, z),
                 tri00t::Vertex::new(x + 1.0, y, z),
@@ -1527,8 +1302,9 @@ mod tests {
             faces.push([base, base + 1, base + 2]);
             faces.push([base, base + 2, base + 3]);
         }
+        let topology_mesh = tri00t::Triangulation::from_vertices_and_faces(vertices, faces);
 
-        trim_triangles_inside_void(&pit_shell, &mut vertices, &mut faces);
+        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &envelope);
 
         // Only the outside quad (2 triangles) should survive.
         assert_eq!(
@@ -1537,16 +1313,15 @@ mod tests {
             "only the outside-footprint quad should remain"
         );
         for face in &faces {
-            let cx = (vertices[face[0] as usize].x
-                + vertices[face[1] as usize].x
-                + vertices[face[2] as usize].x)
-                / 3.0;
-            assert!(cx > 15.0, "a void/excavated triangle survived cleanup");
+            let cx =
+                (verts[face[0] as usize].x + verts[face[1] as usize].x + verts[face[2] as usize].x)
+                    / 3.0;
+            assert!(cx > 15.0, "a void/excavated triangle survived the cut");
         }
     }
 
     #[test]
-    fn trim_triangles_inside_void_clips_partial_lips() {
+    fn clip_topology_to_pit_shell_clips_partial_lips() {
         let pit_shell_mesh = tri00t::Triangulation::from_vertices_and_faces(
             vec![
                 tri00t::Vertex::new(0.0, 0.0, 0.0),
@@ -1556,36 +1331,40 @@ mod tests {
             ],
             vec![[0, 1, 2], [0, 2, 3]],
         );
-        let pit_shell = prepare_pit_shell_surface(&pit_shell_mesh).unwrap();
+        let envelope = envelope_of(&pit_shell_mesh);
 
-        let mut vertices = vec![
-            tri00t::Vertex::new(3.0, 2.0, 1.0),
-            tri00t::Vertex::new(9.0, 2.0, -2.0),
-            tri00t::Vertex::new(3.0, 8.0, -2.0),
-        ];
-        let mut faces = vec![[0, 1, 2]];
+        // One topology triangle whose corner near (3, 2) pokes above the flat shell at z=0:
+        // only that 2 m^2 lip is excavated.
+        let topology_mesh = tri00t::Triangulation::from_vertices_and_faces(
+            vec![
+                tri00t::Vertex::new(3.0, 2.0, 1.0),
+                tri00t::Vertex::new(9.0, 2.0, -2.0),
+                tri00t::Vertex::new(3.0, 8.0, -2.0),
+            ],
+            vec![[0, 1, 2]],
+        );
 
-        trim_triangles_inside_void(&pit_shell, &mut vertices, &mut faces);
+        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &envelope);
 
-        let kept = kept_area(&vertices, &faces);
+        let kept = kept_area(&verts, &faces);
         assert!(
             (kept - 16.0).abs() < 1e-4,
             "expected only the lip corner clipped away, got kept_area={kept}"
         );
         assert!(
-            vertices
-                .iter()
-                .all(|vertex| vertex.z <= VOID_CLEANUP_TOLERANCE + 1e-9),
-            "cleanup left a vertex above the shell lower envelope"
+            verts.iter().all(|vertex| vertex.z <= 1e-9),
+            "cut left a vertex above the shell lower envelope"
         );
         assert!(
             faces.len() > 1,
-            "partial cleanup should trim the triangle instead of dropping or keeping it whole"
+            "the cut should trim the triangle instead of dropping or keeping it whole"
         );
     }
 
     #[test]
-    fn trim_triangles_inside_void_clips_interior_lips() {
+    fn clip_topology_to_pit_shell_clips_interior_lips() {
+        // A small shell patch strictly inside one big topology triangle: the removed region
+        // is a hole in the triangle's interior.
         let pit_shell_mesh = tri00t::Triangulation::from_vertices_and_faces(
             vec![
                 tri00t::Vertex::new(7.0, 1.0, -10.0),
@@ -1594,30 +1373,32 @@ mod tests {
             ],
             vec![[0, 1, 2]],
         );
-        let pit_shell = prepare_pit_shell_surface(&pit_shell_mesh).unwrap();
+        let envelope = envelope_of(&pit_shell_mesh);
 
-        let mut vertices = vec![
-            tri00t::Vertex::new(0.0, 0.0, -5.0),
-            tri00t::Vertex::new(10.0, 0.0, -5.0),
-            tri00t::Vertex::new(0.0, 10.0, -5.0),
-        ];
-        let mut faces = vec![[0, 1, 2]];
+        let topology_mesh = tri00t::Triangulation::from_vertices_and_faces(
+            vec![
+                tri00t::Vertex::new(0.0, 0.0, -5.0),
+                tri00t::Vertex::new(10.0, 0.0, -5.0),
+                tri00t::Vertex::new(0.0, 10.0, -5.0),
+            ],
+            vec![[0, 1, 2]],
+        );
 
-        trim_triangles_inside_void(&pit_shell, &mut vertices, &mut faces);
+        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &envelope);
 
-        let kept = kept_area(&vertices, &faces);
+        let kept = kept_area(&verts, &faces);
         assert!(
             (kept - 48.0).abs() < 1e-6,
             "expected the interior 2 m^2 lip clipped away, got kept_area={kept}"
         );
         for face in &faces {
             let triangle = [
-                vertices[face[0] as usize],
-                vertices[face[1] as usize],
-                vertices[face[2] as usize],
+                verts[face[0] as usize],
+                verts[face[1] as usize],
+                verts[face[2] as usize],
             ];
             assert!(
-                point_strictly_in_triangle_bary_z(7.25, 1.25, triangle).is_none(),
+                point_in_triangle_bary_z(7.25, 1.25, triangle).is_none(),
                 "interior shell patch should not remain covered by topology"
             );
         }
@@ -1631,13 +1412,13 @@ mod tests {
         let pit_surface =
             crate::model::formats::read_mesh("tutorial/example_data/tutorial_pit_surface.00t")
                 .expect("pit surface loads");
-        let pit_shell = prepare_pit_shell_surface(&pit_surface).unwrap();
-        let (verts, faces) = clip_topology_to_pit_shell(&topology, &pit_shell);
+        let envelope = envelope_of(&pit_surface);
+        let (verts, faces) = clip_topology_to_pit_shell(&topology, &envelope);
         let x = 194_396.016;
         let y = 7_954_711.042;
-        let shell_z = shell_lower_envelope_z_strict(&pit_shell, x, y);
+        let shell_z = envelope_z(&envelope, x, y);
         eprintln!(
-            "output verts={} faces={} shell_z_at_reported={shell_z:?}",
+            "output verts={} faces={} envelope_z_at_reported={shell_z:?}",
             verts.len(),
             faces.len()
         );
@@ -1647,7 +1428,7 @@ mod tests {
                 verts[face[1] as usize],
                 verts[face[2] as usize],
             ];
-            if let Some(z) = point_strictly_in_triangle_bary_z(x, y, triangle) {
+            if let Some(z) = point_in_triangle_bary_z(x, y, triangle) {
                 eprintln!(
                     "contains face={face_index} topo_z={z:.6} delta={:?} tri={triangle:?}",
                     shell_z.map(|s| z - s)
@@ -1657,51 +1438,86 @@ mod tests {
         }
     }
 
+    /// Full-footprint verification of the pit-shell cut against real tutorial data, in both
+    /// directions: no output geometry encroaches into the excavated void, and no topology
+    /// that should survive goes missing. Run with `cargo test -- --ignored` when the
+    /// tutorial example data is present.
     #[test]
     #[ignore]
-    fn scan_for_reported_hole_near_picked_triangle() {
+    fn pit_shell_cut_preserves_coverage_and_removes_encroachment_on_tutorial_data() {
         let topology = crate::model::formats::read_mesh("tutorial/example_data/topology.obj")
             .expect("topology.obj loads");
         let pit_surface =
             crate::model::formats::read_mesh("tutorial/example_data/tutorial_pit_surface.00t")
                 .expect("pit surface loads");
-        let pit_shell = prepare_pit_shell_surface(&pit_surface).unwrap();
-        let (verts, faces) = clip_topology_to_pit_shell(&topology, &pit_shell);
+        let envelope = envelope_of(&pit_surface);
+        let (verts, faces) = clip_topology_to_pit_shell(&topology, &envelope);
         let output = tri00t::Triangulation::from_vertices_and_faces(verts, faces);
         let input_bvh = crate::model::spatial::TriangleBvh::build(&topology);
         let output_bvh = crate::model::spatial::TriangleBvh::build(&output);
 
-        let anchor_x = 194_716.885;
-        let anchor_y = 7_954_885.380;
-        let mut missing = Vec::new();
-        for yi in -5..=5 {
-            for xi in -5..=5 {
-                let x = anchor_x + xi as f64;
-                let y = anchor_y + yi as f64;
+        // Samples closer than this (vertically) to the contact line are skipped: right on
+        // the seam, coverage legitimately switches between topology and pit shell.
+        const CONTACT_MARGIN: f64 = 0.01;
+
+        let bounds = topology.bounds();
+        let steps = 400;
+        let step_x = (bounds.max.x - bounds.min.x) / steps as f64;
+        let step_y = (bounds.max.y - bounds.min.y) / steps as f64;
+        let mut worst_encroachment: Option<(f64, f64, f64)> = None;
+        let mut missing: Vec<(f64, f64, f64, Option<f64>)> = Vec::new();
+        let mut checked = 0usize;
+        for yi in 0..=steps {
+            for xi in 0..=steps {
+                let x = bounds.min.x + xi as f64 * step_x;
+                let y = bounds.min.y + yi as f64 * step_y;
                 let Some(input_z) = covering_z_with_bvh(&topology, &input_bvh, x, y) else {
                     continue;
                 };
-                let shell_z = shell_lower_envelope_z_strict(&pit_shell, x, y);
-                let should_keep = shell_z.is_none_or(|z| input_z <= z + 1e-4);
-                if !should_keep {
-                    continue;
-                }
+                checked += 1;
+                let shell_z = envelope_z(&envelope, x, y);
                 let output_z = covering_z_with_bvh(&output, &output_bvh, x, y);
-                if output_z.is_none() {
-                    let dist = (x - anchor_x).hypot(y - anchor_y);
-                    missing.push((dist, x, y, input_z, shell_z));
+                match shell_z {
+                    // Excavated: the topology is clearly above the envelope, so the output
+                    // must not cover this point at all.
+                    Some(shell_z) if input_z > shell_z + CONTACT_MARGIN => {
+                        if output_z.is_some()
+                            && worst_encroachment
+                                .is_none_or(|(depth, ..)| input_z - shell_z > depth)
+                        {
+                            worst_encroachment = Some((input_z - shell_z, x, y));
+                        }
+                    }
+                    // Kept: clearly below the envelope, or outside the shell footprint —
+                    // the output must still cover this point.
+                    Some(shell_z) if input_z < shell_z - CONTACT_MARGIN => {
+                        if output_z.is_none() {
+                            missing.push((x, y, input_z, Some(shell_z)));
+                        }
+                    }
+                    None => {
+                        if output_z.is_none() {
+                            missing.push((x, y, input_z, None));
+                        }
+                    }
+                    // Within the contact margin: either outcome is correct.
+                    Some(_) => {}
                 }
             }
         }
-        missing.sort_by(|a, b| a.0.total_cmp(&b.0));
         eprintln!(
-            "missing_should_keep_samples={} nearest={:?}",
+            "checked={checked} worst_encroachment={worst_encroachment:?} missing={} first_missing={:?}",
             missing.len(),
             missing.iter().take(20).collect::<Vec<_>>()
         );
         assert!(
+            worst_encroachment.is_none(),
+            "output topology encroaches into the excavated void: {worst_encroachment:?}"
+        );
+        assert!(
             missing.is_empty(),
-            "found should-keep samples missing from output"
+            "{} should-keep samples missing from output",
+            missing.len()
         );
     }
 
@@ -1730,8 +1546,8 @@ mod tests {
             vec![[0, 1, 2], [0, 2, 3]],
         );
 
-        let pit_shell = prepare_pit_shell_surface(&pit_shell_mesh).unwrap();
-        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &pit_shell);
+        let envelope = envelope_of(&pit_shell_mesh);
+        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &envelope);
         let total_area = kept_area(&verts, &faces);
         assert!(
             (total_area - 800.0).abs() < 1e-3,
@@ -1759,8 +1575,8 @@ mod tests {
             vec![[0, 1, 2]],
         );
 
-        let pit_shell = prepare_pit_shell_surface(&pit_shell_mesh).unwrap();
-        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &pit_shell);
+        let envelope = envelope_of(&pit_shell_mesh);
+        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &envelope);
 
         assert_eq!(faces.len(), 1);
         assert_eq!(verts.len(), 3);
@@ -1771,33 +1587,9 @@ mod tests {
 
     #[test]
     fn clip_topology_to_pit_shell_follows_walls_down_to_the_floor() {
-        // Pit shell: a frustum — crest rim at z=0 over x/y:[0,10], sloping walls down to a
-        // flat floor at z=-10 over x/y:[3,7]. This is the case prepare_reference_surface_relaxed
-        // would break: the near-vertical walls have almost no XY-projected area and used to be
-        // dropped as "degenerate", leaving only the rim and floor as candidates.
-        let r0 = tri00t::Vertex::new(0.0, 0.0, 0.0);
-        let r1 = tri00t::Vertex::new(10.0, 0.0, 0.0);
-        let r2 = tri00t::Vertex::new(10.0, 10.0, 0.0);
-        let r3 = tri00t::Vertex::new(0.0, 10.0, 0.0);
-        let f0 = tri00t::Vertex::new(3.0, 3.0, -10.0);
-        let f1 = tri00t::Vertex::new(7.0, 3.0, -10.0);
-        let f2 = tri00t::Vertex::new(7.0, 7.0, -10.0);
-        let f3 = tri00t::Vertex::new(3.0, 7.0, -10.0);
-        let pit_shell_mesh = tri00t::Triangulation::from_vertices_and_faces(
-            vec![r0, r1, r2, r3, f0, f1, f2, f3],
-            vec![
-                [0, 1, 5],
-                [0, 5, 4], // front wall
-                [1, 2, 6],
-                [1, 6, 5], // right wall
-                [2, 3, 7],
-                [2, 7, 6], // back wall
-                [3, 0, 4],
-                [3, 4, 7], // left wall
-                [4, 5, 6],
-                [4, 6, 7], // floor
-            ],
-        );
+        // Frustum pit shell: the walls determine how far in from the rim the topology must
+        // be removed as depth increases, so the lower envelope must include them.
+        let pit_shell_mesh = frustum_pit_shell();
 
         // Topology: flat plane at z=-5, well above the floor (-10) but below the rim (0).
         let topology_mesh = tri00t::Triangulation::from_vertices_and_faces(
@@ -1810,8 +1602,8 @@ mod tests {
             vec![[0, 1, 2], [0, 2, 3]],
         );
 
-        let pit_shell = prepare_pit_shell_surface(&pit_shell_mesh).unwrap();
-        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &pit_shell);
+        let envelope = envelope_of(&pit_shell_mesh);
+        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &envelope);
         assert!(!faces.is_empty());
 
         // The cut follows the true contact line down the walls: only the inner part of the

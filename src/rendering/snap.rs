@@ -5,7 +5,10 @@ use glam::{DMat4, DVec2, DVec3};
 use crate::{
     Size,
     model::{
-        Document, Object, SceneEntityId, spatial::ObjectSnapIndex, triangulation::OpenTriangulation,
+        Document, Object, SceneEntityId,
+        road_network::{ResolvedNetwork, RoadKey, resolve},
+        spatial::ObjectSnapIndex,
+        triangulation::OpenTriangulation,
     },
     rendering::pick::{closest_t_on_segment, triangle_weights, world_to_screen},
     ui::state::CursorMode,
@@ -40,6 +43,11 @@ pub(crate) fn snap_cursor(
     let mut best_dist_sq = threshold * threshold;
     let mut best: Option<SnapHit> = None;
     let mut best_surface_depth = f64::INFINITY;
+    // Roads are drawn from their *resolved* centerlines (re-noded through
+    // junction corners, flat approaches applied), which can deviate from the
+    // stored ones — snapping must target what is on screen. Resolved lazily,
+    // only when a road is actually among the candidates.
+    let mut resolved: Option<ResolvedNetwork> = None;
 
     // BVH narrows candidates to objects whose projected AABB overlaps the cursor region.
     let candidates = snap_index.candidates(view_proj, screen, cursor, threshold);
@@ -88,9 +96,30 @@ pub(crate) fn snap_cursor(
             },
 
             CursorMode::SnapToLine => {
+                if let Object::Road { .. } = object {
+                    let network = resolved.get_or_insert_with(|| resolve(document, None));
+                    for edge in network.edges_for(RoadKey::Object(object.id())) {
+                        for pair in edge.center.windows(2) {
+                            let (Some(sa), Some(sb)) = (
+                                world_to_screen(view_proj, pair[0], screen),
+                                world_to_screen(view_proj, pair[1], screen),
+                            ) else {
+                                continue;
+                            };
+                            let t = closest_t_on_segment(cursor, sa, sb);
+                            let d = (sa + (sb - sa) * t).distance_squared(cursor);
+                            if d < best_dist_sq {
+                                best_dist_sq = d;
+                                best = Some(SnapHit {
+                                    world: pair[0] + (pair[1] - pair[0]) * t,
+                                });
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let (verts, closed) = match object {
                     Object::Polyline { verts, closed, .. } => (verts.as_slice(), *closed),
-                    Object::Road { centerline, .. } => (centerline.as_slice(), false),
                     _ => continue,
                 };
                 let n = verts.len();

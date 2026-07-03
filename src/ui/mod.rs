@@ -35,14 +35,7 @@ pub(crate) use unthemed_icon;
 use winit::{event::WindowEvent, window::Window};
 
 use crate::{
-    model::{
-        Document,
-        block_model::OpenBlockModel,
-        geometry::{
-            RoadCenterlineRuleError, road_centerline_with_intersection_flats,
-            validate_road_segment_angles,
-        },
-    },
+    model::{Document, block_model::OpenBlockModel, road_network::RoadRuleViolation},
     rendering::color::{color32_to_rgba, rgba_to_color32},
     ui::{
         fonts::setup_custom_fonts,
@@ -52,6 +45,9 @@ use crate::{
         widgets::viewport::{ViewportLabel, ViewportLabelStyle},
     },
 };
+
+pub(crate) const SELECTION_COLOR_F32: [f32; 4] = [87.0 / 255.0, 163.0 / 255.0, 1.0, 1.0];
+pub(crate) const SELECTION_COLOR: egui::Color32 = egui::Color32::from_rgb(87, 163, 255);
 
 /// Owned egui GUI state: context, winit bridge, and wgpu tessellation renderer.
 ///
@@ -82,8 +78,7 @@ impl Gui {
             style.interaction.show_tooltips_only_when_still = false;
             style.interaction.tooltip_delay = 0.0;
         });
-        let default_selection = rgba_to_color32(crate::app::io::default_selection_color());
-        ctx.set_visuals(theme_visuals(false, default_selection));
+        ctx.set_visuals(theme_visuals(false, SELECTION_COLOR));
 
         let state = egui_winit::State::new(
             ctx.clone(),
@@ -131,7 +126,7 @@ impl Gui {
         camera_forward: [f32; 3],
         camera_up: [f32; 3],
     ) -> UiFrameOutput {
-        let selection_color = selection_color(editor);
+        let selection_color = SELECTION_COLOR;
         let visuals = &self.ctx.global_style().visuals;
         if visuals.dark_mode != editor.dark_mode
             || visuals.selection.stroke.color != selection_color
@@ -231,35 +226,25 @@ struct CanvasOverlay {
     camera_up: [f32; 3],
 }
 
-fn road_preview_angle_too_steep(editor: &EditorState) -> bool {
+/// Short viewport warning for the rule the road preview currently violates
+/// (kept fresh by `update_road_preview`).
+fn road_preview_violation_text(editor: &EditorState) -> Option<&'static str> {
     if editor.active_tool != ActiveTool::MakeRoad || editor.pending_stroke.is_empty() {
-        return false;
+        return None;
     }
-
-    let Some(cursor) = editor.cursor_world else {
-        return false;
-    };
-
-    let mut centerline = editor.pending_stroke.clone();
-    centerline.push(cursor);
-    validate_road_segment_angles(&centerline, editor.road_max_angle_degrees).is_err()
-}
-
-fn road_preview_turn_too_sharp(editor: &EditorState, document: &Document) -> bool {
-    if editor.active_tool != ActiveTool::MakeRoad || editor.pending_stroke.is_empty() {
-        return false;
-    }
-
-    let Some(cursor) = editor.cursor_world else {
-        return false;
-    };
-
-    let mut centerline = editor.pending_stroke.clone();
-    centerline.push(cursor);
-    matches!(
-        road_centerline_with_intersection_flats(&centerline, document, editor.road_width),
-        Err(RoadCenterlineRuleError::TurnTooSharp { .. })
-    )
+    editor
+        .road_preview_violation
+        .map(|violation| match violation {
+            RoadRuleViolation::SegmentTooSteep { .. } => "Ramp gradient is too steep",
+            RoadRuleViolation::TurnTooSharp { .. } => "Road turn is too sharp",
+            RoadRuleViolation::ClearanceTooTight { .. } => {
+                "No room for the flat junction approaches"
+            }
+            RoadRuleViolation::TurnTooCloseToJunction { .. } => {
+                "Road turns too close to a junction"
+            }
+            RoadRuleViolation::DegenerateSegment => "Road segment is too short",
+        })
 }
 
 struct ViewportToolLabel {
@@ -283,7 +268,7 @@ impl ViewportToolLabel {
     }
 }
 
-fn viewport_label_text(editor: &EditorState, document: &Document) -> Option<ViewportToolLabel> {
+fn viewport_label_text(editor: &EditorState) -> Option<ViewportToolLabel> {
     if editor.active_tool == ActiveTool::MeasureDistance
         && let (Some(start), Some(end)) = (editor.measurement_start, editor.measurement_end)
     {
@@ -330,11 +315,8 @@ fn viewport_label_text(editor: &EditorState, document: &Document) -> Option<View
             Some("Select a polygon")
         }
         ActiveTool::DeleteElement => Some("Select an item"),
-        ActiveTool::MakeRoad if road_preview_angle_too_steep(editor) => {
-            return Some(ViewportToolLabel::important("Ramp gradient is too steep"));
-        }
-        ActiveTool::MakeRoad if road_preview_turn_too_sharp(editor, document) => {
-            return Some(ViewportToolLabel::important("Road turn is too sharp"));
+        ActiveTool::MakeRoad => {
+            return road_preview_violation_text(editor).map(ViewportToolLabel::important);
         }
         _ => None,
     }
@@ -441,7 +423,7 @@ fn draw_ui(
         let box_color = if cross_select {
             egui::Color32::from_rgb(80, 220, 100) // green for cross/touch select
         } else {
-            selection_color(editor) // theme colour for window select
+            SELECTION_COLOR // theme colour for window select
         };
         let pixels_per_point = root_ui.ctx().pixels_per_point();
         let selection_rect = egui::Rect::from_two_pos(
@@ -637,7 +619,7 @@ fn draw_ui(
         let ppp = root_ui.ctx().pixels_per_point();
         let pos = egui::pos2(hover_px.0 / ppp, hover_px.1 / ppp);
         let painter = root_ui.painter().with_clip_rect(canvas_rect);
-        let color = selection_color(editor);
+        let color = SELECTION_COLOR;
         painter.circle_filled(pos, 6.0, color);
         painter.circle_stroke(pos, 7.5, egui::Stroke::new(1.5, egui::Color32::WHITE));
     }
@@ -657,7 +639,7 @@ fn draw_ui(
             if let Some(vi) = editor.bezier_selected_verts[slot]
                 && let Some(&(x, y)) = editor.bezier_poly_verts_screen_px.get(vi)
             {
-                painter.circle_filled(egui::pos2(x / ppp, y / ppp), 7.0, selection_color(editor));
+                painter.circle_filled(egui::pos2(x / ppp, y / ppp), 7.0, SELECTION_COLOR);
             }
         }
 
@@ -747,6 +729,9 @@ fn draw_ui(
     }
     crate::ui::dialogs::files::draw_file_operation_dialog(root_ui, editor, project, commands);
     crate::ui::dialogs::files::draw_vertical_exaggeration_dialog(root_ui, editor, canvas_rect);
+    crate::ui::dialogs::editing::draw_move_to_layer_dialog(root_ui, editor, project, commands);
+    crate::ui::dialogs::editing::draw_set_selection_z_dialog(root_ui, editor, commands);
+    crate::ui::dialogs::editing::draw_move_layer_dialog(root_ui, editor, project, commands);
 
     // --- Canvas right-click context menu ---
     if editor.canvas_context_menu_open
@@ -836,7 +821,7 @@ fn draw_ui(
     if editor.road_dialog_open {
         crate::ui::dialogs::editing::draw_road_dialog(root_ui, commands, editor, canvas_rect);
     }
-    if let Some(label) = viewport_label_text(editor, document) {
+    if let Some(label) = viewport_label_text(editor) {
         ViewportLabel::new("viewport_tool_label", label.text, canvas_rect)
             .style(label.style)
             .show(root_ui.ctx());
@@ -966,7 +951,7 @@ fn draw_ui(
         // sentinel/default value) still needs its dropdown shown — losing
         // the whole widget here would strand the user on a variable they
         // can't switch away from through the UI.
-        let range = crate::ui::elements::block_model::active_color_scale(editor, model)
+        let range = crate::ui::elements::block_model::active_color_scale(model)
             .map(|(_, min, max)| (min, max));
         crate::ui::widgets::viewport::ColorScaleLegend::new(
             ("block_model_color_scale_legend", model.id),
@@ -1025,6 +1010,12 @@ fn draw_ui(
         geometry_dirty = true;
         crate::ui::dialogs::triangulation::draw_tri_create_main_dialog(
             root_ui, editor, document, commands,
+        );
+    }
+
+    if editor.tri_create_failure.is_some() {
+        crate::ui::dialogs::triangulation::draw_tri_create_failure_dialog(
+            root_ui, editor, commands,
         );
     }
 
@@ -1119,11 +1110,6 @@ fn dashed_line_segments(
         t += dash + gap;
     }
     segments
-}
-
-/// Returns the current selection colour from the editor state as an sRGB `Color32`.
-pub(crate) fn selection_color(editor: &EditorState) -> egui::Color32 {
-    rgba_to_color32(editor.selection_color)
 }
 
 /// Build an `egui::Visuals` set with selection styling applied to the given theme.

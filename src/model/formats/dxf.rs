@@ -26,7 +26,6 @@ const MAX_BLOCK_DEPTH: usize = 32;
 const TESSELLATION_SEGMENT_LEN: f64 = 0.15;
 const MIN_TESSELLATION_SEGMENTS: usize = 32;
 const MAX_TESSELLATION_SEGMENTS: usize = 4096;
-const DUPLICATE_ENDPOINT_EPSILON: f64 = 1.0e-4;
 
 /// Build a `Document` from a loaded DXF drawing.
 pub(crate) fn from_dxf(drawing: &Drawing) -> Document {
@@ -637,7 +636,7 @@ fn trim_duplicate_open_endpoint(mut verts: Vec<PolyVertex>, closed: bool) -> Vec
     let Some(last) = verts.last() else {
         return verts;
     };
-    if first.pos.distance_squared(last.pos) <= DUPLICATE_ENDPOINT_EPSILON.powi(2) {
+    if crate::model::kernel::points_coincident_3d(first.pos, last.pos) {
         let _ = verts.pop();
     }
     verts

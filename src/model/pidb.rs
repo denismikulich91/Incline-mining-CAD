@@ -189,6 +189,27 @@ impl Workspace {
             .position(|project| project.pidb.document.get_object(object_id).is_some())
     }
 
+    /// Fingerprint of everything `scene_document()` reads: per project, its
+    /// namespace, document revision (bumped by every document mutation) and
+    /// loaded-layer set. Equal keys guarantee an identical composite, letting
+    /// callers skip the rebuild.
+    pub(crate) fn composite_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for project in &self.projects {
+            project.runtime_id.hash(&mut hasher);
+            project.pidb.document.revision().hash(&mut hasher);
+            // Order-insensitive fold over the loaded-layer set.
+            let mut layers_fold: u64 = 0;
+            for layer in &project.loaded_layers {
+                layers_fold ^= layer.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            }
+            layers_fold.hash(&mut hasher);
+            project.loaded_layers.len().hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
     /// Build the composite document rendered and queried by the viewport.
     pub(crate) fn scene_document(&self) -> Document {
         let mut scene = Document::new();
@@ -687,9 +708,33 @@ pub(crate) fn pidb_from_dxf_path(path: impl AsRef<Path>) -> Result<PidbFile> {
 
 pub(crate) fn pidb_from_dgd_isis(path: impl AsRef<Path>) -> Result<PidbFile> {
     let path = path.as_ref();
-    let points = crate::model::formats::isis::read_dgd_points(path)
+    let design = crate::model::formats::isis::read_dgd_design(path)
         .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-    let document = document_from_dgd_points(&points);
+    let index_entries = match crate::model::formats::isis::same_stem_isix_path(path) {
+        Some(index_path) => {
+            let entries = crate::model::formats::isis::read_dgd_index(&index_path)
+                .map_err(|e| anyhow::anyhow!("reading {}: {e}", index_path.display()))?;
+            userspace_log!(
+                "Loaded DGD index sidecar {} ({} current layer entries)",
+                index_path.display(),
+                entries.len()
+            );
+            entries
+        }
+        None => {
+            userspace_log!(
+                "No DGD index sidecar found next to {}; empty DGD layers may be omitted",
+                path.display()
+            );
+            Vec::new()
+        }
+    };
+    let document = document_from_dgd_points(
+        &design.points,
+        &design.texts,
+        &index_entries,
+        &design.layer_names,
+    );
     Ok(PidbFile {
         format_version: PIDB_FORMAT_VERSION,
         document,
@@ -699,49 +744,221 @@ pub(crate) fn pidb_from_dgd_isis(path: impl AsRef<Path>) -> Result<PidbFile> {
     })
 }
 
-fn document_from_dgd_points(points: &[crate::model::formats::isis::DesignPoint]) -> Document {
+fn document_from_dgd_points(
+    points: &[crate::model::formats::isis::DesignPoint],
+    texts: &[crate::model::formats::isis::DesignText],
+    index_entries: &[crate::model::formats::isis::DesignIndexEntry],
+    _embedded_layer_names: &[String],
+) -> Document {
+    use crate::model::formats::isis::{DGD_COORD_RECORD_LEN, DesignGeometryKind};
     use glam::DVec3;
 
     let mut doc = Document::new();
     let mut layer_ids: HashMap<String, LayerId> = HashMap::new();
-    // Current open polyline verts per layer.
-    let mut current_polys: HashMap<LayerId, Vec<PolyVertex>> = HashMap::new();
-    let mut completed: Vec<(LayerId, Vec<PolyVertex>)> = Vec::new();
+    let layer_resolver = DgdLayerResolver::new(index_entries);
+
+    let mut layer_id_for = |doc: &mut Document, name: &str| {
+        *layer_ids.entry(name.to_owned()).or_insert_with(|| {
+            doc.add_layer(name.to_owned(), None, [1.0, 1.0, 1.0, 1.0], true, 0.0)
+        })
+    };
+
+    for entry in index_entries {
+        if let Some(layer_name) = dgd_index_layer_name(&entry.name) {
+            layer_id_for(&mut doc, layer_name);
+        }
+    }
+
+    let mut current_layer = None;
+    let mut current_layer_name: Option<String> = None;
+    let mut current_geometry = DesignGeometryKind::Unknown;
+    let mut current_closed = false;
+    let mut previous_offset = None;
+    let mut current_verts: Vec<PolyVertex> = Vec::new();
+
+    fn finish_segment(
+        doc: &mut Document,
+        layer_id: Option<LayerId>,
+        geometry_kind: DesignGeometryKind,
+        closed: bool,
+        verts: &mut Vec<PolyVertex>,
+    ) {
+        let Some(layer_id) = layer_id else {
+            verts.clear();
+            return;
+        };
+        if geometry_kind == DesignGeometryKind::Point {
+            for vertex in verts.drain(..) {
+                add_dgd_point(doc, layer_id, vertex.pos);
+            }
+            return;
+        }
+        match verts.len() {
+            0 => {}
+            1 => add_dgd_point(doc, layer_id, verts[0].pos),
+            _ => add_dgd_polyline(doc, layer_id, std::mem::take(verts), closed),
+        }
+        verts.clear();
+    }
 
     for point in points {
-        let layer_id = *layer_ids.entry(point.name.clone()).or_insert_with(|| {
-            doc.add_layer(point.name.clone(), None, [1.0, 1.0, 1.0, 1.0], true, 0.0)
-        });
         let vertex = PolyVertex::straight(DVec3::new(point.x, point.y, point.z));
-        if point.seg_type == 0 {
-            if let Some(verts) = current_polys.remove(&layer_id)
-                && !verts.is_empty()
-            {
-                completed.push((layer_id, verts));
+        let has_record_gap =
+            previous_offset.is_some_and(|offset| point.offset != offset + DGD_COORD_RECORD_LEN);
+        if point.seg_type == 0 || current_layer.is_none() || has_record_gap {
+            finish_segment(
+                &mut doc,
+                current_layer,
+                current_geometry,
+                current_closed,
+                &mut current_verts,
+            );
+            current_closed = point.closed;
+            let layer_name = point
+                .layer_name
+                .as_deref()
+                .or_else(|| layer_resolver.layer_name_at(point.offset))
+                .or_else(|| dgd_candidate_layer_name(&point.name))
+                .or_else(|| dgd_candidate_layer_name(&point.secondary_name))
+                .map(str::to_owned);
+            if let Some(layer_name) = layer_name {
+                current_layer = Some(layer_id_for(&mut doc, &layer_name));
+                current_geometry = dgd_segment_geometry_kind(point.geometry_kind, &layer_name);
+                current_layer_name = Some(layer_name);
+            } else if current_layer.is_some() && !has_record_gap {
+                let layer_name = current_layer_name.as_deref().unwrap_or("DGD Import");
+                current_geometry = dgd_segment_geometry_kind(point.geometry_kind, layer_name);
+            } else {
+                let layer_name = "DGD Import";
+                current_layer = Some(layer_id_for(&mut doc, layer_name));
+                current_geometry = dgd_segment_geometry_kind(point.geometry_kind, layer_name);
+                current_layer_name = Some(layer_name.to_owned());
             }
-            current_polys.insert(layer_id, vec![vertex]);
-        } else {
-            current_polys.entry(layer_id).or_default().push(vertex);
         }
+        current_verts.push(vertex);
+        previous_offset = Some(point.offset);
     }
-    for (layer_id, verts) in current_polys {
-        if !verts.is_empty() {
-            completed.push((layer_id, verts));
-        }
-    }
-    for (layer_id, verts) in completed {
-        doc.add_object(|id| Object::Polyline {
+
+    finish_segment(
+        &mut doc,
+        current_layer,
+        current_geometry,
+        current_closed,
+        &mut current_verts,
+    );
+
+    for text in texts {
+        let layer_name = text
+            .layer_name
+            .as_deref()
+            .or_else(|| layer_resolver.layer_name_at(text.offset))
+            .unwrap_or("DGD Import");
+        let layer_id = layer_id_for(&mut doc, layer_name);
+        doc.add_object(|id| Object::Text {
             id,
             layer: layer_id,
-            verts,
-            closed: false,
+            pos: DVec3::new(text.x, text.y, text.z),
+            content: text.content.clone(),
+            height: text.height,
+            rotation: text.rotation_degrees.to_radians(),
             color: ObjectColor::ByLayer,
-            fill: FillStyle::Clear,
-            fill_color: None,
-            line_weight: 1.0,
         });
     }
+
     doc
+}
+
+fn add_dgd_point(doc: &mut Document, layer_id: LayerId, pos: glam::DVec3) {
+    doc.add_object(|id| Object::Point {
+        id,
+        layer: layer_id,
+        pos,
+        color: ObjectColor::ByLayer,
+    });
+}
+
+fn add_dgd_polyline(doc: &mut Document, layer_id: LayerId, verts: Vec<PolyVertex>, closed: bool) {
+    doc.add_object(|id| Object::Polyline {
+        id,
+        layer: layer_id,
+        verts,
+        closed,
+        color: ObjectColor::ByLayer,
+        fill: FillStyle::Clear,
+        fill_color: None,
+        line_weight: 1.0,
+    });
+}
+
+struct DgdLayerResolver<'a> {
+    entries: Vec<&'a crate::model::formats::isis::DesignIndexEntry>,
+}
+
+impl<'a> DgdLayerResolver<'a> {
+    fn new(entries: &'a [crate::model::formats::isis::DesignIndexEntry]) -> Self {
+        let mut entries: Vec<_> = entries.iter().collect();
+        entries.sort_by_key(|entry| entry.offset);
+        Self { entries }
+    }
+
+    fn layer_name_at(&self, offset: usize) -> Option<&'a str> {
+        let index = self.entries.partition_point(|entry| entry.offset <= offset);
+        [
+            index
+                .checked_sub(1)
+                .and_then(|index| self.entries.get(index)),
+            self.entries.get(index),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            dgd_index_layer_name(&entry.name).map(|name| {
+                let distance = entry.offset.abs_diff(offset);
+                (distance, name)
+            })
+        })
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, name)| name)
+    }
+}
+
+fn dgd_segment_geometry_kind(
+    geometry_kind: crate::model::formats::isis::DesignGeometryKind,
+    layer_name: &str,
+) -> crate::model::formats::isis::DesignGeometryKind {
+    if geometry_kind == crate::model::formats::isis::DesignGeometryKind::Unknown
+        && is_dgd_point_collection_layer_name(layer_name)
+    {
+        crate::model::formats::isis::DesignGeometryKind::Point
+    } else {
+        geometry_kind
+    }
+}
+
+fn dgd_candidate_layer_name(raw_name: &str) -> Option<&str> {
+    let name = raw_name.trim();
+    if crate::model::formats::isis::is_dgd_meaningful_layer_name(name) {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+fn dgd_index_layer_name(raw_name: &str) -> Option<&str> {
+    let name = raw_name.trim();
+    if crate::model::formats::isis::is_dgd_index_layer_name(name) {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+fn is_dgd_point_collection_layer_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper == "POINTS"
+        || upper == "REFERENCE_POINTS"
+        || upper.ends_with("_PTS")
+        || upper.ends_with("POINTS")
 }
 
 pub(crate) fn open_project(
@@ -758,4 +975,272 @@ pub(crate) fn open_project(
         loaded_layers: HashSet::new(),
         dirty_layers_cache: RefCell::new(None),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::formats::isis::{DesignGeometryKind, DesignIndexEntry, DesignPoint};
+
+    fn point(name: &str, seg_type: u8, x: f64) -> DesignPoint {
+        point_at(name, seg_type, x as usize, x, DesignGeometryKind::Unknown)
+    }
+
+    fn line_point(name: &str, seg_type: u8, offset: usize, x: f64) -> DesignPoint {
+        point_at(name, seg_type, offset, x, DesignGeometryKind::Line)
+    }
+
+    fn point_at(
+        name: &str,
+        seg_type: u8,
+        offset: usize,
+        x: f64,
+        geometry_kind: DesignGeometryKind,
+    ) -> DesignPoint {
+        DesignPoint {
+            offset,
+            name: name.to_owned(),
+            secondary_name: String::new(),
+            layer_name: None,
+            closed: false,
+            seg_type,
+            geometry_kind,
+            x,
+            y: 1000.0,
+            z: 10.0,
+        }
+    }
+
+    #[test]
+    fn dgd_import_from_env_path() {
+        let Ok(path) = std::env::var("INCLINE_TEST_DGD_IMPORT") else {
+            return;
+        };
+        let pidb = pidb_from_dgd_isis(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        println!(
+            "{path}: {} layers, {} objects",
+            pidb.document.layers().len(),
+            pidb.document.objects().len()
+        );
+        for layer in pidb.document.layers() {
+            println!("  layer: {}", layer.name);
+        }
+        if let Ok(expected_count) = std::env::var("INCLINE_TEST_DGD_IMPORT_LAYER_COUNT") {
+            let expected_count: usize = expected_count.parse().unwrap();
+            assert_eq!(pidb.document.layers().len(), expected_count);
+        }
+        if let Ok(expected_name) = std::env::var("INCLINE_TEST_DGD_IMPORT_LAYER_NAME") {
+            assert!(
+                pidb.document
+                    .layers()
+                    .iter()
+                    .any(|layer| layer.name == expected_name),
+                "{expected_name:?} was not found in {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn dgd_import_builds_segments_in_file_order_not_by_point_name() {
+        let points = vec![
+            line_point("POINT_1", 0, 0, 0.0),
+            line_point("POINT_2", 1, 117, 1.0),
+            line_point("POINT_1", 0, 234, 10.0),
+            line_point("POINT_2", 1, 351, 11.0),
+        ];
+
+        let doc = document_from_dgd_points(&points, &[], &[], &[]);
+
+        assert_eq!(doc.layers().len(), 1);
+        assert_eq!(doc.layers()[0].name, "DGD Import");
+        assert_eq!(doc.objects().len(), 2);
+        for object in doc.objects() {
+            let Object::Polyline { verts, .. } = object else {
+                panic!("expected polyline, got {object:?}");
+            };
+            assert_eq!(verts.len(), 2);
+        }
+    }
+
+    #[test]
+    fn dgd_import_keeps_meaningful_segment_header_names_as_layers() {
+        let points = vec![
+            line_point("DRILLHOLES", 0, 0, 0.0),
+            line_point("DRILLHOLES", 1, 117, 1.0),
+            point("1:1250", 0, 10.0),
+        ];
+
+        let doc = document_from_dgd_points(&points, &[], &[], &[]);
+
+        let layer_names: Vec<&str> = doc
+            .layers()
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect();
+        assert_eq!(layer_names, vec!["DRILLHOLES", "DGD Import"]);
+        assert!(matches!(doc.objects()[0], Object::Polyline { .. }));
+        assert!(matches!(doc.objects()[1], Object::Point { .. }));
+    }
+
+    #[test]
+    fn dgd_import_uses_secondary_record_name_when_primary_is_generated() {
+        let points = vec![DesignPoint {
+            offset: 100,
+            name: "POINT_1".to_owned(),
+            secondary_name: "ORE_OUTLINE".to_owned(),
+            layer_name: None,
+            closed: false,
+            seg_type: 0,
+            geometry_kind: DesignGeometryKind::Unknown,
+            x: 100.0,
+            y: 1000.0,
+            z: 10.0,
+        }];
+
+        let doc = document_from_dgd_points(&points, &[], &[], &[]);
+
+        assert_eq!(doc.layers()[0].name, "ORE_OUTLINE");
+    }
+
+    #[test]
+    fn dgd_import_ignores_numeric_secondary_record_names() {
+        let points = vec![DesignPoint {
+            offset: 100,
+            name: "POINT_1".to_owned(),
+            secondary_name: "0          6".to_owned(),
+            layer_name: None,
+            closed: false,
+            seg_type: 0,
+            geometry_kind: DesignGeometryKind::Unknown,
+            x: 100.0,
+            y: 1000.0,
+            z: 10.0,
+        }];
+
+        let doc = document_from_dgd_points(&points, &[], &[], &[]);
+
+        assert_eq!(doc.layers()[0].name, "DGD Import");
+    }
+
+    #[test]
+    fn dgd_import_uses_inline_header_layer_name_when_primary_is_generated() {
+        let mut point = line_point("POINT_1", 0, 100, 100.0);
+        point.layer_name = Some("Dog".to_owned());
+        let points = vec![point];
+
+        let doc = document_from_dgd_points(&points, &[], &[], &[]);
+
+        assert_eq!(doc.layers()[0].name, "Dog");
+    }
+
+    #[test]
+    fn dgd_import_does_not_precreate_untrusted_gallery_layers() {
+        let points = vec![line_point("POINT_1", 0, 100, 100.0)];
+        let embedded_layer_names = vec!["Cat".to_owned()];
+
+        let doc = document_from_dgd_points(&points, &[], &[], &embedded_layer_names);
+
+        let layer_names: Vec<&str> = doc
+            .layers()
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect();
+        assert_eq!(layer_names, vec!["DGD Import"]);
+    }
+
+    #[test]
+    fn dgd_import_precreates_current_isix_layers() {
+        let index_entries = vec![
+            DesignIndexEntry {
+                offset: 100,
+                name: "Dog".to_owned(),
+            },
+            DesignIndexEntry {
+                offset: 200,
+                name: "1234".to_owned(),
+            },
+            DesignIndexEntry {
+                offset: 300,
+                name: "Cat".to_owned(),
+            },
+            DesignIndexEntry {
+                offset: 400,
+                name: "DIG$COLOUR".to_owned(),
+            },
+            DesignIndexEntry {
+                offset: 500,
+                name: "POLYLINE".to_owned(),
+            },
+        ];
+
+        let doc = document_from_dgd_points(&[], &[], &index_entries, &[]);
+
+        let layer_names: Vec<&str> = doc
+            .layers()
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect();
+        assert_eq!(layer_names, vec!["Dog", "1234", "Cat"]);
+    }
+
+    #[test]
+    fn dgd_import_uses_isix_layer_names_at_segment_starts() {
+        let points = vec![
+            line_point("POINT_1", 0, 100, 100.0),
+            line_point("POINT_2", 1, 217, 117.0),
+            line_point("POINT_3", 0, 334, 200.0),
+            line_point("POINT_4", 1, 451, 217.0),
+        ];
+        let index_entries = vec![
+            DesignIndexEntry {
+                offset: 90,
+                name: "BLASTMASTERS".to_owned(),
+            },
+            DesignIndexEntry {
+                offset: 190,
+                name: "CREST".to_owned(),
+            },
+        ];
+
+        let doc = document_from_dgd_points(&points, &[], &index_entries, &[]);
+
+        let layer_names: Vec<&str> = doc
+            .layers()
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect();
+        assert_eq!(layer_names, vec!["BLASTMASTERS", "CREST"]);
+    }
+
+    #[test]
+    fn dgd_import_breaks_segments_on_record_gaps_even_when_seg_type_continues() {
+        let points = vec![
+            line_point("DRILLHOLES", 0, 0, 0.0),
+            line_point("DRILLHOLES", 1, 117, 1.0),
+            line_point("DRILLHOLES", 1, 500, 20.0),
+        ];
+
+        let doc = document_from_dgd_points(&points, &[], &[], &[]);
+
+        assert_eq!(doc.objects().len(), 2);
+        assert!(matches!(doc.objects()[0], Object::Polyline { .. }));
+        assert!(matches!(doc.objects()[1], Object::Point { .. }));
+    }
+
+    #[test]
+    fn dgd_import_emits_polypoint_runs_as_points() {
+        let points = vec![
+            point_at("POINT_1", 0, 0, 0.0, DesignGeometryKind::Point),
+            point_at("POINT_2", 1, 117, 1.0, DesignGeometryKind::Point),
+        ];
+
+        let doc = document_from_dgd_points(&points, &[], &[], &[]);
+
+        assert_eq!(doc.objects().len(), 2);
+        assert!(
+            doc.objects()
+                .iter()
+                .all(|object| matches!(object, Object::Point { .. }))
+        );
+    }
 }

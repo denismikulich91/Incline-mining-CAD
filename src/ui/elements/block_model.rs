@@ -11,38 +11,18 @@ use crate::{
 
 const TABLE_PAGE_SIZE: usize = 100;
 
-/// Decodes `name` for `model` at most once, reusing the cached result across
-/// UI frames instead of re-walking the page table and re-decoding the raw
-/// bytes for every variable, for every block, on every frame the block-model
-/// tab or colour-scale legend is shown.
-pub(crate) fn decoded_numeric_variable<'a>(
-    editor: &'a mut EditorState,
-    model: &OpenBlockModel,
-    name: &str,
-) -> Option<&'a Vec<f64>> {
-    editor
-        .block_model_variable_cache
-        .entry(model.id)
-        .or_default()
-        .entry(name.to_owned())
-        .or_insert_with(|| model.model.numeric_values(name).ok())
-        .as_ref()
-}
-
-/// The active colour variable's name and render range for `model`, decoding
-/// (and caching) it on demand. `None` when there's no active variable or no
-/// usable range (e.g. every block has the sentinel/default value).
-pub(crate) fn active_color_scale(
-    editor: &mut EditorState,
-    model: &OpenBlockModel,
-) -> Option<(String, f64, f64)> {
+/// The active colour variable's name and render range for `model`, sharing
+/// the model's own decoded-values cache with the renderer. `None` when
+/// there's no active variable or no usable range (e.g. every block has the
+/// sentinel/default value).
+pub(crate) fn active_color_scale(model: &OpenBlockModel) -> Option<(String, f64, f64)> {
     let name = model.active_numeric_variable.clone()?;
     let default = model
         .model
         .variable(&name)
         .and_then(numeric_variable_default);
-    let values = decoded_numeric_variable(editor, model, &name)?;
-    let (min, max) = render_value_range(values, &model.renderable_block_indices, default)?;
+    let values = model.active_numeric_values()?;
+    let (min, max) = render_value_range(&values, &model.renderable_block_indices, default)?;
     Some((name, min, max))
 }
 
@@ -222,19 +202,17 @@ fn draw_block_model_table_contents(
         .unwrap_or(0);
     let start = page * TABLE_PAGE_SIZE;
     let end = (start + TABLE_PAGE_SIZE).min(model.model.metadata.n_blocks);
-    let numeric_vars = model.model.numeric_variables();
-    for var in &numeric_vars {
-        decoded_numeric_variable(editor, model, &var.name);
-    }
-    let decoded: Vec<_> = numeric_vars
+    // Decode only the visible page of each variable; whole-variable decodes
+    // of a large model just to show 100 rows made opening this tab slow.
+    let decoded: Vec<(&str, Option<Vec<f64>>)> = model
+        .model
+        .numeric_variables()
         .iter()
         .map(|var| {
-            let values = editor
-                .block_model_variable_cache
-                .get(&model.id)
-                .and_then(|cache| cache.get(&var.name))
-                .and_then(|values| values.as_ref());
-            (var.name.as_str(), values)
+            (
+                var.name.as_str(),
+                model.model.numeric_values_range(&var.name, start, end).ok(),
+            )
         })
         .collect();
     egui::ScrollArea::both()
@@ -253,7 +231,7 @@ fn draw_block_model_table_contents(
                         for (_, values) in &decoded {
                             let text = values
                                 .as_ref()
-                                .and_then(|values| values.get(row))
+                                .and_then(|values| values.get(row - start))
                                 .map(|value| format!("{value:.4}"))
                                 .unwrap_or_else(|| "-".to_owned());
                             ui.label(text);

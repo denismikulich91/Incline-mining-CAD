@@ -163,7 +163,6 @@ impl<'a> App<'a> {
         self.editor.pending_stroke.clear();
         self.editor.poly_finish_dialog = false;
         self.editor.poly_finish_dialog_px = None;
-        self.editor.active_tool = ActiveTool::None;
         self.invalidate_geometry();
         userspace_log!("Finished closed polygon");
     }
@@ -202,13 +201,13 @@ impl<'a> App<'a> {
         self.editor.pending_stroke.clear();
         self.editor.poly_finish_dialog = false;
         self.editor.poly_finish_dialog_px = None;
-        self.editor.active_tool = ActiveTool::None;
         self.invalidate_geometry();
     }
 
     /// Attempt to finish the active drawing tool via Enter.
+    /// If no stroke is in progress, exits the active drawing tool.
     /// For MakePoly with enough verts, opens the finish dialog at the cursor.
-    /// For MakeLine, commits the pending segment as an open polyline.
+    /// For MakeLine, clears the chain anchor so the next click starts a new string.
     pub(crate) fn try_finish_tool(&mut self) {
         match self.editor.active_tool {
             ActiveTool::MakePoly if self.editor.pending_stroke.len() >= 2 => {
@@ -216,7 +215,17 @@ impl<'a> App<'a> {
                 self.editor.poly_finish_dialog_px = self.editor.cursor_screen_px;
                 self.redraw_requested = true;
             }
-            ActiveTool::MakePoly => {}
+            ActiveTool::MakePoly if !self.editor.pending_stroke.is_empty() => {
+                self.editor.pending_stroke.clear();
+                self.editor.poly_finish_dialog = false;
+                self.editor.poly_finish_dialog_px = None;
+                self.invalidate_geometry();
+                userspace_log!("Finished polygon stroke; MakePoly remains active");
+            }
+            ActiveTool::MakePoly => {
+                self.editor.active_tool = ActiveTool::None;
+                self.invalidate_geometry();
+            }
             ActiveTool::MakeLine => {
                 if self.editor.pending_stroke.len() >= 2 {
                     let verts: Vec<PolyVertex> = self
@@ -233,11 +242,14 @@ impl<'a> App<'a> {
                         );
                     }
                 }
-                // Enter commits the pending segment (if any) and exits the line
-                // tool, mirroring how Escape leaves the tool.
-                self.editor.pending_stroke.clear();
-                self.editor.active_tool = ActiveTool::None;
-                self.invalidate_geometry();
+                if self.editor.pending_stroke.is_empty() {
+                    self.editor.active_tool = ActiveTool::None;
+                    self.invalidate_geometry();
+                } else {
+                    self.editor.pending_stroke.clear();
+                    self.invalidate_geometry();
+                    userspace_log!("Finished line string; MakeLine remains active");
+                }
             }
             _ => {}
         }

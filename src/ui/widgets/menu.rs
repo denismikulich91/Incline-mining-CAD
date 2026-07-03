@@ -489,3 +489,38 @@ impl<'value, T: PartialEq> MenuFieldCombo<'value, T> {
         })
     }
 }
+
+/// Used in prefrences to select a catagory
+pub(crate) struct PrefrenceCatagory {
+    label: String,
+    active: bool,
+}
+
+impl PrefrenceCatagory {
+    pub(crate) fn new(label: String) -> Self {
+        Self {
+            label,
+            active: false,
+        }
+    }
+
+    pub(crate) fn active(mut self, active: bool) -> Self {
+        self.active = active;
+        self
+    }
+
+    pub(crate) fn show(self, ui: &mut egui::Ui) -> egui::Response {
+        let Self { label, active, .. } = self;
+        let visuals = ui.visuals();
+        let fill = if active {
+            crate::ui::SELECTION_COLOR
+        } else {
+            visuals.code_bg_color
+        };
+        ui.add(
+            egui::Button::new(crate::ui::fonts::bold(&label).color(visuals.strong_text_color()))
+                .fill(fill)
+                .min_size((170., 30.).into()),
+        )
+    }
+}

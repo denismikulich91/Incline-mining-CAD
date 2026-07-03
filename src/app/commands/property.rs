@@ -1,6 +1,6 @@
 use crate::{
     app::App,
-    model::{Command, FillStyle, Object, ObjectColor, ObjectId},
+    model::{Command, FillStyle, LayerId, Object, ObjectColor, ObjectId, SceneEntityId},
     userspace_log,
 };
 
@@ -85,6 +85,87 @@ impl<'a> App<'a> {
                 }
             },
             "Batch-set line weight on {} polyline(s)"
+        );
+    }
+
+    pub(crate) fn batch_set_z_value(&mut self, ids: Vec<ObjectId>, z: f64) {
+        batch_property!(
+            self,
+            ids,
+            |obj: &mut Object| {
+                obj.set_z_position(z);
+            },
+            "Batch-set Z value on {} objects"
+        )
+    }
+
+    pub(crate) fn move_objects_to_layer(
+        &mut self,
+        project_index: usize,
+        ids: Vec<ObjectId>,
+        target_layer: LayerId,
+        copy: bool,
+    ) {
+        if self.workspace.active_index != Some(project_index) {
+            self.history.clear();
+            self.workspace.set_active_index(project_index);
+            self.editor.selected_handles.clear();
+        }
+
+        let Some(project) = self.workspace.projects.get_mut(project_index) else {
+            return;
+        };
+        if project.pidb.document.layer(target_layer).is_none() {
+            return;
+        }
+
+        let doc = &mut project.pidb.document;
+        let mut selected_after = Vec::new();
+        let cmds: Vec<Command> = if copy {
+            let originals: Vec<Object> = ids
+                .iter()
+                .filter_map(|&id| doc.get_object(id).cloned())
+                .collect();
+            originals
+                .into_iter()
+                .map(|object| {
+                    let new_id = doc.allocate_object_id();
+                    let copied = object.with_id_and_layer(new_id, target_layer);
+                    selected_after.push(copied.id());
+                    Command::AddObject(copied)
+                })
+                .collect()
+        } else {
+            ids.iter()
+                .filter_map(|&id| {
+                    let before = doc.get_object(id)?.clone();
+                    let after = before.with_id_and_layer(before.id(), target_layer);
+                    if before == after {
+                        None
+                    } else {
+                        selected_after.push(after.id());
+                        Some(Command::Replace { before, after })
+                    }
+                })
+                .collect()
+        };
+
+        if cmds.is_empty() {
+            return;
+        }
+
+        self.history.execute(doc, Command::Batch(cmds));
+        project.dirty = true;
+        self.editor.selected_handles = selected_after
+            .into_iter()
+            .map(SceneEntityId::Object)
+            .collect();
+        self.invalidate_geometry();
+        userspace_log!(
+            "{} {} object(s) to layer {:?}",
+            if copy { "Copied" } else { "Moved" },
+            ids.len(),
+            target_layer
         );
     }
 }

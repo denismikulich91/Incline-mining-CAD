@@ -3,6 +3,8 @@ Incline is an open-pit mine design project to bring the ideals of free open-sour
 
 Cross-platform, lightweight, and built by mining engineers for mining engineers. Incline is free and open for everyone - aspiring students, professionals, and hobbists.
 
+![Screenshot of the app](./tutorial/tutorial_screenshot.png)
+
 ## Status
 
 Incline is in early development. Expect missing or incomplete features as we continue to polish for a v1.0 release.

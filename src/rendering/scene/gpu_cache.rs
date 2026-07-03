@@ -20,6 +20,8 @@ use crate::{
 
 const YELLOW_HIGHLIGHT_COLOR: [f32; 4] = [1.0, 0.85, 0.0, 1.0];
 const MAX_SURFACE_CHUNK_BYTES: usize = 256 * 1024 * 1024;
+const FALLBACK_BLOCK_GRADE: f32 = -1.0;
+const HIDDEN_BLOCK_GRADE: f32 = -2.0;
 
 fn make_translucent(color: &mut [f32; 4]) {
     color[3] *= 0.3;
@@ -116,6 +118,7 @@ pub(crate) struct CachedBlockModelGpu {
     edge_width: f32,
     variable: Option<String>,
     color_transfer: ColorTransferFunction,
+    hide_empty_color_values: bool,
 }
 
 /// A block model surface chunk plus enough CPU-side state to re-colour it
@@ -128,9 +131,16 @@ pub(crate) struct CachedBlockModelSurfaceChunk {
     /// Mirrors the vertex buffer's current contents so `grade` can be
     /// patched in place and re-uploaded with a single `write_buffer`.
     cpu_vertices: Vec<BlockModelVertex>,
-    /// The block index each consecutive group of 8 vertices in
-    /// `cpu_vertices` was generated from, in emission order.
-    block_order: Vec<usize>,
+    /// CPU vertex ranges generated for each block, used to patch grade in
+    /// place even when exposed-face culling gives each block a different
+    /// vertex count.
+    block_vertex_ranges: Vec<BlockVertexRange>,
+}
+
+struct BlockVertexRange {
+    block_index: usize,
+    start: usize,
+    len: usize,
 }
 
 impl BlockModelGpuCache {
@@ -166,7 +176,7 @@ impl BlockModelGpuCache {
             let translucent = editor.translucent_handles.contains(&entity)
                 || block_model_has_partial_alpha_stops(block_model);
             let mut line_color = if selected {
-                editor.selection_color
+                crate::ui::SELECTION_COLOR_F32
             } else {
                 [0.03, 0.05, 0.06, 1.0]
             };
@@ -184,12 +194,15 @@ impl BlockModelGpuCache {
                 let variable_dirty = cached.variable != block_model.active_numeric_variable;
                 let geometry_dirty = cached.translucent != translucent;
                 let style_dirty = cached.color_transfer != block_model.color_transfer;
+                let empty_visibility_dirty =
+                    cached.hide_empty_color_values != block_model.hide_empty_color_values;
                 let edge_geom_dirty = (cached.edge_width == 0.0) != (edge_width == 0.0);
                 let edge_style_dirty =
                     cached.line_color != line_color || cached.edge_width != edge_width;
                 if !variable_dirty
                     && !geometry_dirty
                     && !style_dirty
+                    && !empty_visibility_dirty
                     && !edge_geom_dirty
                     && !edge_style_dirty
                 {
@@ -198,14 +211,19 @@ impl BlockModelGpuCache {
                 if geometry_dirty {
                     // Translucency changes which pipeline/chunking the model
                     // draws with, so it needs a full rebuild.
-                    cached.surface_chunks =
-                        build_block_model_surface_chunks(device, scene_origin, block_model);
+                    cached.surface_chunks = build_block_model_surface_chunks(
+                        device,
+                        scene_origin,
+                        block_model,
+                        !translucent,
+                    );
                     let style = block_model_style(block_model, translucent);
                     queue.write_buffer(&cached.surface_style_buffer, 0, bytemuck::bytes_of(&style));
                     cached.variable = block_model.active_numeric_variable.clone();
                     cached.color_transfer = block_model.color_transfer.clone();
+                    cached.hide_empty_color_values = block_model.hide_empty_color_values;
                     cached.translucent = translucent;
-                } else if variable_dirty {
+                } else if variable_dirty || empty_visibility_dirty {
                     // A legend/attribute switch alone doesn't change which
                     // blocks or faces are rendered — only re-colour, without
                     // re-walking blocks or reallocating GPU buffers.
@@ -214,10 +232,17 @@ impl BlockModelGpuCache {
                         block_model,
                         &mut cached.surface_chunks,
                     );
-                    let style = block_model_style(block_model, translucent);
-                    queue.write_buffer(&cached.surface_style_buffer, 0, bytemuck::bytes_of(&style));
+                    if variable_dirty || style_dirty {
+                        let style = block_model_style(block_model, translucent);
+                        queue.write_buffer(
+                            &cached.surface_style_buffer,
+                            0,
+                            bytemuck::bytes_of(&style),
+                        );
+                    }
                     cached.variable = block_model.active_numeric_variable.clone();
                     cached.color_transfer = block_model.color_transfer.clone();
+                    cached.hide_empty_color_values = block_model.hide_empty_color_values;
                 } else if style_dirty {
                     // Only the colour-transfer function (stop positions or
                     // colours) changed — dragging a handle doesn't touch
@@ -243,8 +268,12 @@ impl BlockModelGpuCache {
                     cached.edge_width = edge_width;
                 }
             } else {
-                let surface_chunks =
-                    build_block_model_surface_chunks(device, scene_origin, block_model);
+                let surface_chunks = build_block_model_surface_chunks(
+                    device,
+                    scene_origin,
+                    block_model,
+                    !translucent,
+                );
                 if surface_chunks.is_empty() {
                     continue;
                 }
@@ -302,6 +331,7 @@ impl BlockModelGpuCache {
                         edge_width,
                         variable: block_model.active_numeric_variable.clone(),
                         color_transfer: block_model.color_transfer.clone(),
+                        hide_empty_color_values: block_model.hide_empty_color_values,
                     },
                 );
             }
@@ -350,7 +380,7 @@ impl TriangulationGpuCache {
                 make_translucent(&mut color);
             }
             let mut line_color = if selected {
-                editor.selection_color
+                crate::ui::SELECTION_COLOR_F32
             } else {
                 triangulation.line_color
             };
@@ -688,32 +718,34 @@ fn upload_edge_chunk(device: &wgpu::Device, instances: &[EdgeInstance]) -> Optio
 /// Decoded values/default/render-range for the block model's currently
 /// active colour variable, if any. Shared by initial geometry build and by
 /// the cheap re-colour path so both compute `grade` identically.
-type BlockModelColorValues = (Vec<f64>, Option<f64>, (f64, f64));
+type BlockModelColorValues = (std::sync::Arc<Vec<f64>>, Option<f64>, Option<(f64, f64)>);
 
 fn block_model_color_values(block_model: &OpenBlockModel) -> Option<BlockModelColorValues> {
-    block_model
-        .active_numeric_variable
-        .as_deref()
-        .and_then(|name| block_model.model.variable(name).map(|var| (name, var)))
-        .and_then(|(name, var)| {
-            let values = block_model.model.numeric_values(name).ok()?;
-            let default = numeric_variable_default(var);
-            let range =
-                render_value_range(&values, &block_model.renderable_block_indices, default)?;
-            Some((values, default, range))
-        })
+    let name = block_model.active_numeric_variable.as_deref()?;
+    let var = block_model.model.variable(name)?;
+    let values = block_model.active_numeric_values()?;
+    let default = numeric_variable_default(var);
+    let range = render_value_range(&values, &block_model.renderable_block_indices, default);
+    Some((values, default, range))
 }
 
-fn grade_for_block(color_values: &Option<BlockModelColorValues>, block_index: usize) -> f32 {
-    color_values
-        .as_ref()
-        .and_then(|(values, default, range)| {
-            values
-                .get(block_index)
-                .copied()
-                .map(|value| normalized_grade(value, *default, *range))
-        })
-        .unwrap_or(-1.0)
+fn grade_for_block(
+    color_values: &Option<BlockModelColorValues>,
+    block_index: usize,
+    hide_empty: bool,
+) -> f32 {
+    let Some((values, default, range)) = color_values.as_ref() else {
+        return FALLBACK_BLOCK_GRADE;
+    };
+    let Some(value) = values.get(block_index).copied() else {
+        return empty_grade(hide_empty);
+    };
+    if is_empty_grade_value(value, *default) {
+        return empty_grade(hide_empty);
+    }
+    range
+        .map(|range| normalized_grade(value, range))
+        .unwrap_or(FALLBACK_BLOCK_GRADE)
 }
 
 /// Recomputes and re-uploads `grade` for every already-built chunk of a
@@ -728,9 +760,13 @@ fn recolor_block_model_surface_chunks(
 ) {
     let color_values = block_model_color_values(block_model);
     for chunk in chunks {
-        for (slot, &block_index) in chunk.block_order.iter().enumerate() {
-            let grade = grade_for_block(&color_values, block_index);
-            for vertex in &mut chunk.cpu_vertices[slot * 8..slot * 8 + 8] {
+        for range in &chunk.block_vertex_ranges {
+            let grade = grade_for_block(
+                &color_values,
+                range.block_index,
+                block_model.hide_empty_color_values,
+            );
+            for vertex in &mut chunk.cpu_vertices[range.start..range.start + range.len] {
                 vertex.grade = grade;
             }
         }
@@ -746,16 +782,13 @@ fn build_block_model_surface_chunks(
     device: &wgpu::Device,
     scene_origin: DVec3,
     block_model: &OpenBlockModel,
+    cull_shared_faces: bool,
 ) -> Vec<CachedBlockModelSurfaceChunk> {
     const BLOCKS_PER_CHUNK: usize = 8192;
 
     let color_values = block_model_color_values(block_model);
+    let renderable_blocks = cull_shared_faces.then(|| block_model_renderable_keys(block_model));
 
-    // Faces shared by two touching, both-rendered blocks are never visible
-    // (interior geometry), so skip emitting them entirely. This only applies
-    // to regular (non-sub-blocked) grids, where every block shares one cell
-    // size and sits on an integer lattice we can index in O(1); irregular
-    // schemas fall back to emitting all 6 faces, as before.
     const QUADS: [[u32; 4]; 6] = [
         [0, 3, 7, 4], // -X
         [1, 5, 6, 2], // +X
@@ -764,7 +797,6 @@ fn build_block_model_surface_chunks(
         [0, 1, 2, 3], // -Z
         [4, 7, 6, 5], // +Z
     ];
-    let neighbor_grid = regular_block_grid_index(block_model);
 
     let mut chunks = Vec::new();
     for source_indices in block_model
@@ -773,128 +805,66 @@ fn build_block_model_surface_chunks(
     {
         let mut vertices = Vec::with_capacity(source_indices.len() * 8);
         let mut indices = Vec::with_capacity(source_indices.len() * 36);
-        let mut block_order = Vec::with_capacity(source_indices.len());
+        let mut block_vertex_ranges = Vec::with_capacity(source_indices.len());
         for &block_index in source_indices {
             let Some(block) = block_model.blocks.get(block_index) else {
                 continue;
             };
-            let visible_faces = neighbor_grid
+            let grade = grade_for_block(
+                &color_values,
+                block_index,
+                block_model.hide_empty_color_values,
+            );
+            let visible_faces = renderable_blocks
                 .as_ref()
-                .and_then(|(grid, cell, origin)| {
-                    let coord = grid_coord(block.lower, *origin, *cell)?;
-                    Some([
-                        !grid.contains(&(coord.0 - 1, coord.1, coord.2)),
-                        !grid.contains(&(coord.0 + 1, coord.1, coord.2)),
-                        !grid.contains(&(coord.0, coord.1 - 1, coord.2)),
-                        !grid.contains(&(coord.0, coord.1 + 1, coord.2)),
-                        !grid.contains(&(coord.0, coord.1, coord.2 - 1)),
-                        !grid.contains(&(coord.0, coord.1, coord.2 + 1)),
-                    ])
-                })
+                .map(|renderable_blocks| visible_block_faces(*block, renderable_blocks))
                 .unwrap_or([true; 6]);
-            if visible_faces == [false; 6] {
-                // Fully interior block: every neighbouring cell is also
-                // rendered, so none of its faces can ever be seen.
+            if !visible_faces.iter().any(|visible| *visible) {
                 continue;
             }
-            let Ok(base) = u32::try_from(vertices.len()) else {
-                break;
-            };
-            let grade = grade_for_block(&color_values, block_index);
-            block_order.push(block_index);
-            for corner in block_corners(block_model, *block) {
-                vertices.push(BlockModelVertex {
-                    pos: (corner - scene_origin).as_vec3().to_array(),
-                    grade,
-                });
-            }
-            for (quad, visible) in QUADS.iter().zip(visible_faces) {
-                if !visible {
-                    continue;
+            let corners = block_corners(block_model, *block);
+            let start = vertices.len();
+            for (face_index, _) in visible_faces
+                .into_iter()
+                .enumerate()
+                .filter(|(_, visible)| *visible)
+            {
+                let quad = QUADS[face_index];
+                let Ok(base) = u32::try_from(vertices.len()) else {
+                    break;
+                };
+                for corner_index in quad {
+                    vertices.push(BlockModelVertex {
+                        pos: (corners[corner_index as usize] - scene_origin)
+                            .as_vec3()
+                            .to_array(),
+                        grade,
+                    });
                 }
-                indices.extend([
-                    base + quad[0],
-                    base + quad[1],
-                    base + quad[2],
-                    base + quad[0],
-                    base + quad[2],
-                    base + quad[3],
-                ]);
+                indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+            }
+            let len = vertices.len() - start;
+            if len > 0 {
+                block_vertex_ranges.push(BlockVertexRange {
+                    block_index,
+                    start,
+                    len,
+                });
             }
         }
         if let Some(gpu) = upload_block_model_surface_chunk(device, &vertices, &indices) {
             chunks.push(CachedBlockModelSurfaceChunk {
                 gpu,
                 cpu_vertices: vertices,
-                block_order,
+                block_vertex_ranges,
             });
         }
     }
     chunks
 }
 
-/// Grid-cell occupancy index, cell size, and lattice origin for a regular
-/// block model's rendered blocks.
-type RegularBlockGridIndex = (HashSet<(i32, i32, i32)>, DVec3, DVec3);
-
-/// Builds a lattice-coordinate index of every rendered block in a regular
-/// (non-sub-blocked) grid, for O(1) touching-neighbour lookups. Returns
-/// `None` for sub-blocked (`is_irregular`) models, where block sizes vary
-/// and a shared face can't be assumed just because two blocks touch.
-fn regular_block_grid_index(block_model: &OpenBlockModel) -> Option<RegularBlockGridIndex> {
-    let metadata = &block_model.model.metadata;
-    if metadata.is_irregular {
-        return None;
-    }
-    let [dim_x, dim_y, dim_z] = metadata.dims;
-    if dim_x == 0 || dim_y == 0 || dim_z == 0 {
-        return None;
-    }
-    let cell = DVec3::new(
-        (metadata.upper.x - metadata.lower.x) / dim_x as f64,
-        (metadata.upper.y - metadata.lower.y) / dim_y as f64,
-        (metadata.upper.z - metadata.lower.z) / dim_z as f64,
-    );
-    if !(cell.x > 0.0 && cell.y > 0.0 && cell.z > 0.0) {
-        return None;
-    }
-    let origin = metadata.lower;
-    let mut grid = HashSet::with_capacity(block_model.renderable_block_indices.len());
-    for &index in &block_model.renderable_block_indices {
-        let Some(block) = block_model.blocks.get(index) else {
-            continue;
-        };
-        // A block whose lower corner doesn't land cleanly on the lattice
-        // (e.g. explicit bound variables that don't describe a uniform
-        // grid) means we can't trust face-adjacency-by-index for this
-        // model; bail out rather than risk culling a face that's really
-        // visible.
-        let coord = grid_coord(block.lower, origin, cell)?;
-        grid.insert(coord);
-    }
-    Some((grid, cell, origin))
-}
-
-fn grid_coord(lower: DVec3, origin: DVec3, cell: DVec3) -> Option<(i32, i32, i32)> {
-    let rel = (lower - origin) / cell;
-    let rounded = rel.round();
-    if (rel - rounded).abs().max_element() > 1e-3 {
-        return None;
-    }
-    Some((rounded.x as i32, rounded.y as i32, rounded.z as i32))
-}
-
 fn block_model_style(block_model: &OpenBlockModel, translucent: bool) -> BlockModelStyleUniform {
-    let has_grade = block_model
-        .active_numeric_variable
-        .as_deref()
-        .and_then(|name| block_model.model.variable(name).map(|var| (name, var)))
-        .and_then(|(name, var)| {
-            let values = block_model.model.numeric_values(name).ok()?;
-            let default = numeric_variable_default(var);
-            render_value_range(&values, &block_model.renderable_block_indices, default)
-        })
-        .is_some();
+    let has_grade = block_model_color_values(block_model).is_some();
     let mut fallback_color = block_model.color;
     if translucent {
         make_translucent(&mut fallback_color);
@@ -980,13 +950,67 @@ fn upload_block_model_surface_chunk(
     })
 }
 
-fn normalized_grade(value: f64, default: Option<f64>, range: (f64, f64)) -> f32 {
-    if !value.is_finite()
+fn block_model_renderable_keys(block_model: &OpenBlockModel) -> HashSet<[u64; 6]> {
+    block_model
+        .renderable_block_indices
+        .iter()
+        .filter_map(|&index| block_model.blocks.get(index).copied())
+        .map(block_key)
+        .collect()
+}
+
+fn visible_block_faces(
+    block: crate::model::block_model::BlockBounds,
+    renderable_blocks: &HashSet<[u64; 6]>,
+) -> [bool; 6] {
+    let size = block.upper - block.lower;
+    let neighbours = [
+        DVec3::new(-size.x, 0.0, 0.0),
+        DVec3::new(size.x, 0.0, 0.0),
+        DVec3::new(0.0, -size.y, 0.0),
+        DVec3::new(0.0, size.y, 0.0),
+        DVec3::new(0.0, 0.0, -size.z),
+        DVec3::new(0.0, 0.0, size.z),
+    ];
+    neighbours.map(|delta| {
+        let neighbour = block_key(crate::model::block_model::BlockBounds {
+            lower: block.lower + delta,
+            upper: block.upper + delta,
+        });
+        !renderable_blocks.contains(&neighbour)
+    })
+}
+
+fn block_key(block: crate::model::block_model::BlockBounds) -> [u64; 6] {
+    [
+        quantize(block.lower.x),
+        quantize(block.lower.y),
+        quantize(block.lower.z),
+        quantize(block.upper.x),
+        quantize(block.upper.y),
+        quantize(block.upper.z),
+    ]
+}
+
+fn quantize(value: f64) -> u64 {
+    (value * 1_000_000.0).round().to_bits()
+}
+
+fn is_empty_grade_value(value: f64, default: Option<f64>) -> bool {
+    !value.is_finite()
         || default.is_some_and(|default| (value - default).abs() < 1e-8)
         || value <= -90.0
-    {
-        return -1.0;
+}
+
+fn empty_grade(hide_empty: bool) -> f32 {
+    if hide_empty {
+        HIDDEN_BLOCK_GRADE
+    } else {
+        FALLBACK_BLOCK_GRADE
     }
+}
+
+fn normalized_grade(value: f64, range: (f64, f64)) -> f32 {
     ((value - range.0) / (range.1 - range.0)).clamp(0.0, 1.0) as f32
 }
 
@@ -1075,45 +1099,46 @@ mod tests {
 
     #[test]
     fn grade_for_block_is_neutral_with_no_active_variable() {
-        assert_eq!(grade_for_block(&None, 0), -1.0);
+        assert_eq!(grade_for_block(&None, 0, true), FALLBACK_BLOCK_GRADE);
     }
 
     #[test]
-    fn grade_for_block_is_neutral_for_an_out_of_range_index() {
-        let color_values = Some((vec![1.0, 2.0], None, (0.0, 2.0)));
-        assert_eq!(grade_for_block(&color_values, 5), -1.0);
+    fn grade_for_block_hides_an_out_of_range_index_when_enabled() {
+        let color_values = Some((std::sync::Arc::new(vec![1.0, 2.0]), None, Some((0.0, 2.0))));
+        assert_eq!(grade_for_block(&color_values, 5, true), HIDDEN_BLOCK_GRADE);
+    }
+
+    #[test]
+    fn grade_for_block_uses_fallback_for_empty_values_when_hide_disabled() {
+        let color_values = Some((
+            std::sync::Arc::new(vec![-99.0]),
+            Some(-99.0),
+            Some((0.0, 2.0)),
+        ));
+        assert_eq!(
+            grade_for_block(&color_values, 0, false),
+            FALLBACK_BLOCK_GRADE
+        );
+    }
+
+    #[test]
+    fn grade_for_block_hides_empty_values_when_enabled() {
+        let color_values = Some((
+            std::sync::Arc::new(vec![-99.0]),
+            Some(-99.0),
+            Some((0.0, 2.0)),
+        ));
+        assert_eq!(grade_for_block(&color_values, 0, true), HIDDEN_BLOCK_GRADE);
     }
 
     #[test]
     fn grade_for_block_normalizes_within_the_render_range() {
-        let color_values = Some((vec![0.0, 5.0, 10.0], None, (0.0, 10.0)));
-        assert_eq!(grade_for_block(&color_values, 1), 0.5);
-    }
-
-    #[test]
-    fn grid_coord_matches_points_exactly_on_the_lattice() {
-        let origin = DVec3::new(100.0, -50.0, 0.0);
-        let cell = DVec3::new(2.0, 2.0, 5.0);
-        let lower = origin + DVec3::new(2.0 * 3.0, 2.0 * -4.0, 5.0 * 7.0);
-        assert_eq!(grid_coord(lower, origin, cell), Some((3, -4, 7)));
-    }
-
-    #[test]
-    fn grid_coord_rejects_points_off_the_lattice() {
-        let origin = DVec3::ZERO;
-        let cell = DVec3::new(2.0, 2.0, 2.0);
-        // Off by a quarter cell on X: not a real grid boundary.
-        let lower = DVec3::new(2.5, 4.0, 6.0);
-        assert_eq!(grid_coord(lower, origin, cell), None);
-    }
-
-    #[test]
-    fn grid_coord_tolerates_float_rounding_noise() {
-        let origin = DVec3::ZERO;
-        let cell = DVec3::new(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0);
-        // Accumulated float error from repeated division, still "on" cell 5.
-        let lower = DVec3::splat(5.0 * (1.0 / 3.0) + 1e-9);
-        assert_eq!(grid_coord(lower, origin, cell), Some((5, 5, 5)));
+        let color_values = Some((
+            std::sync::Arc::new(vec![0.0, 5.0, 10.0]),
+            None,
+            Some((0.0, 10.0)),
+        ));
+        assert_eq!(grade_for_block(&color_values, 1, true), 0.5);
     }
 
     #[test]
@@ -1129,5 +1154,38 @@ mod tests {
         let (min, max) = vertex_bounds(positions.into_iter());
         assert_eq!(min, glam::Vec3::new(-3.0, -2.0, -1.0));
         assert_eq!(max, glam::Vec3::new(1.0, 4.0, 2.0));
+    }
+
+    #[test]
+    fn visible_block_faces_keeps_all_faces_for_isolated_block() {
+        let block = crate::model::block_model::BlockBounds {
+            lower: DVec3::ZERO,
+            upper: DVec3::ONE,
+        };
+        let renderable = HashSet::from([block_key(block)]);
+
+        assert_eq!(visible_block_faces(block, &renderable), [true; 6]);
+    }
+
+    #[test]
+    fn visible_block_faces_culls_shared_regular_grid_face() {
+        let a = crate::model::block_model::BlockBounds {
+            lower: DVec3::ZERO,
+            upper: DVec3::ONE,
+        };
+        let b = crate::model::block_model::BlockBounds {
+            lower: DVec3::X,
+            upper: DVec3::new(2.0, 1.0, 1.0),
+        };
+        let renderable = HashSet::from([block_key(a), block_key(b)]);
+
+        assert_eq!(
+            visible_block_faces(a, &renderable),
+            [true, false, true, true, true, true]
+        );
+        assert_eq!(
+            visible_block_faces(b, &renderable),
+            [false, true, true, true, true, true]
+        );
     }
 }

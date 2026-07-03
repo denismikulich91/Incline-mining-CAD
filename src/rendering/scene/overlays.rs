@@ -23,7 +23,6 @@ pub(crate) struct OverlaySceneBuildInput<'a> {
     pub(crate) screen_size: Size,
     pub(crate) scene_origin: DVec3,
     pub(crate) scale_factor: f32,
-    pub(crate) selection_color: [f32; 4],
 }
 
 pub(crate) fn rebuild_editor_overlay(input: OverlaySceneBuildInput<'_>) {
@@ -36,7 +35,6 @@ pub(crate) fn rebuild_editor_overlay(input: OverlaySceneBuildInput<'_>) {
         screen_size,
         scene_origin,
         scale_factor,
-        selection_color,
     } = input;
 
     overlay_vertex_buf.clear();
@@ -140,7 +138,7 @@ pub(crate) fn rebuild_editor_overlay(input: OverlaySceneBuildInput<'_>) {
                         if selected {
                             PREVIEW_COLOR
                         } else {
-                            selection_color
+                            crate::ui::SELECTION_COLOR_F32
                         },
                     );
                 }
@@ -154,7 +152,7 @@ pub(crate) fn rebuild_editor_overlay(input: OverlaySceneBuildInput<'_>) {
                     if selected {
                         PREVIEW_COLOR
                     } else {
-                        selection_color
+                        crate::ui::SELECTION_COLOR_F32
                     },
                 );
             }
@@ -196,7 +194,7 @@ pub(crate) fn rebuild_editor_overlay(input: OverlaySceneBuildInput<'_>) {
         }
 
         if let Some(tail) = editor.fuse_chain_tail {
-            draw_screen_sphere(&mut overlay, tail, 9.0, selection_color);
+            draw_screen_sphere(&mut overlay, tail, 9.0, crate::ui::SELECTION_COLOR_F32);
         }
 
         if editor.fuse_awaiting_endpoint.is_none()

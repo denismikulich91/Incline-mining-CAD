@@ -163,6 +163,8 @@ pub(crate) struct Graphics<'a> {
     pub(super) stroke_index_gpu: wgpu::Buffer,
     pub(super) overlay_vertex_gpu: wgpu::Buffer,
     pub(super) overlay_index_gpu: wgpu::Buffer,
+    pub(super) dynamic_vertex_gpu: wgpu::Buffer,
+    pub(super) dynamic_index_gpu: wgpu::Buffer,
     pub(super) camera_buffer: wgpu::Buffer,
     pub(super) camera_bind_group: wgpu::BindGroup,
     pub(super) msaa_color: wgpu::Texture,
@@ -187,6 +189,12 @@ pub(crate) struct Graphics<'a> {
     pub(super) overlay_index_buf: Vec<u32>,
     pub(super) overlay_vertex_capacity: usize,
     pub(super) overlay_index_capacity: usize,
+    /// Per-frame stroke geometry for live drawing tools (road ghost,
+    /// batter/berm preview, ghost-reshaped roads); see `rebuild_dynamic_scene`.
+    pub(super) dynamic_vertex_buf: Vec<StrokeVertex>,
+    pub(super) dynamic_index_buf: Vec<u32>,
+    pub(super) dynamic_vertex_capacity: usize,
+    pub(super) dynamic_index_capacity: usize,
     pub(super) camera: Camera,
     pub(super) camera_uniform: CameraUniform,
     pub(super) camera_controller: CameraController,
@@ -258,6 +266,7 @@ impl<'a> Graphics<'a> {
     pub(crate) fn release_mouse_capture(&mut self) {
         self.mouse_pressed = None;
         self.camera_controller.end_orbit();
+        self.orbit_marker = None;
         self.fly_camera_controller.clear_input();
         self.sync_cursor_grab();
     }
@@ -272,6 +281,12 @@ impl<'a> Graphics<'a> {
     /// queries during camera movement.
     pub(crate) fn is_camera_active(&self) -> bool {
         self.mouse_pressed == Some(MouseButton::Right)
+    }
+
+    pub(crate) fn begin_right_orbit_drag(&mut self) {
+        if !self.fly_mode_enabled {
+            self.mouse_pressed = Some(MouseButton::Right);
+        }
     }
 
     pub(crate) fn is_fly_camera_active(&self) -> bool {

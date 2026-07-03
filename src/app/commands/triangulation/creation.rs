@@ -1,37 +1,24 @@
 use super::*;
 use crate::model::geometry::points_coincident;
 
+/// Coarse endpoint-weld tolerance (metres, XY and Z) offered by the failure
+/// dialog for breaklines digitized independently: gaps up to this size are
+/// treated as one intended shared vertex when the user opts in.
+pub(crate) const COARSE_WELD_TOL: f64 = 0.05;
+
 impl<'a> App<'a> {
     pub(crate) fn create_triangulation_from_objects(
         &mut self,
         name: String,
         object_ids: Vec<ObjectId>,
         surface_type: TriSurfaceType,
+        coarse_weld: bool,
     ) -> Result<()> {
         if object_ids.is_empty() {
             anyhow::bail!("No objects selected for triangulation");
         }
 
-        // Only closed polygons are accepted — open lines and points cannot form a surface.
-        let mut rings: Vec<Vec<glam::DVec3>> = Vec::new();
-        let mut rejected = 0usize;
-        for id in &object_ids {
-            let Some(obj) = self.scene_document.get_object(*id) else {
-                continue;
-            };
-            match obj {
-                Object::Polyline {
-                    verts,
-                    closed: true,
-                    ..
-                } if verts.len() >= 3 => {
-                    rings.push(verts.iter().map(|v| v.pos).collect());
-                }
-                _ => {
-                    rejected += 1;
-                }
-            }
-        }
+        let (mut rings, rejected) = self.collect_triangulation_rings(&object_ids);
 
         if rings.is_empty() {
             anyhow::bail!(
@@ -42,6 +29,28 @@ impl<'a> App<'a> {
             userspace_warn!(
                 "Ignored {} non-polygon object(s) during triangulation",
                 rejected
+            );
+        }
+
+        let welded = weld_breakline_vertices(
+            &mut rings,
+            crate::model::kernel::XY_TOL,
+            crate::model::kernel::Z_TOL,
+        );
+        if welded > 0 {
+            userspace_log!(
+                "Welded {} breakline vertex/vertices that coincided within tolerance",
+                welded
+            );
+        }
+        if coarse_weld {
+            let coarse_welded =
+                weld_breakline_vertices(&mut rings, COARSE_WELD_TOL, COARSE_WELD_TOL);
+            userspace_log!(
+                "Weld & retry: moved {} vertex/vertices onto shared positions (up to {} m); \
+                 source objects are unchanged",
+                coarse_welded,
+                COARSE_WELD_TOL
             );
         }
 
@@ -73,6 +82,121 @@ impl<'a> App<'a> {
         );
         self.finish_generated_triangulation(name, all_verts, all_faces, surface_type)
     }
+
+    /// Closed polygons from the selection as rings, plus the count of
+    /// rejected non-polygon objects. Open lines and points cannot form a
+    /// surface.
+    pub(crate) fn collect_triangulation_rings(
+        &self,
+        object_ids: &[ObjectId],
+    ) -> (Vec<Vec<glam::DVec3>>, usize) {
+        let mut rings: Vec<Vec<glam::DVec3>> = Vec::new();
+        let mut rejected = 0usize;
+        for id in object_ids {
+            let Some(obj) = self.scene_document.get_object(*id) else {
+                continue;
+            };
+            match obj {
+                Object::Polyline {
+                    verts,
+                    closed: true,
+                    ..
+                } if verts.len() >= 3 => {
+                    rings.push(verts.iter().map(|v| v.pos).collect());
+                }
+                _ => {
+                    rejected += 1;
+                }
+            }
+        }
+        (rings, rejected)
+    }
+
+    /// Whether the coarse weld would actually move any vertex of the
+    /// selection — if not, offering "weld & retry" would be a no-op lie.
+    pub(crate) fn coarse_weld_would_change(&self, object_ids: &[ObjectId]) -> bool {
+        let (mut rings, _) = self.collect_triangulation_rings(object_ids);
+        weld_breakline_vertices(&mut rings, COARSE_WELD_TOL, COARSE_WELD_TOL) > 0
+    }
+
+    /// Create Triangulation with failure capture: on error, retain the inputs
+    /// and message so the failure dialog can offer a coarse-weld retry.
+    pub(crate) fn run_create_triangulation(
+        &mut self,
+        name: String,
+        object_ids: Vec<ObjectId>,
+        surface_type: TriSurfaceType,
+        coarse_weld: bool,
+    ) -> Result<()> {
+        let result = self.create_triangulation_from_objects(
+            name.clone(),
+            object_ids.clone(),
+            surface_type,
+            coarse_weld,
+        );
+        match &result {
+            Ok(()) => self.editor.tri_create_failure = None,
+            Err(error) => {
+                // Don't offer the weld again if it already ran and failed.
+                let weld_retry_available =
+                    !coarse_weld && self.coarse_weld_would_change(&object_ids);
+                self.editor.tri_create_failure = Some(crate::ui::state::TriCreateFailure {
+                    message: format!("{error:#}"),
+                    name,
+                    object_ids,
+                    surface_type,
+                    weld_retry_available,
+                });
+            }
+        }
+        result
+    }
+}
+
+/// Snap breakline vertices that coincide within the given tolerances (XY
+/// horizontally, Z vertically, both metres) onto one canonical position,
+/// across all rings. At kernel tolerance, vertices this close come from
+/// digitization or floating-point noise, never intent; welding them lets the
+/// CDT share one vertex instead of threading constraints between two points a
+/// fraction of a millimetre apart (sliver triangles) or rejecting the same XY
+/// at two noise-level elevations. At the coarse tolerance this deliberately
+/// moves user geometry and must be user-initiated. Returns the number of
+/// vertices moved.
+fn weld_breakline_vertices(rings: &mut [Vec<glam::DVec3>], xy_tol: f64, z_tol: f64) -> usize {
+    let cell = |v: glam::DVec3| -> (i64, i64) {
+        ((v.x / xy_tol).floor() as i64, (v.y / xy_tol).floor() as i64)
+    };
+    let coincident = |a: glam::DVec3, b: glam::DVec3| -> bool {
+        a.truncate().distance_squared(b.truncate()) <= xy_tol * xy_tol && (a.z - b.z).abs() <= z_tol
+    };
+    let mut grid: HashMap<(i64, i64), Vec<glam::DVec3>> = HashMap::new();
+    let mut welded = 0usize;
+    for ring in rings.iter_mut() {
+        for point in ring.iter_mut() {
+            let (cx, cy) = cell(*point);
+            let mut canonical = None;
+            'search: for gx in cx - 1..=cx + 1 {
+                for gy in cy - 1..=cy + 1 {
+                    for candidate in grid.get(&(gx, gy)).into_iter().flatten() {
+                        if coincident(*candidate, *point) {
+                            canonical = Some(*candidate);
+                            break 'search;
+                        }
+                    }
+                }
+            }
+            match canonical {
+                Some(canonical) => {
+                    if *point != canonical {
+                        *point = canonical;
+                        welded += 1;
+                    }
+                }
+                None => grid.entry((cx, cy)).or_default().push(*point),
+            }
+        }
+    }
+    welded
 }
 
 /// Diagnose why breakline edge `edge_index` of `rings[ring_index]` failed to
@@ -132,53 +256,29 @@ fn describe_edge_conflict(
     c: glam::DVec3,
     d: glam::DVec3,
 ) -> Option<String> {
+    use crate::model::kernel::{self, SegSeg};
     let (a2, b2, c2, d2) = (a.truncate(), b.truncate(), c.truncate(), d.truncate());
-    let r = b2 - a2;
-    let s = d2 - c2;
-    let denom = r.x * s.y - r.y * s.x;
-    const NEAR_ZERO: f64 = 1e-9;
-    // Strict interior, matching `seg_seg_intersection_2d`: a crossing exactly
-    // at an endpoint is a legitimate T-junction (spade handles these fine),
-    // not the kind of conflict that fails `try_add_constraint`.
-    const EPS: f64 = 1e-8;
-
-    if denom.abs() > NEAR_ZERO {
-        let t = ((c2.x - a2.x) * s.y - (c2.y - a2.y) * s.x) / denom;
-        let u = ((c2.x - a2.x) * r.y - (c2.y - a2.y) * r.x) / denom;
-        if t > EPS && t < 1.0 - EPS && u > EPS && u < 1.0 - EPS {
-            return Some(describe_crossing(a, b, c, d, t, u, "cross"));
-        }
-        if (-EPS..=1.0 + EPS).contains(&t) && (-EPS..=1.0 + EPS).contains(&u) {
-            let a_endpoint = !(EPS..=1.0 - EPS).contains(&t);
-            let b_endpoint = !(EPS..=1.0 - EPS).contains(&u);
+    match kernel::segment_segment(a2, b2, c2, d2) {
+        SegSeg::Crossing { t, u, .. } => Some(describe_crossing(a, b, c, d, t, u, "cross")),
+        SegSeg::Touching { point, t, u } => {
+            // An endpoint of one edge on the *interior* of the other fails
+            // `try_add_constraint` (spade can't run a constraint through a
+            // vertex without splitting it). An endpoint-to-endpoint near miss
+            // is the digitized-independently signature instead.
+            let a_endpoint =
+                point.distance(a2) <= kernel::XY_TOL || point.distance(b2) <= kernel::XY_TOL;
+            let b_endpoint =
+                point.distance(c2) <= kernel::XY_TOL || point.distance(d2) <= kernel::XY_TOL;
             if a_endpoint != b_endpoint {
-                return Some(describe_crossing(a, b, c, d, t, u, "touch"));
+                Some(describe_crossing(a, b, c, d, t, u, "touch"))
+            } else {
+                nearest_endpoint_gap(a, b, c, d)
             }
         }
-        return nearest_endpoint_gap(a, b, c, d);
-    }
-
-    // Parallel or anti-parallel: check collinearity, then parameter overlap.
-    let r_len = r.length();
-    if r_len < 1e-9 {
-        return None;
-    }
-    let cross_ac = r.x * (c2.y - a2.y) - r.y * (c2.x - a2.x);
-    let perp_dist = cross_ac.abs() / r_len;
-    if perp_dist > 1e-6 {
-        return nearest_endpoint_gap(a, b, c, d);
-    }
-    let t_c = (c2 - a2).dot(r) / r_len.powi(2);
-    let t_d = (d2 - a2).dot(r) / r_len.powi(2);
-    let (lo, hi) = (t_c.min(t_d), t_c.max(t_d));
-    if hi > 1e-6 && lo < 1.0 - 1e-6 {
-        Some(format!(
-            "collinear and overlapping along the same line for parameter range [{:.3}, {:.3}] of edge A \u{2014} these two breaklines run along the same wall without sharing vertices, so the CDT can't insert both without splitting them",
-            lo.max(0.0),
-            hi.min(1.0)
-        ))
-    } else {
-        nearest_endpoint_gap(a, b, c, d)
+        SegSeg::CollinearOverlap { t0, t1 } => Some(format!(
+            "collinear and overlapping along the same line for parameter range [{t0:.3}, {t1:.3}] of edge A \u{2014} these two breaklines run along the same wall without sharing vertices, so the CDT can't insert both without splitting them"
+        )),
+        SegSeg::Disjoint => nearest_endpoint_gap(a, b, c, d),
     }
 }
 
@@ -239,66 +339,37 @@ fn conflicting_z_detail(
     c: glam::DVec3,
     d: glam::DVec3,
 ) -> Option<String> {
+    use crate::model::kernel::{self, SegSeg};
+    // Elevation disagreement below Z_TOL is survey noise, not a conflict: the
+    // crossing proceeds and the split vertex takes the first edge's Z.
+    const Z_EPS: f64 = crate::model::kernel::Z_TOL;
     let (a2, b2, c2, d2) = (a.truncate(), b.truncate(), c.truncate(), d.truncate());
-    let r = b2 - a2;
-    let s = d2 - c2;
-    let denom = r.x * s.y - r.y * s.x;
-    const EPS: f64 = 1e-8;
-    const Z_EPS: f64 = 1e-3;
-
-    if denom.abs() > 1e-9 {
-        let t = ((c2.x - a2.x) * s.y - (c2.y - a2.y) * s.x) / denom;
-        let u = ((c2.x - a2.x) * r.y - (c2.y - a2.y) * r.x) / denom;
-        if (-EPS..=1.0 + EPS).contains(&t) && (-EPS..=1.0 + EPS).contains(&u) {
+    match kernel::segment_segment(a2, b2, c2, d2) {
+        SegSeg::Crossing { t, u, .. } | SegSeg::Touching { t, u, .. } => {
             let z_a = a.z + t * (b.z - a.z);
             let z_c = c.z + u * (d.z - c.z);
             if (z_a - z_c).abs() > Z_EPS {
                 return Some(describe_crossing(a, b, c, d, t, u, "cross"));
             }
+            None
         }
-        return None;
-    }
-
-    let r_len_sq = r.length_squared();
-    if r_len_sq < 1e-18 {
-        return None;
-    }
-    let perp_dist = (r.x * (c2.y - a2.y) - r.y * (c2.x - a2.x)).abs() / r_len_sq.sqrt();
-    if perp_dist > 1e-6 {
-        return None;
-    }
-
-    let t_c = (c2 - a2).dot(r) / r_len_sq;
-    let t_d = (d2 - a2).dot(r) / r_len_sq;
-    let lo = t_c.min(t_d).max(0.0);
-    let hi = t_c.max(t_d).min(1.0);
-    if hi <= lo + EPS {
-        return None;
-    }
-
-    for t in [lo, hi] {
-        let point = a2 + t * r;
-        let u = point_on_segment_parameter(point, c2, d2);
-        let z_a = a.z + t * (b.z - a.z);
-        let z_c = c.z + u * (d.z - c.z);
-        if (z_a - z_c).abs() > Z_EPS {
-            return Some(format!(
-                "collinear overlap has conflicting elevations near ({:.3}, {:.3}); edge A's Z is {z_a:.3}, edge B's Z is {z_c:.3}",
-                point.x, point.y
-            ));
+        SegSeg::CollinearOverlap { t0, t1 } => {
+            let r = b2 - a2;
+            for t in [t0, t1] {
+                let point = a2 + t * r;
+                let (_, u) = kernel::project_onto_segment(point, c2, d2);
+                let z_a = a.z + t * (b.z - a.z);
+                let z_c = c.z + u * (d.z - c.z);
+                if (z_a - z_c).abs() > Z_EPS {
+                    return Some(format!(
+                        "collinear overlap has conflicting elevations near ({:.3}, {:.3}); edge A's Z is {z_a:.3}, edge B's Z is {z_c:.3}",
+                        point.x, point.y
+                    ));
+                }
+            }
+            None
         }
-    }
-
-    None
-}
-
-fn point_on_segment_parameter(point: glam::DVec2, a: glam::DVec2, b: glam::DVec2) -> f64 {
-    let ab = b - a;
-    let len_sq = ab.length_squared();
-    if len_sq < 1e-18 {
-        0.0
-    } else {
-        ((point - a).dot(ab) / len_sq).clamp(0.0, 1.0)
+        SegSeg::Disjoint => None,
     }
 }
 
@@ -368,13 +439,22 @@ pub(super) fn cdt_surface_from_breaklines(
             let handle = cdt
                 .insert(Point2::new(point.x, point.y))
                 .map_err(|error| anyhow::anyhow!("CDT insert failed: {error:?}"))?;
-            if let Some(existing_z) = handle_z.insert(handle.index(), point.z)
-                && (existing_z - point.z).abs() > 1e-7
-            {
-                anyhow::bail!(
-                    "Selected breaklines contain the same XY point at conflicting elevations ({existing_z:.3} and {:.3})",
-                    point.z
-                );
+            // Same XY from two breaklines: keep the first elevation when they
+            // agree within Z_TOL (survey noise); larger disagreement cannot be
+            // represented by a single-valued terrain.
+            match handle_z.entry(handle.index()) {
+                std::collections::hash_map::Entry::Occupied(existing) => {
+                    let existing_z = *existing.get();
+                    if (existing_z - point.z).abs() > crate::model::kernel::Z_TOL {
+                        anyhow::bail!(
+                            "Selected breaklines contain the same XY point at conflicting elevations ({existing_z:.3} and {:.3})",
+                            point.z
+                        );
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    vacant.insert(point.z);
+                }
             }
             handles.push(handle);
         }
@@ -570,9 +650,12 @@ pub(super) fn closed_solid_from_breaklines(
             }
         }
 
-        let flat: Vec<f64> = ring.iter().flat_map(|point| [point.x, point.y]).collect();
-        let cap_triangles = earcutr::earcut(&flat, &[], 2)
-            .map_err(|error| anyhow::anyhow!("Failed to triangulate solid closure: {error}"))?;
+        let flat: Vec<[f64; 2]> = ring.iter().map(|point| [point.x, point.y]).collect();
+        let mut cap_triangles: Vec<usize> = Vec::new();
+        earcut::Earcut::new().earcut(flat.iter().copied(), &[], &mut cap_triangles);
+        if cap_triangles.is_empty() && flat.len() >= 3 {
+            anyhow::bail!("Failed to triangulate solid closure: degenerate boundary ring");
+        }
         for triangle in cap_triangles.chunks_exact(3) {
             let mut face = [
                 boundary_indices[triangle[0]],
@@ -636,23 +719,45 @@ pub(super) fn cdt_fill_ring(
         let h = cdt
             .insert(Point2::new(v.x, v.y))
             .map_err(|error| anyhow::anyhow!("CDT insert failed: {error:?}"))?;
-        if let Some(existing_z) = handle_z.insert(h.index(), v.z)
-            && (existing_z - v.z).abs() > 1e-7
-        {
-            anyhow::bail!(
-                "Selected polygon contains the same XY point at conflicting elevations ({existing_z:.3} and {:.3})",
-                v.z
-            );
+        match handle_z.entry(h.index()) {
+            std::collections::hash_map::Entry::Occupied(existing) => {
+                let existing_z = *existing.get();
+                if (existing_z - v.z).abs() > crate::model::kernel::Z_TOL {
+                    anyhow::bail!(
+                        "Selected polygon contains the same XY point at conflicting elevations ({existing_z:.3} and {:.3})",
+                        v.z
+                    );
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                vacant.insert(v.z);
+            }
         }
         handles.push(h);
     }
     for i in 0..ring.len() {
         let j = (i + 1) % ring.len();
         let (ha, hb) = (handles[i], handles[j]);
-        if ha != hb && cdt.try_add_constraint(ha, hb).is_empty() {
-            anyhow::bail!(
-                "Selected polygon edges intersect or overlap in XY and cannot form a terrain surface"
-            );
+        if ha == hb {
+            continue;
+        }
+        // Self-intersecting edges are split at their crossing points rather
+        // than rejected; split vertices take their Z from the edge being
+        // inserted.
+        let constraint_edges = cdt.add_constraint_and_split(ha, hb, |point| point);
+        for edge in constraint_edges {
+            let edge = cdt.directed_edge(edge);
+            for vertex in [edge.from(), edge.to()] {
+                let index = vertex.fix().index();
+                handle_z.entry(index).or_insert_with(|| {
+                    let position = vertex.position();
+                    interpolate_z_on_edge(
+                        ring[i],
+                        ring[j],
+                        glam::DVec2::new(position.x, position.y),
+                    )
+                });
+            }
         }
     }
 
@@ -720,6 +825,41 @@ pub(super) fn signed_area_xy(ring: &[glam::DVec3]) -> f64 {
 mod tests {
     use super::*;
     use glam::DVec3;
+
+    #[test]
+    fn coarse_weld_merges_cm_scale_gaps_that_the_noise_weld_leaves() {
+        const E: f64 = 476_000.0;
+        const N: f64 = 7_654_000.0;
+        // Second ring's first vertex was digitized 3 cm off the first ring's
+        // shared corner (2 cm high) — outside noise tolerance, inside the
+        // user-consented coarse tolerance.
+        let intended = DVec3::new(E, N, 100.0);
+        let digitized = DVec3::new(E + 0.03, N + 0.004, 100.02);
+        let mut rings = vec![
+            vec![
+                intended,
+                DVec3::new(E + 10.0, N, 100.0),
+                DVec3::new(E + 5.0, N + 8.0, 100.0),
+            ],
+            vec![
+                digitized,
+                DVec3::new(E + 10.0, N, 100.0),
+                DVec3::new(E + 5.0, N - 8.0, 100.0),
+            ],
+        ];
+
+        let noise_welded = weld_breakline_vertices(
+            &mut rings,
+            crate::model::kernel::XY_TOL,
+            crate::model::kernel::Z_TOL,
+        );
+        assert_eq!(noise_welded, 0, "3 cm is not digitization noise");
+        assert_eq!(rings[1][0], digitized);
+
+        let coarse_welded = weld_breakline_vertices(&mut rings, COARSE_WELD_TOL, COARSE_WELD_TOL);
+        assert_eq!(coarse_welded, 1);
+        assert_eq!(rings[1][0], intended, "gap endpoint snaps to first-seen");
+    }
 
     #[test]
     fn diagnose_reports_crossing_with_differing_elevations() {
@@ -872,6 +1012,68 @@ mod tests {
 
         let result = cdt_surface_from_breaklines(&[ring10, ring11]);
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn cdt_surface_accepts_shared_xy_vertex_with_noise_level_z_difference() {
+        // Two rings share a vertex in XY exactly, but its elevation differs by
+        // 1 cm — survey noise, far below Z_TOL. This used to bail at 1e-7.
+        let ring0 = vec![
+            DVec3::new(0.0, 0.0, 10.0),
+            DVec3::new(10.0, 0.0, 10.0),
+            DVec3::new(10.0, 10.0, 10.0),
+            DVec3::new(0.0, 10.0, 10.0),
+        ];
+        let ring1 = vec![
+            DVec3::new(10.0, 0.0, 10.01),
+            DVec3::new(20.0, 0.0, 10.0),
+            DVec3::new(20.0, 10.0, 10.0),
+        ];
+        let result = cdt_surface_from_breaklines(&[ring0, ring1]);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn weld_snaps_noise_level_near_misses_onto_one_vertex() {
+        // Ring 1's first vertex sits 0.05 mm from ring 0's corner — a
+        // digitization near miss well inside XY_TOL.
+        let mut rings = vec![
+            vec![
+                DVec3::new(0.0, 0.0, 10.0),
+                DVec3::new(10.0, 0.0, 10.0),
+                DVec3::new(10.0, 10.0, 10.0),
+                DVec3::new(0.0, 10.0, 10.0),
+            ],
+            vec![
+                DVec3::new(10.00005, 0.00002, 10.0),
+                DVec3::new(20.0, 0.0, 10.0),
+                DVec3::new(20.0, 10.0, 10.0),
+            ],
+        ];
+        let welded = weld_breakline_vertices(
+            &mut rings,
+            crate::model::kernel::XY_TOL,
+            crate::model::kernel::Z_TOL,
+        );
+        assert_eq!(welded, 1);
+        assert_eq!(rings[1][0], rings[0][1]);
+        let result = cdt_surface_from_breaklines(&rings);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn cdt_fill_ring_splits_a_self_crossing_ring_instead_of_failing() {
+        // Bow-tie: the closing edge crosses edge 1 at (5,5). This used to
+        // bail with "edges intersect or overlap in XY".
+        let ring = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(10.0, 0.0, 0.0),
+            DVec3::new(0.0, 10.0, 0.0),
+            DVec3::new(10.0, 10.0, 0.0),
+        ];
+        let result = cdt_fill_ring(&ring, false);
+        let (_, faces) = result.expect("self-crossing ring should split, not fail");
+        assert!(!faces.is_empty());
     }
 
     #[test]

@@ -83,6 +83,14 @@ pub(crate) fn draw_main_menu(
                     }
                 });
 
+                // Not implemented
+                ui.menu_button("Object", |ui| {
+                    if ui.button("Set selection(s) Z value ..").clicked() {
+                        commands.push(UiCommand::OpenSetSelectionZValueDialog);
+                        ui.close();
+                    }
+                });
+
                 ui.menu_button("Triangulation", |ui| {
                     if ui.button("Create Triangulation").clicked() {
                         commands.push(UiCommand::OpenCreateTriangulation);

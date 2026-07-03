@@ -40,7 +40,6 @@ pub(crate) struct DocumentSceneBuildInput<'a> {
     pub(crate) text_pick_records: &'a mut Vec<TextPickRecord>,
     pub(crate) scene_origin: DVec3,
     pub(crate) scale_factor: f32,
-    pub(crate) selection_color: [f32; 4],
 }
 
 pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
@@ -57,7 +56,6 @@ pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
         text_pick_records,
         scene_origin,
         scale_factor,
-        selection_color,
     } = input;
 
     lyon_buffer.indices.clear();
@@ -81,12 +79,22 @@ pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
 
         draw_origin_marker(&mut draw_ctx);
 
-        let all_road_data = build_render_road_data(document, editor);
+        // Static pass: roads resolve without the ghost. Roads the ghost
+        // reshapes are suppressed here and drawn by `rebuild_dynamic_scene`
+        // from the ghost-inclusive resolve instead.
+        let road_network = resolve(document, None);
 
         // The document is the sole source of geometry. Draw each object in world
         // space, honoring layer visibility / hide / freeze, and record a pick range
-        // unless frozen so objects select and highlight.
-        for object in document.objects() {
+        // unless frozen so objects select and highlight. Selected objects are
+        // emitted last so overlapping selected strokes remain visible.
+        let mut objects: Vec<&Object> = document.objects().iter().collect();
+        objects.sort_by_key(|object| {
+            let handle = SceneEntityId::Object(object.id());
+            editor.selected_handles.contains(&handle)
+                || editor.tool_highlight_id == Some(object.id())
+        });
+        for object in objects {
             let handle = SceneEntityId::Object(object.id());
             let layer_visible = document
                 .layer(object.layer())
@@ -204,118 +212,38 @@ pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
                         }
                     }
                 }
-                Object::Road {
-                    id: road_id,
-                    centerline,
-                    ..
-                } => {
-                    if let Some(rd) = all_road_data.iter().find(|r| r.id == Some(*road_id)) {
-                        for seg in centerline.windows(2) {
-                            draw_bulge_segment(
-                                &mut draw_ctx,
-                                seg[0].pos,
-                                seg[1].pos,
-                                seg[0].bulge,
-                                DOC_LINE_WIDTH,
-                                rgba,
-                            );
+                Object::Road { id: road_id, .. } => {
+                    if editor.road_preview_affected_roads.contains(road_id) {
+                        continue;
+                    }
+                    // All geometry is pre-resolved by the road network: the
+                    // resolved center carries junction flattening and grade
+                    // flats, and the side lines already terminate exactly at
+                    // shared junction corners — nothing to clip here.
+                    for edge in road_network.edges_for(RoadKey::Object(*road_id)) {
+                        for pair in edge.center.windows(2) {
+                            draw_line(&mut draw_ctx, pair[0], pair[1], DOC_LINE_WIDTH, rgba);
                         }
-
-                        let edge_color = YELLOW_HIGHLIGHT_COLOR;
-                        for (edge_pts, z_off) in
-                            [(&rd.left_pts, rd.left_z), (&rd.right_pts, rd.right_z)]
-                        {
-                            for i in rd.draw_start..rd.draw_end.saturating_sub(1) {
-                                let pa = edge_pts[i];
-                                let pb = edge_pts[i + 1];
-                                let pa2 = pa.truncate();
-                                let pb2 = pb.truncate();
-
-                                let mut ts: Vec<f64> = vec![0.0, 1.0];
-                                for other in &all_road_data {
-                                    if other.id == rd.id {
-                                        continue;
-                                    }
-                                    for other_edge in [&other.left_pts, &other.right_pts] {
-                                        for pair in other_edge.windows(2) {
-                                            if let Some(t) = road_edge_seg_t(
-                                                pa2,
-                                                pb2,
-                                                pair[0].truncate(),
-                                                pair[1].truncate(),
-                                            ) {
-                                                ts.push(t);
-                                            }
-                                        }
-                                    }
-                                }
-                                for attachment in &rd.attachments {
-                                    for segment in &attachment.segments {
-                                        if let Some(t) = road_edge_seg_t(
-                                            pa2,
-                                            pb2,
-                                            segment[0].truncate(),
-                                            segment[1].truncate(),
-                                        ) {
-                                            ts.push(t);
-                                        }
-                                    }
-                                    if let (Some(along_a), Some(along_b)) = (
-                                        render_attachment_edge_along(pa2, attachment),
-                                        render_attachment_edge_along(pb2, attachment),
-                                    ) {
-                                        add_render_along_split(&mut ts, along_a, along_b, 0.0);
-                                        add_render_along_split(
-                                        &mut ts,
-                                        along_a,
-                                        along_b,
-                                        crate::model::geometry::ROAD_INTERSECTION_FLAT_CLEARANCE_M,
-                                    );
-                                    }
-                                }
-                                ts.sort_by(|a, b| {
-                                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                                });
-
-                                for w in ts.windows(2) {
-                                    let (t0, t1) = (w[0], w[1]);
-                                    if t1 - t0 < 1e-8 {
-                                        continue;
-                                    }
-                                    let mid2d = pa2 + (pb2 - pa2) * ((t0 + t1) * 0.5);
-                                    let inside = all_road_data.iter().any(|other| {
-                                        if other.id == rd.id {
-                                            return false;
-                                        }
-                                        road_point_in_body(mid2d, &other.cl_raw, other.half_w)
-                                    });
-                                    let clipped_by_attachment = rd
-                                        .attachments
-                                        .iter()
-                                        .filter(|attachment| attachment.clip_boundary)
-                                        .filter_map(|attachment| {
-                                            render_attachment_edge_along(mid2d, attachment)
-                                        })
-                                        .any(|along| along < -1e-8);
-                                    if !inside && !clipped_by_attachment {
-                                        let interp = |t: f64| {
-                                            let base = DVec3::new(
-                                                pa.x + (pb.x - pa.x) * t,
-                                                pa.y + (pb.y - pa.y) * t,
-                                                pa.z + (pb.z - pa.z) * t,
-                                            );
-                                            render_tapered_edge_point(base, z_off, &rd.attachments)
-                                        };
-                                        draw_line(
-                                            &mut draw_ctx,
-                                            interp(t0),
-                                            interp(t1),
-                                            DOC_LINE_WIDTH,
-                                            edge_color,
-                                        );
-                                    }
-                                }
+                        for side in [&edge.left, &edge.right] {
+                            for pair in side.windows(2) {
+                                draw_line(
+                                    &mut draw_ctx,
+                                    pair[0],
+                                    pair[1],
+                                    DOC_LINE_WIDTH,
+                                    YELLOW_HIGHLIGHT_COLOR,
+                                );
                             }
+                        }
+                        if edge.start_cap
+                            && let (Some(&l), Some(&r)) = (edge.left.first(), edge.right.first())
+                        {
+                            draw_line(&mut draw_ctx, l, r, DOC_LINE_WIDTH, YELLOW_HIGHLIGHT_COLOR);
+                        }
+                        if edge.end_cap
+                            && let (Some(&l), Some(&r)) = (edge.left.last(), edge.right.last())
+                        {
+                            draw_line(&mut draw_ctx, l, r, DOC_LINE_WIDTH, YELLOW_HIGHLIGHT_COLOR);
                         }
                     }
                 }
@@ -348,7 +276,7 @@ pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
                         let indicator_color = if is_editing {
                             TEXT_EDIT_INDICATOR_COLOR
                         } else {
-                            selection_color
+                            crate::ui::SELECTION_COLOR_F32
                         };
                         for edge in corners
                             .iter()
@@ -409,70 +337,6 @@ pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
                 });
             }
         }
-
-        if editor.batter_berm_dialog_open {
-            const BATTER_BERM_PREVIEW_COLOR: [f32; 4] = [1.0, 0.86, 0.0, 1.0];
-            const BATTER_BERM_GUIDE_COLOR: [f32; 4] = [1.0, 0.9, 0.16, 0.8];
-
-            for &(from, to) in &editor.batter_berm_guides_world {
-                draw_line(&mut draw_ctx, from, to, 1.5, BATTER_BERM_GUIDE_COLOR);
-            }
-
-            for ring in &editor.batter_berm_rings_world {
-                for pair in ring.windows(2) {
-                    draw_line(
-                        &mut draw_ctx,
-                        pair[0],
-                        pair[1],
-                        2.0,
-                        BATTER_BERM_PREVIEW_COLOR,
-                    );
-                }
-                if editor.batter_berm_preview_closed
-                    && ring.len() >= 2
-                    && let (Some(&first), Some(&last)) = (ring.first(), ring.last())
-                {
-                    draw_line(&mut draw_ctx, last, first, 2.0, BATTER_BERM_PREVIEW_COLOR);
-                }
-            }
-        }
-
-        if editor.active_tool == ActiveTool::MakeRoad {
-            let mut raw_centerline = editor.pending_stroke.clone();
-            if let Some(cursor) = editor.cursor_world {
-                raw_centerline.push(cursor);
-            }
-            let centerline = crate::model::geometry::validate_road_segment_angles(
-                &raw_centerline,
-                editor.road_max_angle_degrees,
-            )
-            .ok()
-            .and_then(|_| {
-                crate::model::geometry::road_centerline_with_intersection_flats(
-                    &raw_centerline,
-                    document,
-                    editor.road_width,
-                )
-                .ok()
-            });
-            let color = if centerline.is_some() {
-                PREVIEW_COLOR
-            } else {
-                INVALID_PREVIEW_COLOR
-            };
-            let centerline = centerline.unwrap_or(raw_centerline);
-            for pair in centerline.windows(2) {
-                draw_line(&mut draw_ctx, pair[0], pair[1], 1.5, color);
-            }
-            for edge in [
-                &editor.road_preview_left_world,
-                &editor.road_preview_right_world,
-            ] {
-                for pair in edge.windows(2) {
-                    draw_line(&mut draw_ctx, pair[0], pair[1], 2.0, YELLOW_HIGHLIGHT_COLOR);
-                }
-            }
-        }
     }
 
     if !editor.translucent_handles.is_empty() {
@@ -514,11 +378,11 @@ pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
             }
             let stroke = rec.stroke_range.0 as usize..rec.stroke_range.1 as usize;
             for vertex in &mut stroke_vertex_buf[stroke] {
-                vertex.color = selection_color;
+                vertex.color = crate::ui::SELECTION_COLOR_F32;
             }
             let fill = rec.fill_range.0 as usize..rec.fill_range.1 as usize;
             for vertex in &mut lyon_buffer.vertices[fill] {
-                vertex.color = selection_color;
+                vertex.color = crate::ui::SELECTION_COLOR_F32;
             }
         }
     }
@@ -528,11 +392,152 @@ pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
         if let Some(rec) = pick_records.iter().find(|r| r.entity == handle) {
             let stroke = rec.stroke_range.0 as usize..rec.stroke_range.1 as usize;
             for vertex in &mut stroke_vertex_buf[stroke] {
-                vertex.color = selection_color;
+                vertex.color = crate::ui::SELECTION_COLOR_F32;
             }
             let fill = rec.fill_range.0 as usize..rec.fill_range.1 as usize;
             for vertex in &mut lyon_buffer.vertices[fill] {
-                vertex.color = selection_color;
+                vertex.color = crate::ui::SELECTION_COLOR_F32;
+            }
+        }
+    }
+}
+
+pub(crate) struct DynamicSceneBuildInput<'a> {
+    pub(crate) editor: &'a EditorState,
+    pub(crate) document: &'a Document,
+    pub(crate) dynamic_vertex_buf: &'a mut Vec<StrokeVertex>,
+    pub(crate) dynamic_index_buf: &'a mut Vec<u32>,
+    pub(crate) scene_origin: DVec3,
+    pub(crate) scale_factor: f32,
+}
+
+/// Per-frame geometry for the live drawing tools: the road ghost preview, the
+/// batter/berm preview, and the committed roads the ghost reshapes (suppressed
+/// from the static pass). Stroke-only and tiny, so rebuilding it every frame
+/// while a tool is active is cheap — unlike the full document scene it
+/// replaces in that role.
+pub(crate) fn rebuild_dynamic_scene(input: DynamicSceneBuildInput<'_>) {
+    let DynamicSceneBuildInput {
+        editor,
+        document,
+        dynamic_vertex_buf,
+        dynamic_index_buf,
+        scene_origin,
+        scale_factor,
+    } = input;
+
+    dynamic_vertex_buf.clear();
+    dynamic_index_buf.clear();
+
+    let mut unused_fill_vertices: Vec<Vertex> = Vec::new();
+    let mut unused_fill_indices: Vec<u32> = Vec::new();
+    let mut draw_ctx = DrawContext {
+        stroke_vertex_buf: dynamic_vertex_buf,
+        stroke_index_buf: dynamic_index_buf,
+        fill_vertex_buf: &mut unused_fill_vertices,
+        fill_index_buf: &mut unused_fill_indices,
+        scene_origin,
+        scale_factor,
+    };
+
+    // Ghost-reshaped committed roads, resolved with the ghost included (kept
+    // fresh by `update_road_preview`), drawn exactly like the static pass
+    // draws roads and honouring the same visibility filters.
+    for edge in &editor.road_preview_affected_edges {
+        let RoadKey::Object(road_id) = edge.road else {
+            continue;
+        };
+        let Some(object) = document.get_object(road_id) else {
+            continue;
+        };
+        let handle = SceneEntityId::Object(road_id);
+        let layer_visible = document
+            .layer(object.layer())
+            .map(|layer| layer.visible)
+            .unwrap_or(true);
+        if !layer_visible || editor.hidden_handles.contains(&handle) {
+            continue;
+        }
+        let rgba = document.object_rgba(object);
+        for pair in edge.center.windows(2) {
+            draw_line(&mut draw_ctx, pair[0], pair[1], DOC_LINE_WIDTH, rgba);
+        }
+        for side in [&edge.left, &edge.right] {
+            for pair in side.windows(2) {
+                draw_line(
+                    &mut draw_ctx,
+                    pair[0],
+                    pair[1],
+                    DOC_LINE_WIDTH,
+                    YELLOW_HIGHLIGHT_COLOR,
+                );
+            }
+        }
+        if edge.start_cap
+            && let (Some(&l), Some(&r)) = (edge.left.first(), edge.right.first())
+        {
+            draw_line(&mut draw_ctx, l, r, DOC_LINE_WIDTH, YELLOW_HIGHLIGHT_COLOR);
+        }
+        if edge.end_cap
+            && let (Some(&l), Some(&r)) = (edge.left.last(), edge.right.last())
+        {
+            draw_line(&mut draw_ctx, l, r, DOC_LINE_WIDTH, YELLOW_HIGHLIGHT_COLOR);
+        }
+    }
+
+    if editor.batter_berm_dialog_open {
+        const BATTER_BERM_PREVIEW_COLOR: [f32; 4] = [1.0, 0.86, 0.0, 1.0];
+        const BATTER_BERM_GUIDE_COLOR: [f32; 4] = [1.0, 0.9, 0.16, 0.8];
+
+        for &(from, to) in &editor.batter_berm_guides_world {
+            draw_line(&mut draw_ctx, from, to, 1.5, BATTER_BERM_GUIDE_COLOR);
+        }
+
+        for ring in &editor.batter_berm_rings_world {
+            for pair in ring.windows(2) {
+                draw_line(
+                    &mut draw_ctx,
+                    pair[0],
+                    pair[1],
+                    2.0,
+                    BATTER_BERM_PREVIEW_COLOR,
+                );
+            }
+            if editor.batter_berm_preview_closed
+                && ring.len() >= 2
+                && let (Some(&first), Some(&last)) = (ring.first(), ring.last())
+            {
+                draw_line(&mut draw_ctx, last, first, 2.0, BATTER_BERM_PREVIEW_COLOR);
+            }
+        }
+    }
+
+    if editor.active_tool == ActiveTool::MakeRoad {
+        // The resolved ghost centerline (flat pockets included) when the
+        // stroke passes the placement rules; the raw stroke in the invalid
+        // colour otherwise. Both are maintained by `update_road_preview`.
+        let valid =
+            editor.road_preview_violation.is_none() && !editor.road_preview_center_world.is_empty();
+        let (centerline, color) = if valid {
+            (editor.road_preview_center_world.clone(), PREVIEW_COLOR)
+        } else {
+            let mut raw_centerline = editor.pending_stroke.clone();
+            if let Some(cursor) = editor.cursor_world {
+                raw_centerline.push(cursor);
+            }
+            (raw_centerline, INVALID_PREVIEW_COLOR)
+        };
+        for pair in centerline.windows(2) {
+            if pair[0].is_finite() && pair[1].is_finite() {
+                draw_line(&mut draw_ctx, pair[0], pair[1], 1.5, color);
+            }
+        }
+        for edge in [
+            &editor.road_preview_left_world,
+            &editor.road_preview_right_world,
+        ] {
+            for pair in edge.windows(2) {
+                draw_line(&mut draw_ctx, pair[0], pair[1], 2.0, YELLOW_HIGHLIGHT_COLOR);
             }
         }
     }

@@ -113,6 +113,12 @@ pub(crate) struct App<'a> {
     empty_document: Document,
     scene_document: Document,
     snap_index: ObjectSnapIndex,
+    /// Set by `invalidate_geometry`; the index rebuilds lazily on the next
+    /// snap/orbit query via `refresh_snap_index`.
+    snap_index_dirty: bool,
+    /// `Workspace::composite_key()` of the last `scene_document` build;
+    /// `None` forces the next invalidation to rebuild.
+    scene_document_key: Option<u64>,
     history: crate::model::History,
     modifiers: ModifiersState,
     drag: Option<DragState>,
@@ -120,6 +126,8 @@ pub(crate) struct App<'a> {
     /// Screen position where the right mouse button was pressed (physical px).
     /// Used to distinguish a quick context-menu click from a camera orbit drag.
     right_press_px: Option<(f32, f32)>,
+    /// True after a pending right press has become an active camera orbit drag.
+    right_orbit_active: bool,
     pending_topology_click: Option<(SceneEntityId, DVec3)>,
     move_session_original: Option<Vec<Object>>,
     move_session_project_dirty: Option<bool>,
@@ -165,11 +173,14 @@ impl<'a> App<'a> {
             empty_document: Document::new(),
             scene_document: Document::new(),
             snap_index: ObjectSnapIndex::default(),
+            snap_index_dirty: false,
+            scene_document_key: None,
             history: crate::model::History::new(),
             modifiers: ModifiersState::empty(),
             drag: None,
             gizmo_drag: None,
             right_press_px: None,
+            right_orbit_active: false,
             pending_topology_click: None,
             move_session_original: None,
             move_session_project_dirty: None,
@@ -207,12 +218,10 @@ impl<'a> App<'a> {
         app.editor.show_world_axis_gizmo = config.show_world_axis_gizmo;
         app.editor.show_view_cube = config.show_view_cube;
         app.editor.renderer_background_color = config.renderer_background_color;
-        app.editor.selection_color = config.selection_color;
         app.editor.snap_poll_rate = config.snap_poll_rate.clamp(5, 1000);
         app.editor.frame_rate_cap = config.frame_rate_cap.clamp(20, 1000);
         app.editor.resize_frame_rate_cap = config.resize_frame_rate_cap.clamp(20, 1000);
         app.editor.frame_counter_enabled = config.frame_counter_enabled;
-        app.editor.topology_folder_search_depth = config.topology_folder_search_depth.clamp(0, 10);
 
         Ok(app)
     }
@@ -261,6 +270,8 @@ impl<'a> App<'a> {
         self.editor.active_tool = crate::ui::state::ActiveTool::None;
         self.editor.selection_box_start_px = None;
         self.editor.selection_box_current_px = None;
+        self.editor.move_to_layer_dialog = None;
+        self.editor.move_layer_dialog = None;
         self.pending_topology_click = None;
         self.editor.measurement_start = None;
         self.editor.measurement_end = None;
@@ -300,12 +311,32 @@ impl<'a> App<'a> {
     }
 
     fn invalidate_geometry(&mut self) {
-        self.scene_document = self.workspace.scene_document();
-        self.snap_index = ObjectSnapIndex::build(self.scene_document.objects());
+        // Many of the ~90 invalidation sites fire for editor-state reasons
+        // (selection, tool changes) with the documents untouched; the
+        // composite clone and snap index only need refreshing when the
+        // workspace contents actually changed.
+        let composite_key = self.workspace.composite_key();
+        if Some(composite_key) != self.scene_document_key {
+            self.scene_document = self.workspace.scene_document();
+            self.scene_document_key = Some(composite_key);
+            // The snap index rebuild is deferred to the next snap/orbit
+            // query: many edits never snap before the next edit, and the
+            // BVH build is the expensive part.
+            self.snap_index_dirty = true;
+        }
         if let Some(graphics) = self.graphics.as_mut() {
             graphics.invalidate_geometry();
         }
         self.redraw_requested = true;
+    }
+
+    /// Rebuild the snap index from the current scene document if an edit
+    /// invalidated it. Call before handing `self.snap_index` to a query.
+    fn refresh_snap_index(&mut self) {
+        if self.snap_index_dirty {
+            self.snap_index = ObjectSnapIndex::build(self.scene_document.objects());
+            self.snap_index_dirty = false;
+        }
     }
 
     fn invalidate_overlay(&mut self) {
@@ -676,45 +707,6 @@ impl<'a> App<'a> {
         paths
     }
 
-    /// Recursively collect sub-directories that contain triangulation files, up to `max_depth`
-    /// levels below `dir`. Returns a list of (subdirectory, files_in_that_dir) pairs.
-    /// The root `dir` itself is NOT included in the results — only child dirs.
-    fn find_child_triangulation_dirs(
-        dir: &Path,
-        depth: u32,
-        max_depth: u32,
-    ) -> Vec<(PathBuf, Vec<PathBuf>)> {
-        if depth >= max_depth {
-            return vec![];
-        }
-        let subdirs: Vec<PathBuf> = match fs::read_dir(dir) {
-            Ok(entries) => entries
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.is_dir())
-                .collect(),
-            Err(error) => {
-                userspace_warn!(
-                    "Could not scan child triangulation folders in {}: {error}",
-                    dir.display()
-                );
-                return vec![];
-            }
-        };
-        let mut result = Vec::new();
-        for subdir in subdirs {
-            let files = Self::scan_triangulation_dir(&subdir);
-            if !files.is_empty() {
-                result.push((subdir.clone(), files));
-            }
-            result.extend(Self::find_child_triangulation_dirs(
-                &subdir,
-                depth + 1,
-                max_depth,
-            ));
-        }
-        result
-    }
-
     fn refresh_triangulation_dir_entries(&mut self) {
         self.triangulation_dir_entries = self
             .triangulation_dirs
@@ -772,6 +764,7 @@ impl<'a> ApplicationHandler for App<'a> {
             .with_title(crate::APP_NAME.to_string())
             .with_window_icon(window_icon())
             .with_min_inner_size(winit::dpi::PhysicalSize::new(900, 500))
+            .with_inner_size(winit::dpi::PhysicalSize::new(900, 500))
             .with_maximized(true);
         #[cfg(target_os = "linux")]
         let window_attributes = window_attributes.with_name(crate::APP_ID, crate::APP_ID);

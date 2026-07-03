@@ -5,8 +5,8 @@ use crate::{
     rendering::color::{color32_to_rgba, rgba_to_color32},
     ui::{
         state::{
-            ActiveTool, BatterBermMode, EditorState, HeightMode, OffsetMeasure, OffsetProjection,
-            RelimitMode, TrimEnd, UiCommand, UiProjectView,
+            ActiveTool, BatterBermMode, EditorState, HeightMode, MoveToLayerDialog, OffsetMeasure,
+            OffsetProjection, RelimitMode, TrimEnd, UiCommand, UiProjectView,
         },
         widgets::menu::{
             DragableMenu, MenuField, MenuFieldColor32, MenuFieldCombo, MenuFieldF32, MenuFieldF64,
@@ -193,12 +193,285 @@ pub(crate) fn draw_right_click_context(
                 ui.separator();
             }
 
+            if has_doc_objects {
+                if ui.button("Move to Layer...").clicked() {
+                    let target_layer = project
+                        .active_index
+                        .and_then(|index| {
+                            project.projects.iter().find(|entry| entry.index == index)
+                        })
+                        .and_then(|entry| entry.layers.first())
+                        .map(|layer| layer.id);
+                    editor.move_to_layer_dialog = Some(MoveToLayerDialog {
+                        object_ids: selected_obj_ids.clone(),
+                        target_layer,
+                        copy: false,
+                    });
+                    commands.push(UiCommand::CloseCanvasContextMenu);
+                }
+
+                ui.separator();
+            }
+
             if ui.button("✖  Close").clicked() {
                 commands.push(UiCommand::CloseCanvasContextMenu);
             }
         });
     if !open {
         commands.push(UiCommand::CloseCanvasContextMenu);
+    }
+}
+
+pub(crate) fn draw_move_to_layer_dialog(
+    ui: &mut egui::Ui,
+    editor: &mut EditorState,
+    project: &UiProjectView,
+    commands: &mut Vec<UiCommand>,
+) {
+    let Some(active_project_index) = project.active_index else {
+        editor.move_to_layer_dialog = None;
+        return;
+    };
+    let Some(active_project) = project
+        .projects
+        .iter()
+        .find(|entry| entry.index == active_project_index)
+    else {
+        editor.move_to_layer_dialog = None;
+        return;
+    };
+    let Some(dialog) = editor.move_to_layer_dialog.as_mut() else {
+        return;
+    };
+
+    if dialog
+        .target_layer
+        .is_none_or(|id| !active_project.layers.iter().any(|layer| layer.id == id))
+    {
+        dialog.target_layer = active_project.layers.first().map(|layer| layer.id);
+    }
+
+    let selected_label = dialog
+        .target_layer
+        .and_then(|id| active_project.layers.iter().find(|layer| layer.id == id))
+        .map(|layer| layer.name.as_str())
+        .unwrap_or("Choose a layer");
+    let layer_options = active_project
+        .layers
+        .iter()
+        .map(|layer| (Some(layer.id), layer.name.clone().into()));
+    let can_apply = dialog.target_layer.is_some() && !dialog.object_ids.is_empty();
+    let object_count = dialog.object_ids.len();
+    let mut close = false;
+    let mut apply = false;
+    let mut open = true;
+
+    DragableMenu::new("Move to Layer")
+        .open(&mut open)
+        .min_width(260.0)
+        .show(ui.ctx(), |ui| {
+            ui.set_max_width(280.0);
+            MenuField::new("Action").show(ui, |ui, _| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut dialog.copy, false, "Move");
+                    ui.selectable_value(&mut dialog.copy, true, "Copy");
+                })
+                .response
+            });
+            MenuFieldCombo::new(
+                "move_to_layer_target",
+                "Layer",
+                &mut dialog.target_layer,
+                selected_label,
+                layer_options,
+            )
+            .width(180.0)
+            .show(ui);
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let action_label = if dialog.copy { "Copy" } else { "Move" };
+                if ui
+                    .add_enabled(can_apply, egui::Button::new(action_label))
+                    .clicked()
+                {
+                    apply = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+            ui.label(format!("{object_count} object(s) selected"));
+        });
+
+    if apply {
+        if let Some(target_layer) = dialog.target_layer {
+            commands.push(UiCommand::MoveObjectsToLayer {
+                project_index: active_project_index,
+                object_ids: dialog.object_ids.clone(),
+                target_layer,
+                copy: dialog.copy,
+            });
+        }
+        editor.move_to_layer_dialog = None;
+    } else if close || !open {
+        editor.move_to_layer_dialog = None;
+    }
+}
+
+pub(crate) fn draw_set_selection_z_dialog(
+    ui: &mut egui::Ui,
+    editor: &mut EditorState,
+    commands: &mut Vec<UiCommand>,
+) {
+    let Some(dialog) = editor.set_selection_z_dialog.as_mut() else {
+        return;
+    };
+
+    let z_value = dialog
+        .z_input
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite());
+    let object_count = dialog.object_ids.len();
+    let can_apply = z_value.is_some() && object_count > 0;
+    let mut close = false;
+    let mut apply = false;
+    let mut open = true;
+
+    DragableMenu::new("Set Selection Z")
+        .open(&mut open)
+        .min_width(260.0)
+        .show(ui.ctx(), |ui| {
+            ui.set_max_width(280.0);
+            let response = MenuFieldText::new("Z value", &mut dialog.z_input)
+                .hint_text("0.0")
+                .width(120.0)
+                .show(ui);
+            if z_value.is_none() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(200, 70, 70),
+                    "Enter a valid Z value.",
+                );
+            }
+            ui.add_space(4.0);
+            let submitted =
+                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            ui.horizontal(|ui| {
+                if (submitted
+                    || ui
+                        .add_enabled(can_apply, egui::Button::new("Apply"))
+                        .clicked())
+                    && can_apply
+                {
+                    apply = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+            ui.label(format!("{object_count} object(s) selected"));
+        });
+
+    if apply {
+        if let Some(z) = z_value {
+            commands.push(UiCommand::BatchSetZValue(dialog.object_ids.clone(), z));
+            editor.z_input = dialog.z_input.clone();
+        }
+        editor.set_selection_z_dialog = None;
+    } else if close || !open {
+        editor.set_selection_z_dialog = None;
+    }
+}
+
+pub(crate) fn draw_move_layer_dialog(
+    ui: &mut egui::Ui,
+    editor: &mut EditorState,
+    project: &UiProjectView,
+    commands: &mut Vec<UiCommand>,
+) {
+    let Some(dialog) = editor.move_layer_dialog.as_mut() else {
+        return;
+    };
+    let source_name = project
+        .projects
+        .iter()
+        .find(|entry| entry.index == dialog.source_project_index)
+        .and_then(|entry| {
+            entry
+                .layers
+                .iter()
+                .find(|layer| layer.id == dialog.layer_id)
+                .map(|layer| layer.name.as_str())
+        })
+        .unwrap_or("Layer");
+
+    if dialog.target_project_index.is_none_or(|target| {
+        target == dialog.source_project_index
+            || !project.projects.iter().any(|entry| entry.index == target)
+    }) {
+        dialog.target_project_index = project
+            .projects
+            .iter()
+            .find(|entry| entry.index != dialog.source_project_index)
+            .map(|entry| entry.index);
+    }
+
+    let selected_label = dialog
+        .target_project_index
+        .and_then(|index| project.projects.iter().find(|entry| entry.index == index))
+        .map(|entry| entry.name.as_str())
+        .unwrap_or("Choose a PIDB");
+    let pidb_options = project
+        .projects
+        .iter()
+        .filter(|entry| entry.index != dialog.source_project_index)
+        .map(|entry| (Some(entry.index), entry.name.clone().into()));
+    let can_apply = dialog.target_project_index.is_some();
+    let mut close = false;
+    let mut apply = false;
+    let mut open = true;
+
+    DragableMenu::new("Move Layer")
+        .open(&mut open)
+        .min_width(280.0)
+        .show(ui.ctx(), |ui| {
+            ui.set_max_width(300.0);
+            ui.label(source_name);
+            MenuFieldCombo::new(
+                "move_layer_target_project",
+                "PIDB",
+                &mut dialog.target_project_index,
+                selected_label,
+                pidb_options,
+            )
+            .width(200.0)
+            .show(ui);
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(can_apply, egui::Button::new("Move"))
+                    .clicked()
+                {
+                    apply = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+
+    if apply {
+        if let Some(target_project_index) = dialog.target_project_index {
+            commands.push(UiCommand::MoveLayerToProject {
+                source_project_index: dialog.source_project_index,
+                layer_id: dialog.layer_id,
+                target_project_index,
+            });
+        }
+        editor.move_layer_dialog = None;
+    } else if close || !open {
+        editor.move_layer_dialog = None;
     }
 }
 

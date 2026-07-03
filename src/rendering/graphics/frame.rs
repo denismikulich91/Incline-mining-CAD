@@ -1,6 +1,9 @@
 use super::*;
 use crate::rendering::scene::{
-    build::{DocumentSceneBuildInput, rebuild_document_scene},
+    build::{
+        DocumentSceneBuildInput, DynamicSceneBuildInput, rebuild_document_scene,
+        rebuild_dynamic_scene,
+    },
     overlays::{OverlaySceneBuildInput, rebuild_editor_overlay},
 };
 
@@ -13,7 +16,6 @@ impl<'a> Graphics<'a> {
         block_models: &[crate::model::block_model::OpenBlockModel],
         project: &UiProjectView,
     ) -> Result<UiFrameOutput, RenderSurfaceError> {
-        let selection_color = editor.selection_color;
         self.vertical_exaggeration = editor.vertical_exaggeration.clamp(0.1, 20.0);
         self.fit_depth_to_scene(
             document,
@@ -66,9 +68,7 @@ impl<'a> Graphics<'a> {
         );
         let needs_geometry_rebuild = self.geometry_dirty
             || self.cached_document_revision != document.revision()
-            || (self.cached_scale_factor - scale_factor).abs() > f32::EPSILON
-            || editor.active_tool == crate::ui::state::ActiveTool::MakeRoad
-            || editor.batter_berm_dialog_open;
+            || (self.cached_scale_factor - scale_factor).abs() > f32::EPSILON;
 
         if needs_geometry_rebuild {
             rebuild_document_scene(DocumentSceneBuildInput {
@@ -84,7 +84,6 @@ impl<'a> Graphics<'a> {
                 text_pick_records: &mut self.text_pick_records,
                 scene_origin: self.scene_origin,
                 scale_factor,
-                selection_color,
             });
 
             self.upload_scene_stream_buffers();
@@ -92,6 +91,54 @@ impl<'a> Graphics<'a> {
             self.cached_scale_factor = scale_factor;
             self.cached_document_revision = document.revision();
             self.geometry_dirty = false;
+        }
+
+        // Per-frame pass for the live drawing tools; the static scene above no
+        // longer rebuilds while they run. Rebuilt while a tool is active and
+        // once more after it deactivates (to clear the buffers).
+        let dynamic_active = editor.active_tool == crate::ui::state::ActiveTool::MakeRoad
+            || editor.batter_berm_dialog_open;
+        if dynamic_active || !self.dynamic_vertex_buf.is_empty() {
+            rebuild_dynamic_scene(DynamicSceneBuildInput {
+                editor,
+                document,
+                dynamic_vertex_buf: &mut self.dynamic_vertex_buf,
+                dynamic_index_buf: &mut self.dynamic_index_buf,
+                scene_origin: self.scene_origin,
+                scale_factor,
+            });
+            if !self.dynamic_vertex_buf.is_empty() {
+                Self::ensure_stream_capacity(
+                    &self.device,
+                    &mut self.dynamic_vertex_gpu,
+                    &mut self.dynamic_vertex_capacity,
+                    self.dynamic_vertex_buf.len(),
+                    std::mem::size_of::<StrokeVertex>(),
+                    wgpu::BufferUsages::VERTEX,
+                    "Dynamic Scene Vertex Buffer",
+                );
+                self.queue.write_buffer(
+                    &self.dynamic_vertex_gpu,
+                    0,
+                    bytemuck::cast_slice(&self.dynamic_vertex_buf),
+                );
+            }
+            if !self.dynamic_index_buf.is_empty() {
+                Self::ensure_stream_capacity(
+                    &self.device,
+                    &mut self.dynamic_index_gpu,
+                    &mut self.dynamic_index_capacity,
+                    self.dynamic_index_buf.len(),
+                    std::mem::size_of::<u32>(),
+                    wgpu::BufferUsages::INDEX,
+                    "Dynamic Scene Index Buffer",
+                );
+                self.queue.write_buffer(
+                    &self.dynamic_index_gpu,
+                    0,
+                    bytemuck::cast_slice(&self.dynamic_index_buf),
+                );
+            }
         }
 
         let measurement_state = (
@@ -120,7 +167,6 @@ impl<'a> Graphics<'a> {
                 screen_size: overlay_screen,
                 scene_origin: self.scene_origin,
                 scale_factor,
-                selection_color,
             });
 
             if !self.overlay_vertex_buf.is_empty() {

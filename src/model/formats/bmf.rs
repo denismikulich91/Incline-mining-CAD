@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, error::Error, fmt, fs, path::Path};
+use std::{collections::BTreeMap, error::Error, fmt, fs, path::Path, sync::Arc};
 
 use glam::{DMat3, DVec3};
 
@@ -17,7 +17,29 @@ pub(crate) struct BmfModel {
     /// time. Computing bearing/dip/plunge trig here once avoids redoing it for
     /// every corner of every block on every bounds query.
     rotation: DMat3,
-    bytes: Vec<u8>,
+    bytes: Arc<BmfBytes>,
+}
+
+enum BmfBytes {
+    _Owned(Vec<u8>),
+    Mapped(memmap2::Mmap),
+}
+
+impl fmt::Debug for BmfBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BmfBytes")
+            .field("len", &self.as_ref().len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AsRef<[u8]> for BmfBytes {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::_Owned(bytes) => bytes,
+            Self::Mapped(map) => map,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -99,14 +121,25 @@ impl From<std::io::Error> for BmfError {
 
 impl BmfModel {
     pub(crate) fn from_path(path: impl AsRef<Path>) -> Result<Self, BmfError> {
-        Self::from_bytes(fs::read(path)?)
+        let file = fs::File::open(path)?;
+        // Mapping avoids eagerly reading multi-GB block models into a Vec.
+        // The parser still sees a normal byte slice, but the OS pages data in
+        // on demand as metadata, bounds, and selected variables are decoded.
+        let map = unsafe { memmap2::Mmap::map(&file)? };
+        Self::from_storage(BmfBytes::Mapped(map))
     }
 
-    pub(crate) fn from_bytes(bytes: Vec<u8>) -> Result<Self, BmfError> {
-        if bytes.len() < FILE_HEADER_LEN || !bytes.starts_with(b"TBMS2.0\0") {
+    pub(crate) fn _from_bytes(bytes: Vec<u8>) -> Result<Self, BmfError> {
+        Self::from_storage(BmfBytes::_Owned(bytes))
+    }
+
+    fn from_storage(bytes: BmfBytes) -> Result<Self, BmfError> {
+        let bytes = Arc::new(bytes);
+        let slice = bytes.as_ref().as_ref();
+        if slice.len() < FILE_HEADER_LEN || !slice.starts_with(b"TBMS2.0\0") {
             return Err(BmfError::Invalid("not a Vulcan TBMS2.0 block model".into()));
         }
-        let root = parse_bmf_metadata_root(&bytes)?;
+        let root = parse_bmf_metadata_root(slice)?;
         let metadata = BmfMetadata::from_node(&root)?;
         let rotation = compute_rotation_matrix(metadata.orientation);
         Ok(Self {
@@ -129,11 +162,23 @@ impl BmfModel {
     }
 
     pub(crate) fn numeric_values(&self, name: &str) -> Result<Vec<f64>, BmfError> {
+        self.numeric_values_range(name, 0, self.metadata.n_blocks)
+    }
+
+    /// Values for blocks `start..end` only, decoding just the value pages
+    /// covering that range. Lets a paged viewer show a slice of a large
+    /// model without decoding (or holding) whole variables.
+    pub(crate) fn numeric_values_range(
+        &self,
+        name: &str,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<f64>, BmfError> {
         let variable = self
             .variable(name)
             .ok_or_else(|| BmfError::Invalid(format!("unknown block variable '{name}'")))?;
         if is_numeric_type(&variable.physical_type) {
-            self.decode_numeric_variable(variable)
+            self.decode_numeric_variable(variable, start, end)
         } else {
             Err(BmfError::Invalid(format!(
                 "variable '{}' is not numeric ({})",
@@ -285,14 +330,22 @@ impl BmfModel {
         self.metadata.orientation.x.abs() < EPSILON && self.metadata.orientation.y.abs() < EPSILON
     }
 
-    fn decode_numeric_variable(&self, variable: &BmfVariable) -> Result<Vec<f64>, BmfError> {
+    fn decode_numeric_variable(
+        &self,
+        variable: &BmfVariable,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<f64>, BmfError> {
+        let end = end.min(self.metadata.n_blocks);
+        let start = start.min(end);
         if variable.location == 0 {
             let value = parse_default_f64(variable);
-            return Ok(vec![value; self.metadata.n_blocks]);
+            return Ok(vec![value; end - start]);
         }
 
         let values_per_page = match variable.physical_type.as_str() {
             "float" => 512,
+            "short" => 1024,
             "int" => 512,
             "longlong" => 256,
             "double" => 256,
@@ -302,9 +355,10 @@ impl BmfModel {
                 )));
             }
         };
-        let required_pages = self.metadata.n_blocks.div_ceil(values_per_page);
-        let page_offsets = self.value_page_offsets(variable.location, required_pages)?;
-        let mut values = Vec::with_capacity(self.metadata.n_blocks);
+        let first_page = start / values_per_page;
+        let last_page = end.div_ceil(values_per_page);
+        let page_offsets = self.value_page_offsets(variable.location, first_page..last_page)?;
+        let mut values = Vec::with_capacity(end - start + values_per_page);
         for offset in page_offsets {
             if offset == 0 {
                 values.extend(std::iter::repeat_n(
@@ -318,6 +372,11 @@ impl BmfModel {
                 "float" => {
                     for chunk in payload.chunks_exact(4) {
                         values.push(f32::from_le_bytes(read_chunk(chunk)?) as f64);
+                    }
+                }
+                "short" => {
+                    for chunk in payload.chunks_exact(2) {
+                        values.push(i16::from_le_bytes(read_chunk(chunk)?) as f64);
                     }
                 }
                 "int" => {
@@ -338,7 +397,11 @@ impl BmfModel {
                 _ => unreachable!(),
             }
         }
-        values.truncate(self.metadata.n_blocks);
+        // `values` starts at block `first_page * values_per_page`; trim to
+        // the requested block range.
+        let skip = start - first_page * values_per_page;
+        values.drain(..skip.min(values.len()));
+        values.truncate(end - start);
         Ok(values)
     }
 
@@ -358,7 +421,7 @@ impl BmfModel {
             }
         };
         let required_pages = self.metadata.n_blocks.div_ceil(values_per_page);
-        let page_offsets = self.value_page_offsets(variable.location, required_pages)?;
+        let page_offsets = self.value_page_offsets(variable.location, 0..required_pages)?;
         let mut values = Vec::with_capacity(self.metadata.n_blocks);
         for offset in page_offsets {
             if offset == 0 {
@@ -402,10 +465,13 @@ impl BmfModel {
             })
     }
 
+    /// Value-page file offsets for the pages in `pages`, in order. Only
+    /// walks the child tables covering the requested range, so a small
+    /// range on a huge model stays cheap.
     fn value_page_offsets(
         &self,
         table_offset: u64,
-        required_pages: usize,
+        pages: std::ops::Range<usize>,
     ) -> Result<Vec<u64>, BmfError> {
         let page = self.page(table_offset)?;
         let kind = &page[..2];
@@ -413,12 +479,13 @@ impl BmfModel {
         match kind {
             [0x01, 0x01] => Ok(read_u64_slots(payload)?
                 .into_iter()
-                .take(required_pages)
+                .take(pages.end)
+                .skip(pages.start)
                 .collect()),
             [0x02, 0x01] => {
                 let child_tables = read_u64_slots(payload)?;
-                let mut offsets = Vec::with_capacity(required_pages);
-                for page_index in 0..required_pages {
+                let mut offsets = Vec::with_capacity(pages.len());
+                for page_index in pages {
                     let child_index = page_index / 256;
                     let child_slot = page_index % 256;
                     let child_offset = child_tables.get(child_index).copied().unwrap_or(0);
@@ -446,7 +513,8 @@ impl BmfModel {
     fn page(&self, offset: u64) -> Result<&[u8], BmfError> {
         let offset = usize::try_from(offset)
             .map_err(|_| BmfError::Invalid("BMF page offset does not fit in memory".into()))?;
-        self.bytes
+        let bytes = self.bytes.as_ref().as_ref();
+        bytes
             .get(offset..offset + PAGE_STRIDE)
             .ok_or_else(|| BmfError::Invalid(format!("BMF page offset {offset} is outside file")))
     }
@@ -568,8 +636,15 @@ impl BmfVariable {
             }
         }
         Some(Self {
-            name: object.string("name").unwrap_or_default(),
-            physical_type: object.string("type").unwrap_or_default(),
+            name: object.string("name").unwrap_or_default().trim().to_owned(),
+            // Vulcan writes some metadata strings space-padded to a fixed
+            // width; normalize so type matching doesn't depend on padding or
+            // case ("float " must read as float).
+            physical_type: object
+                .string("type")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase(),
             description: object.string("description").unwrap_or_default(),
             location: object.u64("location").unwrap_or(0),
             default: object.string("default").unwrap_or_default(),
@@ -636,6 +711,11 @@ struct MetadataCandidate {
     /// built from — i.e. the last page the allocator wrote for this text,
     /// regardless of which order the pages read correctly in.
     max_page_offset: usize,
+    /// Number of pages in this candidate that start a root object. Candidates
+    /// with multiple roots are useful for heuristic parsing, but pointer
+    /// anchoring should prefer an unambiguous single-root candidate when two
+    /// candidates end at the same page.
+    root_starts: usize,
 }
 
 /// Vulcan orients a block model with three angles: bearing, dip, and
@@ -658,9 +738,8 @@ fn compute_rotation_matrix(orientation: DVec3) -> DMat3 {
 }
 
 /// Read the metadata root, preferring the candidate whose last page sits
-/// immediately before the file header's primary table pointer (offset
-/// `0x18`), and falling back to heuristic scoring when that anchor is
-/// unavailable or doesn't match any candidate.
+/// nearest before the file header's primary table pointer (offset `0x18`),
+/// and falling back to heuristic scoring when that anchor is unavailable.
 ///
 /// BMF files observed in this repo can contain multiple, fully-formed
 /// metadata "root" objects left over from earlier incremental saves (e.g. a
@@ -670,18 +749,21 @@ fn compute_rotation_matrix(orientation: DVec3) -> DMat3 {
 /// leave its remaining text scattered behind unrelated data pages with no
 /// link field to follow. What is reliable, verified against every `.bmf`
 /// sample in `test/Vulcan/bmf_bdf/`, is that the primary table pointer at
-/// `0x18` always points to a page table (`01 01`/`02 01`) that sits
-/// immediately after the last `00 02` page of the *live* root's text. Using
-/// that as the tiebreaker is strictly more grounded than picking whichever
+/// `0x18` always points to a page table (`01 01`/`02 01`) that sits after the
+/// last `00 02` page of the *live* root's text. In repo samples it sits
+/// immediately after that page; company files have also been observed with
+/// unrelated pages between the root and the table. Choosing the nearest parsed
+/// root before the pointer is strictly more grounded than picking whichever
 /// candidate happens to mention the most `var_`/`schema_` keys.
 fn parse_bmf_metadata_root(bytes: &[u8]) -> Result<MetaNode, BmfError> {
     let candidates = extract_metadata_candidates(bytes)?;
     let pointer = header_primary_table_pointer(bytes);
 
-    let mut anchored = None;
+    let mut pointer_anchor = None;
     let mut last_error = None;
     let mut best_root = None;
     let mut best_score = 0usize;
+    let mut parsed_page_ends: Vec<usize> = Vec::new();
     for candidate in &candidates {
         let parsed = match parse_metadata_root(&candidate.text) {
             Ok(parsed) => parsed,
@@ -690,10 +772,23 @@ fn parse_bmf_metadata_root(bytes: &[u8]) -> Result<MetaNode, BmfError> {
                 continue;
             }
         };
-        if anchored.is_none()
-            && pointer.is_some_and(|pointer| candidate.max_page_offset + PAGE_STRIDE == pointer)
+        parsed_page_ends.push(candidate.max_page_offset);
+        if let Some(pointer) = pointer
+            && candidate.max_page_offset < pointer
         {
-            anchored = Some(parsed.clone());
+            let gap = pointer - candidate.max_page_offset;
+            if gap % PAGE_STRIDE == 0 {
+                let replace_anchor = match pointer_anchor.as_ref() {
+                    Some((best_gap, best_root_starts, _)) => {
+                        gap < *best_gap
+                            || (gap == *best_gap && candidate.root_starts < *best_root_starts)
+                    }
+                    None => true,
+                };
+                if replace_anchor {
+                    pointer_anchor = Some((gap, candidate.root_starts, parsed.clone()));
+                }
+            }
         }
         let score = metadata_root_score(&parsed);
         if score > best_score || best_root.is_none() {
@@ -702,14 +797,22 @@ fn parse_bmf_metadata_root(bytes: &[u8]) -> Result<MetaNode, BmfError> {
         }
     }
 
-    if let Some(root) = anchored {
+    if let Some((_, _, root)) = pointer_anchor {
         return Ok(root);
     }
-    if pointer.is_some() {
+    if let Some(pointer) = pointer {
+        parsed_page_ends.sort_unstable();
+        parsed_page_ends.dedup();
+        let ends = parsed_page_ends
+            .iter()
+            .map(|offset| format!("0x{offset:x}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         userspace_warn!(
-            "BMF metadata root was not found where the file header's table pointer expected it; \
-             falling back to heuristic candidate scoring, which may pick the wrong root in an \
-             atypical or malformed file"
+            "BMF metadata root was not found where the file header's table pointer expected it \
+             (pointer 0x{pointer:x}; parsed candidate roots end at [{ends}]); falling back to \
+             heuristic candidate scoring, which may pick the wrong root in an atypical or \
+             malformed file. If block values look wrong, please report these offsets."
         );
     }
     best_root.ok_or_else(|| {
@@ -827,6 +930,7 @@ fn push_threaded_metadata_candidates(
         candidates.push(MetadataCandidate {
             text: text.clone(),
             max_page_offset,
+            root_starts: 1,
         });
         for continuation in pages.iter().skip(index + 1) {
             if continuation.starts_root {
@@ -837,6 +941,7 @@ fn push_threaded_metadata_candidates(
             candidates.push(MetadataCandidate {
                 text: text.clone(),
                 max_page_offset,
+                root_starts: 1,
             });
         }
     }
@@ -858,6 +963,7 @@ fn push_metadata_run_candidates(run: &[&MetadataPage], candidates: &mut Vec<Meta
     // forward scan), so the maximum offset is the same for both the forward
     // and reverse text arrangement below.
     let max_page_offset = run.last().map_or(0, |page| page.offset);
+    let root_starts = run.iter().filter(|page| page.starts_root).count().max(1);
     let forward = run
         .iter()
         .map(|page| page.text.as_str())
@@ -866,6 +972,7 @@ fn push_metadata_run_candidates(run: &[&MetadataPage], candidates: &mut Vec<Meta
         candidates.push(MetadataCandidate {
             text: forward,
             max_page_offset,
+            root_starts,
         });
     }
     if run.len() > 1 {
@@ -878,6 +985,7 @@ fn push_metadata_run_candidates(run: &[&MetadataPage], candidates: &mut Vec<Meta
             candidates.push(MetadataCandidate {
                 text: reverse,
                 max_page_offset,
+                root_starts,
             });
         }
     }
@@ -927,7 +1035,10 @@ fn parse_default_code(variable: &BmfVariable) -> u32 {
 }
 
 fn is_numeric_type(physical_type: &str) -> bool {
-    matches!(physical_type, "float" | "int" | "longlong" | "double")
+    matches!(
+        physical_type,
+        "float" | "short" | "int" | "longlong" | "double"
+    )
 }
 
 fn is_empty_block_label(label: &str) -> bool {
@@ -1246,7 +1357,7 @@ mod tests {
             metadata_page(continuation),
         ]);
 
-        let model = BmfModel::from_bytes(bytes).unwrap();
+        let model = BmfModel::_from_bytes(bytes).unwrap();
 
         assert_eq!(model.metadata.n_blocks, 6);
         assert_eq!(model.metadata.dims, [2, 3, 1]);
@@ -1286,11 +1397,98 @@ mod tests {
             leaf_table_page_with_entries(&[data_page_offset as u64]),
         ]);
 
-        let model = BmfModel::from_bytes(bytes).unwrap();
+        let model = BmfModel::_from_bytes(bytes).unwrap();
         assert!(model.unsupported_variables().is_empty());
         assert_eq!(
             model.numeric_values("value0").unwrap(),
             vec![1.5, -2.25, 3.75]
+        );
+        assert_eq!(
+            model.numeric_values_range("value0", 1, 3).unwrap(),
+            vec![-2.25, 3.75]
+        );
+        assert_eq!(
+            model.numeric_values_range("value0", 2, 100).unwrap(),
+            vec![3.75]
+        );
+    }
+
+    #[test]
+    fn decodes_double_variable_range_across_pages() {
+        let root = r#"{
+ "dim_x" = 258,
+ "dim_y" = 1,
+ "dim_z" = 1,
+ "var_0" =
+  {
+   "default" = "-99",
+   "description" = "average value0",
+   "global" = "-99",
+   "location" = 8224,
+   "name" = "value0",
+   "type" = "double"
+  }
+}"#;
+        let page_offset =
+            |index: usize| (FILE_HEADER_LEN + PAGE_HEADER_LEN + index * PAGE_STRIDE) as u64;
+        assert_eq!(page_offset(3), 8224);
+        let first: Vec<f64> = (0..256).map(f64::from).collect();
+        let bytes = bmf_bytes_with_pages(vec![
+            metadata_page(root),
+            double_data_page(&first),
+            double_data_page(&[1000.0, 1001.0]),
+            leaf_table_page_with_entries(&[page_offset(1), page_offset(2)]),
+        ]);
+
+        let model = BmfModel::_from_bytes(bytes).unwrap();
+        // Starts mid-page and crosses a page boundary; only pages 1..2 are
+        // decoded, so the leading skip is relative to the first decoded page.
+        assert_eq!(
+            model.numeric_values_range("value0", 255, 258).unwrap(),
+            vec![255.0, 1000.0, 1001.0]
+        );
+        assert_eq!(
+            model.numeric_values_range("value0", 257, 258).unwrap(),
+            vec![1001.0]
+        );
+    }
+
+    #[test]
+    fn decodes_short_variable() {
+        let root = r#"{
+ "dim_x" = 4,
+ "dim_y" = 1,
+ "dim_z" = 1,
+ "var_0" =
+  {
+   "default" = "-1",
+   "description" = "short code",
+   "global" = "-1",
+   "location" = 6168,
+   "name" = "code",
+   "type" = "short"
+  }
+}"#;
+        let data_page_offset = FILE_HEADER_LEN + PAGE_HEADER_LEN + PAGE_STRIDE;
+        let table_offset = FILE_HEADER_LEN + PAGE_HEADER_LEN + 2 * PAGE_STRIDE;
+        assert_eq!(table_offset, 6168);
+        let mut short_page = vec![0u8; PAGE_STRIDE];
+        short_page[..2].copy_from_slice(&[0x00, 0x0a]);
+        for (index, value) in [-2i16, 0, 17, 2048].iter().enumerate() {
+            let start = PAGE_HEADER_LEN + index * 2;
+            short_page[start..start + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        let bytes = bmf_bytes_with_pages(vec![
+            metadata_page(root),
+            short_page,
+            leaf_table_page_with_entries(&[data_page_offset as u64]),
+        ]);
+
+        let model = BmfModel::_from_bytes(bytes).unwrap();
+        assert!(model.unsupported_variables().is_empty());
+        assert_eq!(
+            model.numeric_values("code").unwrap(),
+            vec![-2.0, 0.0, 17.0, 2048.0]
         );
     }
 
@@ -1312,7 +1510,7 @@ mod tests {
 }"#;
         let bytes = bmf_bytes_with_pages(vec![metadata_page(root)]);
 
-        let model = BmfModel::from_bytes(bytes).unwrap();
+        let model = BmfModel::_from_bytes(bytes).unwrap();
         let unsupported = model.unsupported_variables();
         assert_eq!(unsupported.len(), 1);
         assert_eq!(unsupported[0].name, "mystery");
@@ -1352,12 +1550,54 @@ mod tests {
         let table_offset = FILE_HEADER_LEN + PAGE_HEADER_LEN + 2 * PAGE_STRIDE;
         bytes[0x18..0x20].copy_from_slice(&(table_offset as u64).to_le_bytes());
 
-        let model = BmfModel::from_bytes(bytes).unwrap();
+        let model = BmfModel::_from_bytes(bytes).unwrap();
 
         assert_eq!(model.metadata.n_blocks, 4);
         assert_eq!(model.metadata.dims, [4, 1, 1]);
         assert_eq!(model.metadata.variables.len(), 1);
         assert_eq!(model.metadata.variables[0].name, "grade");
+    }
+
+    #[test]
+    fn picks_nearest_root_before_header_pointer_when_table_is_not_adjacent() {
+        // Company files have been observed with unrelated pages between the
+        // live metadata root and the header's primary table pointer. The stale
+        // root has a higher heuristic score, so proximity to the pointer must
+        // be the deciding signal.
+        let stale_root = r#"{
+ "dim_x" = 1,
+ "dim_y" = 1,
+ "dim_z" = 1,
+ "var_0" =
+  {
+   "default" = "-99",
+   "description" = "stale grade",
+   "global" = "-99",
+   "location" = 0,
+   "name" = "stale_grade",
+   "type" = "float"
+  }
+}"#;
+        let live_root = r#"{
+ "dim_x" = 4,
+ "dim_y" = 1,
+ "dim_z" = 1
+}"#;
+        let mut bytes = bmf_bytes_with_pages(vec![
+            metadata_page(stale_root),
+            metadata_page(live_root),
+            data_page(),
+            data_page(),
+            leaf_table_page(),
+        ]);
+        let table_offset = FILE_HEADER_LEN + PAGE_HEADER_LEN + 4 * PAGE_STRIDE;
+        bytes[0x18..0x20].copy_from_slice(&(table_offset as u64).to_le_bytes());
+
+        let model = BmfModel::_from_bytes(bytes).unwrap();
+
+        assert_eq!(model.metadata.n_blocks, 4);
+        assert_eq!(model.metadata.dims, [4, 1, 1]);
+        assert!(model.metadata.variables.is_empty());
     }
 
     #[test]
@@ -1376,7 +1616,7 @@ mod tests {
 }"#;
         let bytes = bmf_bytes_with_pages(vec![metadata_page(root)]);
 
-        let model = BmfModel::from_bytes(bytes).unwrap();
+        let model = BmfModel::_from_bytes(bytes).unwrap();
         assert!(model.metadata.is_irregular);
 
         let error = model.block_bounds().unwrap_err().to_string();

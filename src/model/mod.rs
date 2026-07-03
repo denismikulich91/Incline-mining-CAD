@@ -3,7 +3,9 @@
 pub(crate) mod block_model;
 pub(crate) mod formats;
 pub(crate) mod geometry;
+pub(crate) mod kernel;
 pub(crate) mod pidb;
+pub(crate) mod road_network;
 pub(crate) mod spatial;
 pub(crate) mod triangulation;
 
@@ -187,6 +189,20 @@ impl Object {
             } => {
                 for vertex in verts {
                     vertex.pos += delta;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn set_z_position(&mut self, z: f64) {
+        match self {
+            Object::Point { pos, .. } | Object::Text { pos, .. } => pos.z = z,
+            Object::Polyline { verts, .. }
+            | Object::Road {
+                centerline: verts, ..
+            } => {
+                for vertex in verts {
+                    vertex.pos.z = z;
                 }
             }
         }

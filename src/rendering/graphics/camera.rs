@@ -688,7 +688,10 @@ impl<'a> Graphics<'a> {
             WindowEvent::MouseInput { button, state, .. } => {
                 let pressing = *state == ElementState::Pressed;
                 if pressing {
-                    if self.mouse_pressed.is_none() || *button == MouseButton::Right {
+                    if *button == MouseButton::Right && !self.fly_mode_enabled {
+                        // The app promotes a right press to orbit only after it
+                        // moves past the context-click threshold.
+                    } else if self.mouse_pressed.is_none() || *button == MouseButton::Right {
                         self.mouse_pressed = Some(*button);
                     }
                     if self.fly_mode_enabled && *button == MouseButton::Right {

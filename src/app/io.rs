@@ -9,10 +9,6 @@ pub(crate) fn default_renderer_background_color() -> [f32; 4] {
     crate::rendering::color::hex_to_linear_rgba(0x232c36)
 }
 
-pub(crate) fn default_selection_color() -> [f32; 4] {
-    [87.0 / 255.0, 163.0 / 255.0, 1.0, 1.0]
-}
-
 pub(crate) const fn default_snap_poll_rate() -> u32 {
     30
 }
@@ -23,10 +19,6 @@ pub(crate) const fn default_frame_rate_cap() -> u32 {
 
 pub(crate) const fn default_resize_frame_rate_cap() -> u32 {
     80
-}
-
-pub(crate) const fn default_topology_folder_search_depth() -> u32 {
-    0
 }
 
 pub(crate) const fn default_show_world_axis_gizmo() -> bool {
@@ -73,9 +65,6 @@ pub(crate) struct Config {
     /// Linear RGBA clear colour used behind the rendered scene.
     #[serde(default = "default_renderer_background_color")]
     pub(crate) renderer_background_color: [f32; 4],
-    /// RGBA colour used for UI accents and selected renderer geometry.
-    #[serde(default = "default_selection_color")]
-    pub(crate) selection_color: [f32; 4],
     #[serde(default = "default_snap_poll_rate")]
     pub(crate) snap_poll_rate: u32,
     #[serde(default = "default_frame_rate_cap")]
@@ -84,8 +73,6 @@ pub(crate) struct Config {
     pub(crate) resize_frame_rate_cap: u32,
     #[serde(default)]
     pub(crate) frame_counter_enabled: bool,
-    #[serde(default = "default_topology_folder_search_depth")]
-    pub(crate) topology_folder_search_depth: u32,
     #[serde(default = "default_show_world_axis_gizmo")]
     pub(crate) show_world_axis_gizmo: bool,
     #[serde(default = "default_show_view_cube")]
@@ -99,12 +86,10 @@ impl Default for Config {
             dark_mode: false,
             show_console: false,
             renderer_background_color: default_renderer_background_color(),
-            selection_color: default_selection_color(),
             snap_poll_rate: default_snap_poll_rate(),
             frame_rate_cap: default_frame_rate_cap(),
             resize_frame_rate_cap: default_resize_frame_rate_cap(),
             frame_counter_enabled: false,
-            topology_folder_search_depth: default_topology_folder_search_depth(),
             show_world_axis_gizmo: default_show_world_axis_gizmo(),
             show_view_cube: default_show_view_cube(),
         }

@@ -113,6 +113,9 @@ fn vs_main(model: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    if (in.grade < -1.5) {
+        discard;
+    }
     var normal = normalize(cross(dpdx(in.local_position), dpdy(in.local_position)));
     if (dot(normal, camera.cam_forward.xyz) > 0.0) {
         normal = -normal;

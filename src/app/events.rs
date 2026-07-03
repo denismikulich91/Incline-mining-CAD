@@ -11,6 +11,8 @@ use crate::{
     userspace_log,
 };
 
+const RIGHT_CLICK_DRAG_THRESHOLD_PX: f32 = 3.0;
+
 impl<'a> App<'a> {
     pub(crate) fn handle_window_event(
         &mut self,
@@ -68,11 +70,6 @@ impl<'a> App<'a> {
             self.handle_right_release(&event);
             self.handle_control_shortcuts(&event);
         }
-
-        // Set the orbit anchor with proper surface picking before the graphics
-        // input handler runs (orbit-begin was removed from graphics.input so that
-        // triangulations are available here).
-        self.handle_orbit_anchor(&event, gui_consumed);
 
         let graphics_consumed = self.graphics.as_mut().is_some_and(|graphics| {
             if gui_consumed && !graphics.should_receive_fly_event(&event) {
@@ -259,9 +256,9 @@ impl<'a> App<'a> {
                     {
                         self.redraw_requested = true;
                     }
+                    self.maybe_start_right_orbit_drag();
                     let z = self.editor.z_level;
                     let raw = self.graphics.as_ref().and_then(|g| g.cursor_world(z));
-                    let document = &self.scene_document;
                     let is_drawing_tool = matches!(
                         self.editor.active_tool,
                         ActiveTool::MakePoint
@@ -291,6 +288,8 @@ impl<'a> App<'a> {
                     });
                     let snapped = if snap_eligible && snap_poll_due {
                         self.last_snap_poll_instant = Some(now);
+                        self.refresh_snap_index();
+                        let document = &self.scene_document;
                         self.graphics.as_ref().and_then(|g| {
                             g.snap_cursor(
                                 document,
@@ -608,12 +607,14 @@ impl<'a> App<'a> {
         } = event
         {
             self.right_press_px = self.editor.cursor_screen_px;
+            self.right_orbit_active = false;
         }
     }
 
     fn handle_right_release(&mut self, event: &WindowEvent) {
         if self.editor.fly_mode_enabled {
             self.right_press_px = None;
+            self.right_orbit_active = false;
             return;
         }
         if let WindowEvent::MouseInput {
@@ -622,14 +623,16 @@ impl<'a> App<'a> {
             ..
         } = event
         {
+            let orbit_was_active = self.right_orbit_active;
+            self.right_orbit_active = false;
             let is_quick_press = match (self.right_press_px.take(), self.editor.cursor_screen_px) {
                 (Some(press), Some(cur)) => {
                     let dx = cur.0 - press.0;
                     let dy = cur.1 - press.1;
-                    (dx * dx + dy * dy).sqrt() < 3.0
+                    (dx * dx + dy * dy).sqrt() < RIGHT_CLICK_DRAG_THRESHOLD_PX
                 }
                 _ => false,
-            };
+            } && !orbit_was_active;
             if is_quick_press && self.editor.active_tool == ActiveTool::MakeRoad {
                 self.commit_road();
                 self.redraw_requested = true;
@@ -665,10 +668,20 @@ impl<'a> App<'a> {
                     )
                 });
                 if let Some((handle, world)) = picked {
-                    if let crate::model::SceneEntityId::Object(id) = handle
-                        && self.active_layer_object(id).is_none()
-                    {
-                        return;
+                    if let crate::model::SceneEntityId::Object(id) = handle {
+                        let Some(index) = self.workspace.project_index_for_object(id) else {
+                            return;
+                        };
+                        if self.workspace.active_index != Some(index) {
+                            self.history.clear();
+                            self.editor.selected_handles.clear();
+                        }
+                        self.workspace.set_active_index(index);
+                        self.editor.active_layer = self
+                            .workspace
+                            .active_document()
+                            .and_then(|document| document.get_object(id))
+                            .map(crate::model::Object::layer);
                     }
                     if !self.editor.selected_handles.contains(&handle) {
                         self.editor.on_canvas_pick(
@@ -723,26 +736,33 @@ impl<'a> App<'a> {
         }
     }
 
-    fn handle_orbit_anchor(&mut self, event: &WindowEvent, gui_consumed: bool) {
-        if self.editor.fly_mode_enabled {
+    fn maybe_start_right_orbit_drag(&mut self) {
+        if self.editor.fly_mode_enabled || self.right_orbit_active {
             return;
         }
-        if !gui_consumed
-            && let WindowEvent::MouseInput {
-                button: MouseButton::Right,
-                state: ElementState::Pressed,
-                ..
-            } = event
-            && let Some(graphics) = self.graphics.as_mut()
-        {
-            graphics.begin_orbit_at_surface(
-                &self.triangulations,
-                &self.editor.hidden_handles,
-                &self.editor.frozen_handles,
-                &self.scene_document,
-                &self.snap_index,
-            );
+        let (Some(press), Some(cur)) = (self.right_press_px, self.editor.cursor_screen_px) else {
+            return;
+        };
+        let dx = cur.0 - press.0;
+        let dy = cur.1 - press.1;
+        if (dx * dx + dy * dy).sqrt() < RIGHT_CLICK_DRAG_THRESHOLD_PX {
+            return;
         }
+
+        self.refresh_snap_index();
+        let Some(graphics) = self.graphics.as_mut() else {
+            return;
+        };
+        graphics.begin_orbit_at_surface(
+            &self.triangulations,
+            &self.editor.hidden_handles,
+            &self.editor.frozen_handles,
+            &self.scene_document,
+            &self.snap_index,
+        );
+        graphics.begin_right_orbit_drag();
+        self.right_orbit_active = true;
+        self.redraw_requested = true;
     }
 
     fn handle_key_action(&mut self, event: &WindowEvent) {

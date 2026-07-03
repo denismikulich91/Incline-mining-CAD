@@ -73,23 +73,15 @@ impl<'a> Graphics<'a> {
                 crate::rendering::pick::world_to_screen(&vp, p, screen)
                     .map(|sp| (sp.x as f32, sp.y as f32))
             };
-            let mut center_preview: Vec<DVec3> = editor.pending_stroke.clone();
-            if let Some(cursor) = editor.cursor_world {
-                center_preview.push(cursor);
-            }
-            if crate::model::geometry::validate_road_segment_angles(
-                &center_preview,
-                editor.road_max_angle_degrees,
-            )
-            .is_ok()
-                && let Ok(valid_center_preview) =
-                    crate::model::geometry::road_centerline_with_intersection_flats(
-                        &center_preview,
-                        document,
-                        editor.road_width,
-                    )
-            {
-                center_preview = valid_center_preview;
+            // Prefer the resolved ghost centerline (kept fresh by
+            // update_road_preview); fall back to the raw stroke when the
+            // current cursor position is invalid.
+            let mut center_preview: Vec<DVec3> = editor.road_preview_center_world.clone();
+            if center_preview.is_empty() {
+                center_preview = editor.pending_stroke.clone();
+                if let Some(cursor) = editor.cursor_world {
+                    center_preview.push(cursor);
+                }
             }
             editor.road_preview_center_screen_px =
                 center_preview.iter().map(|&p| project(p)).collect();

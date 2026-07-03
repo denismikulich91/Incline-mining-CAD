@@ -210,6 +210,12 @@ The embedded metadata can differ from the `.bdf`. In `bm50x50.bdf`,
 `flag` and `zone`. For decoding the `.bmf` payload, prefer the embedded `.bmf`
 metadata.
 
+Large or incrementally saved `.bmf` files can contain multiple complete metadata
+roots from earlier saves. Incline chooses the parsed root whose last `00 02`
+metadata page is nearest before the primary table pointer at file offset
+`0x18`. In repo samples this root is immediately before the table; company files
+have also been observed with unrelated pages between the live root and table.
+
 ### Variable Records
 
 Observed variable metadata fields:
@@ -217,7 +223,7 @@ Observed variable metadata fields:
 | Field | Meaning |
 | --- | --- |
 | `name` | Variable name. |
-| `type` | Physical storage type: `float`, `double`, `int`, `namedbyte`, `namedshort`, or `longlong` in the observed files. |
+| `type` | Physical storage type: `float`, `double`, `short`, `int`, `namedbyte`, `namedshort`, or `longlong` in the observed files. |
 | `location` | Offset of the page table for per-block values. A value of `0` means there is no stored array. |
 | `default` | Default value as text. |
 | `global` | Global value used when `location=0`. |
@@ -272,6 +278,7 @@ Observed capacities per data page:
 | `float` | `00 04` | 512 | `f32le` |
 | `longlong` | `00 05` | 256 | `u64le` |
 | `int` | `00 06` | 512 | `i32le` |
+| `short` | `00 0a` | 1024 | `i16le` |
 | `namedbyte` | `00 09` | 2048 | `u8` dictionary code |
 | `namedshort` | `00 0a` | 1024 | `u16le` dictionary code |
 

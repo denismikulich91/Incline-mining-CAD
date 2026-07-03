@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{cell::RefCell, path::PathBuf, sync::Arc};
 
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
@@ -91,11 +91,36 @@ pub(crate) struct OpenBlockModel {
     pub(crate) color: [f32; 4],
     pub(crate) active_numeric_variable: Option<String>,
     pub(crate) color_transfer: ColorTransferFunction,
+    pub(crate) hide_empty_color_values: bool,
+    /// Lazily decoded values for [`Self::active_numeric_variable`], shared
+    /// by the renderer's grade colouring and the UI's colour-scale legend so
+    /// switching colour state doesn't re-decode the whole variable in each.
+    /// Holds `(variable name, decode result)`; a failed decode is cached too
+    /// so a broken variable isn't re-decoded every frame.
+    pub(crate) active_values_cache: ActiveValuesCache,
 }
+
+pub(crate) type ActiveValuesCache = RefCell<Option<(String, Option<Arc<Vec<f64>>>)>>;
 
 impl OpenBlockModel {
     pub(crate) fn entity_id(&self) -> crate::model::SceneEntityId {
         crate::model::SceneEntityId::BlockModel(self.id)
+    }
+
+    /// Decoded values for the active colour variable, decoding at most once
+    /// per variable switch. `None` when there is no active variable or it
+    /// can't be decoded.
+    pub(crate) fn active_numeric_values(&self) -> Option<Arc<Vec<f64>>> {
+        let name = self.active_numeric_variable.as_deref()?;
+        let mut cache = self.active_values_cache.borrow_mut();
+        if let Some((cached_name, values)) = cache.as_ref()
+            && cached_name == name
+        {
+            return values.clone();
+        }
+        let values = self.model.numeric_values(name).ok().map(Arc::new);
+        *cache = Some((name.to_owned(), values.clone()));
+        values
     }
 
     pub(crate) fn world_bounds(&self) -> Option<(DVec3, DVec3)> {
