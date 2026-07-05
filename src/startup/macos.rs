@@ -5,7 +5,7 @@ use objc2::{AnyThread, MainThreadMarker};
 use objc2_app_kit::{NSApplication, NSImage};
 use objc2_foundation::NSData;
 
-pub(super) fn set_dock_icon() -> Result<()> {
+pub(crate) fn set_dock_icon() -> Result<()> {
     let mtm = MainThreadMarker::new().context("Dock icon must be set on the main thread")?;
     // Dock icons are visually smaller than their full image canvas. Give the
     // existing edge-to-edge logo a transparent macOS-style safe area without

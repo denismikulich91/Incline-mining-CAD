@@ -1,7 +1,5 @@
 //! Left-side explorer panel: design databases (.pidb) and triangulations.
 
-use std::path::PathBuf;
-
 use crate::ui::{
     EditorState, UiCommand, UiProjectView,
     fonts::bold,
@@ -318,26 +316,25 @@ pub(crate) fn draw_explorer(
                             }
                         };
 
-                    // Individually-opened files (no group) — shown flat, removable.
-                    let individual: Vec<_> = project
-                        .triangulations
-                        .iter()
-                        .filter(|t| t.group.is_none())
-                        .collect();
-                    for tri in &individual {
-                        render_tri_entry(ui, commands, tri, true);
-                    }
+                    let mut tri_index = 0;
+                    while tri_index < project.triangulations.len() {
+                        let tri = &project.triangulations[tri_index];
+                        let Some(dir) = tri.group.as_ref() else {
+                            render_tri_entry(ui, commands, tri, true);
+                            tri_index += 1;
+                            continue;
+                        };
 
-                    // Folder groups — each dir gets a collapsible sub-header.
-                    let mut seen_dirs: Vec<PathBuf> = Vec::new();
-                    for tri in &project.triangulations {
-                        if let Some(ref dir) = tri.group
-                            && !seen_dirs.contains(dir)
+                        let dir = dir.clone();
+                        let folder_start = tri_index;
+                        tri_index += 1;
+                        while tri_index < project.triangulations.len()
+                            && project.triangulations[tri_index].group.as_deref()
+                                == Some(dir.as_path())
                         {
-                            seen_dirs.push(dir.clone());
+                            tri_index += 1;
                         }
-                    }
-                    for dir in seen_dirs {
+                        let folder_tris = &project.triangulations[folder_start..tri_index];
                         let dir_name = dir
                             .file_name()
                             .and_then(|n| n.to_str())
@@ -345,11 +342,6 @@ pub(crate) fn draw_explorer(
                             .to_owned();
                         let dir_for_menu = dir.clone();
                         let collapse_id = ui.make_persistent_id(("tri_folder", &dir));
-                        let folder_tris: Vec<_> = project
-                            .triangulations
-                            .iter()
-                            .filter(|t| t.group.as_deref() == Some(dir.as_path()))
-                            .collect();
                         let any_loaded = folder_tris.iter().any(|t| t.is_loaded);
                         let any_unloaded = folder_tris.iter().any(|t| !t.is_loaded);
                         let img = if any_loaded {

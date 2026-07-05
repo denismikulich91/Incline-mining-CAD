@@ -2,8 +2,10 @@
 
 use crate::ui::{
     state::{EditorState, FileOperationKind, UiCommand, UiProjectView},
-    widgets::menu::{DragableMenu, MenuField, MenuFieldCombo, MenuFieldText},
-    widgets::viewport::ViewportDockPanel,
+    widgets::{
+        menu::{DragableMenu, MenuField, MenuFieldCombo, MenuFieldF64},
+        viewport::ViewportDockPanel,
+    },
 };
 
 /// Draw the file import/export dialog.
@@ -268,22 +270,16 @@ pub(crate) fn draw_vertical_exaggeration_dialog(
     .show(ui.ctx(), |ui| {
         ui.label("Scales Z distances visually without changing stored coordinates.");
         ui.add_space(8.0);
-        let response = MenuFieldText::new("Z scale ratio", &mut editor.vertical_exaggeration_input)
-            .width(100.0)
-            .hint_text("1.0 ×")
-            .show(ui);
-        let parsed = editor
-            .vertical_exaggeration_input
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .filter(|ratio| ratio.is_finite() && (0.1..=20.0).contains(ratio));
-        if parsed.is_none() {
-            ui.colored_label(
-                egui::Color32::from_rgb(200, 70, 70),
-                "Enter a ratio from 0.1 to 20.",
-            );
-        }
+        let response = MenuFieldF64::new(
+            "Z scale ratio",
+            &mut editor.vertical_exaggeration_input,
+            0.1..=20.,
+        )
+        .max_decimals(1)
+        .width(100.)
+        .speed(0.1)
+        .suffix("x")
+        .show(ui);
         ui.add_space(10.0);
         let apply_from_enter =
             response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
@@ -294,16 +290,12 @@ pub(crate) fn draw_vertical_exaggeration_dialog(
             }
             if ui.button("Reset to 1×").clicked() {
                 editor.vertical_exaggeration = 1.0;
-                editor.vertical_exaggeration_input = "1.0".to_string();
+                editor.vertical_exaggeration_input = 1.0;
                 editor.vertical_exaggeration_dialog_open = false;
             }
-            let apply_clicked = ui
-                .add_enabled(parsed.is_some(), egui::Button::new("Apply"))
-                .clicked();
-            if (apply_from_enter || apply_clicked)
-                && let Some(ratio) = parsed
-            {
-                editor.vertical_exaggeration = ratio;
+            let apply_clicked = ui.add(egui::Button::new("Apply")).clicked();
+            if apply_from_enter || apply_clicked {
+                editor.vertical_exaggeration = editor.vertical_exaggeration_input;
                 editor.vertical_exaggeration_dialog_open = false;
             }
         });

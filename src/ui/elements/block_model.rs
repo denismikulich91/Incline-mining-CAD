@@ -1,30 +1,13 @@
 use crate::{
-    model::block_model::{
-        BlockModelId, OpenBlockModel, numeric_variable_default, render_value_range,
-    },
+    model::block_model::{BlockModelId, OpenBlockModel},
     ui::{
         EditorState, UiCommand,
         state::OreFilterMode,
-        widgets::menu::{DragableMenu, MenuFieldCombo, MenuFieldText},
+        widgets::menu::{DragableMenu, MenuFieldCombo, MenuFieldF64, MenuFieldText},
     },
 };
 
 const TABLE_PAGE_SIZE: usize = 100;
-
-/// The active colour variable's name and render range for `model`, sharing
-/// the model's own decoded-values cache with the renderer. `None` when
-/// there's no active variable or no usable range (e.g. every block has the
-/// sentinel/default value).
-pub(crate) fn active_color_scale(model: &OpenBlockModel) -> Option<(String, f64, f64)> {
-    let name = model.active_numeric_variable.clone()?;
-    let default = model
-        .model
-        .variable(&name)
-        .and_then(numeric_variable_default);
-    let values = model.active_numeric_values()?;
-    let (min, max) = render_value_range(&values, &model.renderable_block_indices, default)?;
-    Some((name, min, max))
-}
 
 pub(crate) fn draw_block_model_table(
     ui: &mut egui::Ui,
@@ -322,11 +305,15 @@ pub(crate) fn draw_ore_triangulation_dialog(
             .width(160.0)
             .show(ui);
 
-            MenuFieldText::new("Threshold / min", &mut editor.ore_min_input)
-                .width(120.0)
-                .show(ui);
+            MenuFieldF64::new(
+                "Threshold / min",
+                &mut editor.ore_min_input,
+                f64::MIN..=f64::MAX,
+            )
+            .width(120.0)
+            .show(ui);
             if editor.ore_filter_mode == OreFilterMode::Between {
-                MenuFieldText::new("Max", &mut editor.ore_max_input)
+                MenuFieldF64::new("Max", &mut editor.ore_max_input, f64::MIN..=f64::MAX)
                     .width(120.0)
                     .show(ui);
             }
@@ -334,13 +321,13 @@ pub(crate) fn draw_ore_triangulation_dialog(
                 .width(220.0)
                 .show(ui);
 
-            let min = editor.ore_min_input.trim().parse::<f64>().ok();
-            let max = editor.ore_max_input.trim().parse::<f64>().ok();
+            let min = editor.ore_min_input;
+            let max = editor.ore_max_input;
             let ready = editor.ore_block_model_id.is_some()
                 && !editor.ore_variable.is_empty()
                 && !editor.ore_name_input.trim().is_empty()
-                && min.is_some()
-                && (editor.ore_filter_mode != OreFilterMode::Between || max.is_some());
+                && min.is_finite()
+                && (editor.ore_filter_mode != OreFilterMode::Between || max.is_finite());
             ui.horizontal(|ui| {
                 if ui.button("Cancel").clicked() {
                     editor.ore_triangulation_open = false;
@@ -350,8 +337,12 @@ pub(crate) fn draw_ore_triangulation_dialog(
                         block_model_id: editor.ore_block_model_id.unwrap(),
                         variable: editor.ore_variable.clone(),
                         mode: editor.ore_filter_mode,
-                        min: min.unwrap(),
-                        max: max.unwrap_or(min.unwrap()),
+                        min,
+                        max: if editor.ore_filter_mode == OreFilterMode::Between {
+                            max
+                        } else {
+                            min
+                        },
                         name: editor.ore_name_input.trim().to_owned(),
                     });
                 }

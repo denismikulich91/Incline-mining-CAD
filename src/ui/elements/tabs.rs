@@ -266,7 +266,7 @@ fn tab_entry(ui: &mut egui::Ui, tab: &Tab, rect: egui::Rect, selected: bool) -> 
             egui::Align2::CENTER_CENTER.align_size_within_rect(egui::vec2(12.0, 12.0), close_rect);
         ui.put(
             icon_rect,
-            egui::Image::new(unthemed_icon!("exit.svg")).fit_to_exact_size(icon_rect.size()),
+            egui::Image::new(themed_icon!(ui, "exit.svg")).fit_to_exact_size(icon_rect.size()),
         );
         close_response.clicked()
     } else {

@@ -263,19 +263,39 @@ impl BmfModel {
             return self.regular_block_bounds();
         }
 
-        let lower_x = self.numeric_values("__lower_x")?;
-        let lower_y = self.numeric_values("__lower_y")?;
-        let lower_z = self.numeric_values("__lower_z")?;
-        let upper_x = self.numeric_values("__upper_x")?;
-        let upper_y = self.numeric_values("__upper_y")?;
-        let upper_z = self.numeric_values("__upper_z")?;
+        // Decode the six bound columns in bounded slices rather than holding
+        // six full N-length f64 temporaries at once: on a multi-GB model the
+        // whole-column form peaks at ~48 B × N of scratch on top of the output
+        // `Vec<BlockBounds>`. One slice is ~48 MB of temporaries regardless of
+        // model size.
+        const BOUNDS_SLICE_BLOCKS: usize = 1 << 20;
         let n = self.metadata.n_blocks;
-        Ok((0..n)
-            .map(|i| BlockBounds {
-                lower: DVec3::new(lower_x[i], lower_y[i], lower_z[i]),
-                upper: DVec3::new(upper_x[i], upper_y[i], upper_z[i]),
-            })
-            .collect())
+        let mut blocks = Vec::with_capacity(n);
+        let mut start = 0;
+        while start < n {
+            let end = (start + BOUNDS_SLICE_BLOCKS).min(n);
+            let lower_x = self.numeric_values_range("__lower_x", start, end)?;
+            let lower_y = self.numeric_values_range("__lower_y", start, end)?;
+            let lower_z = self.numeric_values_range("__lower_z", start, end)?;
+            let upper_x = self.numeric_values_range("__upper_x", start, end)?;
+            let upper_y = self.numeric_values_range("__upper_y", start, end)?;
+            let upper_z = self.numeric_values_range("__upper_z", start, end)?;
+            let rows = lower_x
+                .into_iter()
+                .zip(lower_y)
+                .zip(lower_z)
+                .zip(upper_x)
+                .zip(upper_y)
+                .zip(upper_z);
+            for (((((lx, ly), lz), ux), uy), uz) in rows {
+                blocks.push(BlockBounds {
+                    lower: DVec3::new(lx, ly, lz),
+                    upper: DVec3::new(ux, uy, uz),
+                });
+            }
+            start = end;
+        }
+        Ok(blocks)
     }
 
     fn regular_block_bounds(&self) -> Result<Vec<BlockBounds>, BmfError> {
@@ -319,6 +339,19 @@ impl BmfModel {
 
     pub(crate) fn local_to_world(&self, local: DVec3) -> DVec3 {
         self.metadata.origin + self.rotation * local
+    }
+
+    /// The model's local→world rotation and origin, so a renderer can push the
+    /// affine placement (`origin + rotation * local`) to the GPU and expand
+    /// axis-aligned local block bounds into oriented world boxes in a shader
+    /// instead of pre-rotating every corner on the CPU. Orthonormal, so its
+    /// inverse is its transpose.
+    pub(crate) fn rotation(&self) -> DMat3 {
+        self.rotation
+    }
+
+    pub(crate) fn origin(&self) -> DVec3 {
+        self.metadata.origin
     }
 
     /// `true` when the model's dip/plunge are (approximately) zero, i.e. the

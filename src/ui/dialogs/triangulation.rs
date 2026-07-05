@@ -8,7 +8,9 @@ use crate::{
             EditorState, TriCreatePhase, TriSurfaceCutSide, TriSurfaceType, UiCommand,
             UiProjectView,
         },
-        widgets::menu::{DragableMenu, MenuField, MenuFieldColor32, MenuFieldCombo, MenuFieldText},
+        widgets::menu::{
+            DragableMenu, MenuField, MenuFieldColor32, MenuFieldCombo, MenuFieldF64, MenuFieldText,
+        },
     },
 };
 
@@ -404,12 +406,20 @@ pub(crate) fn draw_cut_z_dialog(
 
             ui.add_space(4.0);
 
-            MenuFieldText::new("Z min", &mut editor.tri_cut_z_min_input)
-                .width(80.0)
-                .show(ui);
-            MenuFieldText::new("Z max", &mut editor.tri_cut_z_max_input)
-                .width(80.0)
-                .show(ui);
+            MenuFieldF64::new(
+                "Z min",
+                &mut editor.tri_cut_z_min_input,
+                f64::MIN..=f64::MAX,
+            )
+            .width(80.0)
+            .show(ui);
+            MenuFieldF64::new(
+                "Z max",
+                &mut editor.tri_cut_z_max_input,
+                f64::MIN..=f64::MAX,
+            )
+            .width(80.0)
+            .show(ui);
 
             ui.add_space(4.0);
 
@@ -421,9 +431,9 @@ pub(crate) fn draw_cut_z_dialog(
             ui.add_space(6.0);
             ui.separator();
 
-            let z_min = editor.tri_cut_z_min_input.trim().parse::<f64>().ok();
-            let z_max = editor.tri_cut_z_max_input.trim().parse::<f64>().ok();
-            let valid_z_range = z_min.zip(z_max).is_some_and(|(min, max)| min < max);
+            let z_min = editor.tri_cut_z_min_input;
+            let z_max = editor.tri_cut_z_max_input;
+            let valid_z_range = z_min.is_finite() && z_max.is_finite() && z_min < z_max;
             let can_run = editor.tri_cut_z_tri_id.is_some()
                 && valid_z_range
                 && !editor.tri_cut_z_name_input.trim().is_empty();
@@ -436,8 +446,8 @@ pub(crate) fn draw_cut_z_dialog(
                 {
                     commands.push(UiCommand::ExecuteCutTriangulationByZ {
                         tri_id,
-                        z_min: z_min.expect("Slice button enabled only with parsed Z min"),
-                        z_max: z_max.expect("Slice button enabled only with parsed Z max"),
+                        z_min,
+                        z_max,
                         name: editor.tri_cut_z_name_input.trim().to_owned(),
                     });
                 }
@@ -878,15 +888,17 @@ pub(crate) fn draw_contour_dialog(
 
             ui.add_space(4.0);
 
-            MenuFieldText::new(
+            MenuFieldF64::new(
                 "Minor interval",
                 &mut editor.tri_contour_minor_interval_input,
+                1e-6..=f64::MAX,
             )
             .width(70.0)
             .show(ui);
-            MenuFieldText::new(
+            MenuFieldF64::new(
                 "Major interval",
                 &mut editor.tri_contour_major_interval_input,
+                1e-6..=f64::MAX,
             )
             .width(70.0)
             .show(ui);
@@ -931,19 +943,13 @@ pub(crate) fn draw_contour_dialog(
             ui.add_space(6.0);
             ui.separator();
 
-            let minor_interval = editor
-                .tri_contour_minor_interval_input
-                .trim()
-                .parse::<f64>()
-                .ok();
-            let major_interval = editor
-                .tri_contour_major_interval_input
-                .trim()
-                .parse::<f64>()
-                .ok();
-            let valid_intervals = minor_interval
-                .zip(major_interval)
-                .is_some_and(|(minor, major)| minor >= 1e-6 && major >= 1e-6 && major >= minor);
+            let minor_interval = editor.tri_contour_minor_interval_input;
+            let major_interval = editor.tri_contour_major_interval_input;
+            let valid_intervals = minor_interval.is_finite()
+                && major_interval.is_finite()
+                && minor_interval >= 1e-6
+                && major_interval >= 1e-6
+                && major_interval >= minor_interval;
             let can_run = editor.tri_contour_tri_id.is_some()
                 && valid_intervals
                 && !project.projects.is_empty();
@@ -956,10 +962,8 @@ pub(crate) fn draw_contour_dialog(
                 {
                     commands.push(UiCommand::ExecuteContourTriangulation {
                         tri_id,
-                        major_interval: major_interval
-                            .expect("Generate button enabled only with parsed major interval"),
-                        minor_interval: minor_interval
-                            .expect("Generate button enabled only with parsed minor interval"),
+                        major_interval,
+                        minor_interval,
                         major_color: editor.tri_contour_major_color,
                         minor_color: editor.tri_contour_minor_color,
                         project_index: editor.tri_contour_project_index,

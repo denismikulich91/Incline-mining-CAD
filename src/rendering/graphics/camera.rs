@@ -509,8 +509,12 @@ impl<'a> Graphics<'a> {
             crate::ui::state::StandardView::West => (DVec3::X, DVec3::Z),
             crate::ui::state::StandardView::East => (DVec3::NEG_X, DVec3::Z),
         };
-        self.camera
-            .set_target_orientation(forward, up, self.projection.zoom);
+        self.camera_controller.begin_view_transition(
+            &self.camera,
+            forward,
+            up,
+            self.projection.zoom,
+        );
         self.camera_controller.end_orbit();
         self.orbit_marker = None;
     }
@@ -634,7 +638,7 @@ impl<'a> Graphics<'a> {
         }
     }
 
-    pub(super) fn upload_camera_uniform(&mut self) {
+    pub(super) fn upload_camera_uniform(&mut self, interaction_resolution_divisor: u32) {
         let screen_size = self.screen_size();
         self.camera_uniform.update_view_proj(
             &self.camera,
@@ -642,6 +646,23 @@ impl<'a> Graphics<'a> {
             self.scene_origin,
             self.vertical_exaggeration,
         );
+        // While the camera is being orbited/panned/zoomed, draw the volume
+        // raycast at a reduced per-axis resolution and upscale. The reduced
+        // resolution also coarsens the raycaster's footprint-driven brick LOD
+        // implicitly and arms its in-shader step cap, so the explicit LOD boost
+        // stays at 1.0. See `CameraUniform::set_interaction_quality` and the
+        // volume upscale pass.
+        const MOTION_LOD_BOOST: f32 = 1.0;
+        let motion_render_scale = 1.0 / interaction_resolution_divisor.clamp(1, 64) as f32;
+        if self.is_camera_active() || self.needs_continuous_redraw() {
+            self.mark_interaction();
+        }
+        if self.interaction_active() {
+            self.camera_uniform
+                .set_interaction_quality(MOTION_LOD_BOOST, motion_render_scale);
+        } else {
+            self.camera_uniform.set_interaction_quality(1.0, 1.0);
+        }
         self.text_system.viewport.update(
             &self.queue,
             Resolution {
@@ -659,8 +680,14 @@ impl<'a> Graphics<'a> {
         );
     }
 
-    pub(crate) fn update(&mut self, dt: Duration) {
-        if self.fly_mode_enabled {
+    pub(crate) fn update(&mut self, dt: Duration, interaction_resolution_divisor: u32) {
+        if self.camera_controller.has_view_transition() {
+            self.camera_controller.update_view_transition(
+                &mut self.camera,
+                &mut self.projection,
+                dt,
+            );
+        } else if self.fly_mode_enabled {
             self.fly_camera_controller
                 .update_camera(&mut self.camera, dt);
         } else {
@@ -672,12 +699,18 @@ impl<'a> Graphics<'a> {
                 screen_size,
             );
         }
-        self.upload_camera_uniform();
+        self.upload_camera_uniform(interaction_resolution_divisor);
     }
 
     pub(crate) fn input(&mut self, event: &WindowEvent) -> bool {
         match event {
             WindowEvent::MouseWheel { delta, .. } => {
+                // Zoom is applied and cleared within a single update tick, so
+                // `needs_continuous_redraw` only briefly reflects it and the
+                // low-quality volume path can be missed for a scroll burst.
+                // Mark interaction directly so the cooldown covers the whole
+                // burst (and 150 ms after), like camera drags and resizes.
+                self.mark_interaction();
                 if self.fly_mode_enabled {
                     self.fly_camera_controller.process_scroll(delta);
                 } else {
@@ -687,11 +720,17 @@ impl<'a> Graphics<'a> {
             }
             WindowEvent::MouseInput { button, state, .. } => {
                 let pressing = *state == ElementState::Pressed;
+                let camera_button = matches!(
+                    button,
+                    MouseButton::Left | MouseButton::Middle | MouseButton::Right
+                );
                 if pressing {
                     if *button == MouseButton::Right && !self.fly_mode_enabled {
                         // The app promotes a right press to orbit only after it
                         // moves past the context-click threshold.
-                    } else if self.mouse_pressed.is_none() || *button == MouseButton::Right {
+                    } else if camera_button
+                        && (self.mouse_pressed.is_none() || *button == MouseButton::Right)
+                    {
                         self.mouse_pressed = Some(*button);
                     }
                     if self.fly_mode_enabled && *button == MouseButton::Right {

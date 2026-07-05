@@ -28,7 +28,10 @@ pub(crate) fn draw_preferences(
         ui.vertical_centered(|ui| {
             ui.add_space(50.);
             ui.allocate_ui_with_layout(
-                egui::vec2(850.0, ui.available_height() - 50.),
+                egui::vec2(
+                    ui.available_width() * 0.4 + 200.,
+                    ui.available_height() - 50.,
+                ),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     egui::Panel::left("pannel")
@@ -127,8 +130,6 @@ pub(crate) fn draw_preferences(
                                     &mut draft.show_world_axis_gizmo,
                                 )
                                 .show(ui);
-                                MenuFieldBool::new("Show view cube", &mut draft.show_view_cube)
-                                    .show(ui);
                                 MenuFieldBool::new(
                                     "Enable frame counter",
                                     &mut draft.frame_counter_enabled,
@@ -158,6 +159,13 @@ pub(crate) fn draw_preferences(
                                     20..=1000,
                                 )
                                 .suffix(" FPS")
+                                .show(ui);
+                                MenuFieldU32::new(
+                                    "Block model raycast downscale while interacting",
+                                    &mut draft.block_model_interaction_resolution_divisor,
+                                    1..=64,
+                                )
+                                .suffix("x")
                                 .show(ui);
                             }
                         }

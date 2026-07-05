@@ -195,6 +195,28 @@ macro_rules! menu_field_float {
                     )
                 })
             }
+
+            pub(crate) fn show_inline(self, ui: &mut egui::Ui) -> egui::Response {
+                let Self {
+                    label,
+                    value,
+                    range,
+                    width,
+                    speed,
+                    suffix,
+                    max_decimals,
+                } = self;
+                let row_height = ui.spacing().interact_size.y;
+                ui.label(label);
+                ui.add_sized(
+                    [width, row_height],
+                    egui::DragValue::new(value)
+                        .speed(speed)
+                        .range(range)
+                        .suffix(suffix)
+                        .max_decimals(max_decimals),
+                )
+            }
         }
     };
 }

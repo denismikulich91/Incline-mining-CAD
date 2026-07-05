@@ -7,11 +7,13 @@ impl<'a> App<'a> {
             dark_mode: self.editor.dark_mode,
             show_console: self.editor.show_console,
             show_world_axis_gizmo: self.editor.show_world_axis_gizmo,
-            show_view_cube: self.editor.show_view_cube,
             renderer_background_color: self.editor.renderer_background_color,
             snap_poll_rate: self.editor.snap_poll_rate,
             frame_rate_cap: self.editor.frame_rate_cap,
             resize_frame_rate_cap: self.editor.resize_frame_rate_cap,
+            block_model_interaction_resolution_divisor: self
+                .editor
+                .block_model_interaction_resolution_divisor,
             frame_counter_enabled: self.editor.frame_counter_enabled,
         })?;
         Ok(())
@@ -21,16 +23,6 @@ impl<'a> App<'a> {
         self.editor.show_world_axis_gizmo = enabled;
         if let Some(draft) = self.editor.preferences_draft.as_mut() {
             draft.show_world_axis_gizmo = enabled;
-        }
-        self.save_preferences()?;
-        self.redraw_requested = true;
-        Ok(())
-    }
-
-    pub(crate) fn set_show_view_cube(&mut self, enabled: bool) -> anyhow::Result<()> {
-        self.editor.show_view_cube = enabled;
-        if let Some(draft) = self.editor.preferences_draft.as_mut() {
-            draft.show_view_cube = enabled;
         }
         self.save_preferences()?;
         self.redraw_requested = true;
@@ -81,11 +73,13 @@ impl<'a> App<'a> {
             dark_mode: preferences.dark_mode,
             show_console: preferences.show_console,
             show_world_axis_gizmo: preferences.show_world_axis_gizmo,
-            show_view_cube: preferences.show_view_cube,
             renderer_background_color: preferences.renderer_background_color,
             snap_poll_rate: preferences.snap_poll_rate.clamp(5, 1000),
             frame_rate_cap: preferences.frame_rate_cap.clamp(20, 1000),
             resize_frame_rate_cap: preferences.resize_frame_rate_cap.clamp(20, 1000),
+            block_model_interaction_resolution_divisor: preferences
+                .block_model_interaction_resolution_divisor
+                .clamp(1, 64),
             frame_counter_enabled: preferences.frame_counter_enabled,
         })?;
 
@@ -93,11 +87,13 @@ impl<'a> App<'a> {
         self.editor.dark_mode = preferences.dark_mode;
         self.editor.show_console = preferences.show_console;
         self.editor.show_world_axis_gizmo = preferences.show_world_axis_gizmo;
-        self.editor.show_view_cube = preferences.show_view_cube;
         self.editor.renderer_background_color = preferences.renderer_background_color;
         self.editor.snap_poll_rate = preferences.snap_poll_rate.clamp(5, 1000);
         self.editor.frame_rate_cap = preferences.frame_rate_cap.clamp(20, 1000);
         self.editor.resize_frame_rate_cap = preferences.resize_frame_rate_cap.clamp(20, 1000);
+        self.editor.block_model_interaction_resolution_divisor = preferences
+            .block_model_interaction_resolution_divisor
+            .clamp(1, 64);
         self.editor.frame_counter_enabled = preferences.frame_counter_enabled;
         if !preferences.frame_counter_enabled {
             self.editor.measured_fps = None;

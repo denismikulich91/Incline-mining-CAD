@@ -183,14 +183,16 @@ pub(crate) fn draw_round_join(
     line_width: f32,
     color: [f32; 4],
 ) {
-    const SEGMENTS: u32 = 16;
-    static DIRECTIONS: LazyLock<[[f32; 2]; (SEGMENTS + 1) as usize]> = LazyLock::new(|| {
+    const MAX_SEGMENTS: u32 = 16;
+    static DIRECTIONS: LazyLock<[[f32; 2]; (MAX_SEGMENTS + 1) as usize]> = LazyLock::new(|| {
         std::array::from_fn(|index| {
-            let angle = std::f32::consts::TAU * index as f32 / SEGMENTS as f32;
+            let angle = std::f32::consts::TAU * index as f32 / MAX_SEGMENTS as f32;
             [angle.cos(), angle.sin()]
         })
     });
     let radius = (line_width * ctx.scale_factor).max(1.0) * 0.5;
+    let segments = if radius <= 2.0 { 8 } else { MAX_SEGMENTS };
+    let direction_step = (MAX_SEGMENTS / segments) as usize;
     let base = ctx.stroke_vertex_buf.len() as u32;
     let position = local(center, ctx.scene_origin);
     ctx.stroke_vertex_buf.push(StrokeVertex {
@@ -200,7 +202,8 @@ pub(crate) fn draw_round_join(
         offset_px: [0.0, 0.0],
         screen_space: 1.0,
     });
-    for direction in DIRECTIONS.iter() {
+    for index in (0..=MAX_SEGMENTS as usize).step_by(direction_step) {
+        let direction = DIRECTIONS[index];
         ctx.stroke_vertex_buf.push(StrokeVertex {
             pos: position,
             color,
@@ -209,7 +212,7 @@ pub(crate) fn draw_round_join(
             screen_space: 1.0,
         });
     }
-    for index in 0..SEGMENTS {
+    for index in 0..segments {
         ctx.stroke_index_buf
             .extend_from_slice(&[base, base + index + 1, base + index + 2]);
     }

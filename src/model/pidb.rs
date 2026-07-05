@@ -773,6 +773,7 @@ fn document_from_dgd_points(
     let mut current_layer_name: Option<String> = None;
     let mut current_geometry = DesignGeometryKind::Unknown;
     let mut current_closed = false;
+    let mut current_color_index: Option<u8> = None;
     let mut previous_offset = None;
     let mut current_verts: Vec<PolyVertex> = Vec::new();
 
@@ -781,22 +782,24 @@ fn document_from_dgd_points(
         layer_id: Option<LayerId>,
         geometry_kind: DesignGeometryKind,
         closed: bool,
+        color_index: Option<u8>,
         verts: &mut Vec<PolyVertex>,
     ) {
         let Some(layer_id) = layer_id else {
             verts.clear();
             return;
         };
+        let color = dgd_object_color(color_index);
         if geometry_kind == DesignGeometryKind::Point {
             for vertex in verts.drain(..) {
-                add_dgd_point(doc, layer_id, vertex.pos);
+                add_dgd_point(doc, layer_id, vertex.pos, color);
             }
             return;
         }
         match verts.len() {
             0 => {}
-            1 => add_dgd_point(doc, layer_id, verts[0].pos),
-            _ => add_dgd_polyline(doc, layer_id, std::mem::take(verts), closed),
+            1 => add_dgd_point(doc, layer_id, verts[0].pos, color),
+            _ => add_dgd_polyline(doc, layer_id, std::mem::take(verts), closed, color),
         }
         verts.clear();
     }
@@ -811,9 +814,11 @@ fn document_from_dgd_points(
                 current_layer,
                 current_geometry,
                 current_closed,
+                current_color_index,
                 &mut current_verts,
             );
             current_closed = point.closed;
+            current_color_index = point.color_index;
             let layer_name = point
                 .layer_name
                 .as_deref()
@@ -844,6 +849,7 @@ fn document_from_dgd_points(
         current_layer,
         current_geometry,
         current_closed,
+        current_color_index,
         &mut current_verts,
     );
 
@@ -861,29 +867,44 @@ fn document_from_dgd_points(
             content: text.content.clone(),
             height: text.height,
             rotation: text.rotation_degrees.to_radians(),
-            color: ObjectColor::ByLayer,
+            color: dgd_object_color(text.color_index),
         });
     }
 
     doc
 }
 
-fn add_dgd_point(doc: &mut Document, layer_id: LayerId, pos: glam::DVec3) {
+/// Resolve a Vulcan object colour index to an [`ObjectColor`], falling back to
+/// `ByLayer` for blank or not-yet-mapped indices (see
+/// [`crate::rendering::color::vulcan_color_to_linear_rgba`]).
+fn dgd_object_color(color_index: Option<u8>) -> ObjectColor {
+    color_index
+        .and_then(crate::rendering::color::vulcan_color_to_linear_rgba)
+        .map_or(ObjectColor::ByLayer, ObjectColor::Fixed)
+}
+
+fn add_dgd_point(doc: &mut Document, layer_id: LayerId, pos: glam::DVec3, color: ObjectColor) {
     doc.add_object(|id| Object::Point {
         id,
         layer: layer_id,
         pos,
-        color: ObjectColor::ByLayer,
+        color,
     });
 }
 
-fn add_dgd_polyline(doc: &mut Document, layer_id: LayerId, verts: Vec<PolyVertex>, closed: bool) {
+fn add_dgd_polyline(
+    doc: &mut Document,
+    layer_id: LayerId,
+    verts: Vec<PolyVertex>,
+    closed: bool,
+    color: ObjectColor,
+) {
     doc.add_object(|id| Object::Polyline {
         id,
         layer: layer_id,
         verts,
         closed,
-        color: ObjectColor::ByLayer,
+        color,
         fill: FillStyle::Clear,
         fill_color: None,
         line_weight: 1.0,
@@ -1003,6 +1024,7 @@ mod tests {
             secondary_name: String::new(),
             layer_name: None,
             closed: false,
+            color_index: None,
             seg_type,
             geometry_kind,
             x,
@@ -1017,8 +1039,14 @@ mod tests {
             return;
         };
         let pidb = pidb_from_dgd_isis(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let fixed_color = pidb
+            .document
+            .objects()
+            .iter()
+            .filter(|object| matches!(object.color(), ObjectColor::Fixed(_)))
+            .count();
         println!(
-            "{path}: {} layers, {} objects",
+            "{path}: {} layers, {} objects ({fixed_color} with a fixed Vulcan colour)",
             pidb.document.layers().len(),
             pidb.document.objects().len()
         );
@@ -1090,6 +1118,7 @@ mod tests {
             secondary_name: "ORE_OUTLINE".to_owned(),
             layer_name: None,
             closed: false,
+            color_index: None,
             seg_type: 0,
             geometry_kind: DesignGeometryKind::Unknown,
             x: 100.0,
@@ -1110,6 +1139,7 @@ mod tests {
             secondary_name: "0          6".to_owned(),
             layer_name: None,
             closed: false,
+            color_index: None,
             seg_type: 0,
             geometry_kind: DesignGeometryKind::Unknown,
             x: 100.0,

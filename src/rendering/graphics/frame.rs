@@ -26,7 +26,7 @@ impl<'a> Graphics<'a> {
         self.include_pending_stroke_in_depth(editor);
         self.include_batter_berm_preview_in_depth(editor);
         self.include_road_preview_in_depth(editor);
-        self.upload_camera_uniform();
+        self.upload_camera_uniform(editor.block_model_interaction_resolution_divisor);
         let output = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(output)
             | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
@@ -64,6 +64,7 @@ impl<'a> Graphics<'a> {
             block_models,
             editor,
             &self.surface_style_bind_group_layout,
+            &self.block_model_volume_bind_group_layout,
             &self.edge_style_bind_group_layout,
         );
         let needs_geometry_rebuild = self.geometry_dirty
@@ -204,7 +205,15 @@ impl<'a> Graphics<'a> {
             self.overlay_dirty = false;
         }
 
-        {
+        // Glyph vertices are stored pre-view_proj (the text shader applies the
+        // camera from the params uniform), so prepare only has to run when the
+        // text areas changed — camera-only frames reuse the prepared buffers.
+        if needs_geometry_rebuild || self.text_prepare_pending {
+            // Trim resets the atlas's in-use protection set; prepare rebuilds
+            // it, so the two must run in the same frame or a later prepare
+            // could evict glyphs the live vertex buffer still references.
+            self.text_system.text_atlas.trim();
+
             let text_areas: Vec<TextArea> = self
                 .cached_textareas
                 .iter()
@@ -222,6 +231,7 @@ impl<'a> Graphics<'a> {
             ) {
                 log::error!("Text prepare failed: {e:?}");
             }
+            self.text_prepare_pending = false;
             if needs_geometry_rebuild
                 && self
                     .frame_index
@@ -260,18 +270,26 @@ impl<'a> Graphics<'a> {
         if ui_output.geometry_dirty {
             self.invalidate_geometry();
         }
+        // Dragging a UI widget that affects the render (e.g. a colour-gradient
+        // stop) starts the interaction cooldown so the volume raycaster drops
+        // to its low-quality path, like camera drags / zoom / resize. The
+        // volume was already drawn this frame, so this takes effect next frame
+        // — fine, since dragging spans many frames.
+        if ui_output.ui_pointer_active {
+            self.mark_interaction();
+        }
         if ui_output.repaint {
+            self.window.request_redraw();
+        }
+        // Keep redrawing through the interaction cooldown so the volume
+        // raycaster's reduced-quality frames are always followed by a
+        // full-quality one once the camera settles / resizing stops.
+        if self.interaction_active() {
             self.window.request_redraw();
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
-        if self
-            .frame_index
-            .is_multiple_of(TEXT_ATLAS_TRIM_INTERVAL_FRAMES)
-        {
-            self.text_system.text_atlas.trim();
-        }
         self.frame_index = self.frame_index.wrapping_add(1);
 
         Ok(ui_output)

@@ -1,6 +1,6 @@
 [package]
 name = "incline"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Incline is an open-pit mine design project"
 repository = "https://github.com/Incline-Mine-Designer/Incline"
@@ -36,7 +36,9 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
 wgpu = "29.0.3"
 winit = "0.30.13"
-glyphon = { version = "0.10", git = "https://github.com/trimental/glyphon.git", rev = "a5458590fc0b52c0bac878219fb287bdffd1fb9a" } # Fork of glyphon with world-space transform support - not ideal
+# Fork of glyphon with world-space transform support; view_proj is applied
+# in the vertex shader so prepare() output is camera-independent.
+glyphon = { version = "0.10", git = "https://github.com/trimental/glyphon.git", rev = "322b7dba28b8b402caed7fec0b83a8e1cc731a31" }
 twox-hash = "2.1.2"
 egui = "0.35.0"
 egui-winit = "0.35.0"
@@ -48,10 +50,10 @@ toml = "1.1.2"
 lazy_static = "1.5.0"
 rayon = "1.12.0"
 spade = "2.15.1"
-geo = "0.33.1"
+geo = { version = "0.33.1", default-features = false, features = ["spade", "multithreading"] } # Disables earcut dependency so its not downgraded to 0.4.5
 chrono = "0.4.45"
 colored = "3.1.1"
-earcut = "0.4"
+earcut = "0.4.10"
 robust = "1.2"
 memmap2 = "0.9.9"
 
@@ -63,3 +65,8 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["N
 [dependencies.bytemuck]
 version = "1.25.0"
 features = ["derive"]
+
+[dev-dependencies]
+# Pinned to wgpu's bundled naga so shader-validation tests parse/validate the
+# same WGSL the renderer compiles at runtime.
+naga = { version = "29.0.3", features = ["wgsl-in"] }

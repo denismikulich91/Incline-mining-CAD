@@ -40,11 +40,115 @@ impl<'a> Graphics<'a> {
             sample_count,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         (texture, view)
+    }
+
+    pub(super) fn create_block_model_peel_targets(
+        device: &wgpu::Device,
+        config: &wgpu::SurfaceConfiguration,
+        scene_depth_view: &wgpu::TextureView,
+        peel_layout: &wgpu::BindGroupLayout,
+        composite_layout: &wgpu::BindGroupLayout,
+    ) -> BlockModelPeelTargets {
+        let size = wgpu::Extent3d {
+            width: config.width.max(1),
+            height: config.height.max(1),
+            depth_or_array_layers: 1,
+        };
+        let accum_textures = vec![device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Block Model Transparency Accum"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })];
+        let accum_views = accum_textures
+            .iter()
+            .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()))
+            .collect::<Vec<_>>();
+        let peel_bind_groups = vec![device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: peel_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(scene_depth_view),
+            }],
+            label: Some("Block Model Transparency Bind Group"),
+        })];
+        let composite_bind_groups = vec![device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: composite_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&accum_views[0]),
+            }],
+            label: Some("Block Model Transparency Composite Bind Group"),
+        })];
+        BlockModelPeelTargets {
+            _accum_textures: accum_textures,
+            accum_views,
+            peel_bind_groups,
+            composite_bind_groups,
+        }
+    }
+
+    /// Off-screen target the volume raycast draws into so it can render at a
+    /// reduced resolution during interaction and be upscaled afterwards. The
+    /// texture is always full surface size; the raycast fills only a
+    /// `scale`-sized top-left sub-rect (set via the render pass viewport), so
+    /// the scale can change every frame without reallocating anything.
+    pub(super) fn create_block_model_volume_target(
+        device: &wgpu::Device,
+        config: &wgpu::SurfaceConfiguration,
+        layout: &wgpu::BindGroupLayout,
+    ) -> BlockModelVolumeTarget {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Block Model Volume Low-Res Target"),
+            size: wgpu::Extent3d {
+                width: config.width.max(1),
+                height: config.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // vec4: xy = the sub-rect (in pixels) rendered this frame.
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Block Model Volume Upscale Params"),
+            size: std::mem::size_of::<[f32; 4]>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+            label: Some("Block Model Volume Upscale Bind Group"),
+        });
+        BlockModelVolumeTarget {
+            _texture: texture,
+            view,
+            params_buffer,
+            bind_group,
+        }
     }
 
     pub(super) fn depth_state(write_enabled: bool, bias: i32) -> wgpu::DepthStencilState {

@@ -8,12 +8,16 @@ use crate::{
             ActiveTool, BatterBermMode, EditorState, HeightMode, MoveToLayerDialog, OffsetMeasure,
             OffsetProjection, RelimitMode, TrimEnd, UiCommand, UiProjectView,
         },
-        widgets::menu::{
-            DragableMenu, MenuField, MenuFieldColor32, MenuFieldCombo, MenuFieldF32, MenuFieldF64,
-            MenuFieldRgba, MenuFieldText, MenuFieldU32,
+        themed_icon, unthemed_icon,
+        widgets::{
+            menu::{
+                DragableMenu, MenuField, MenuFieldColor32, MenuFieldCombo, MenuFieldF32,
+                MenuFieldF64, MenuFieldRgba, MenuFieldText, MenuFieldU32,
+            },
+            viewport::ViewportDockPanel,
         },
-        widgets::viewport::ViewportDockPanel,
     },
+    userspace_warn,
 };
 
 fn fill_style_label(style: FillStyle) -> &'static str {
@@ -140,8 +144,8 @@ pub(crate) fn draw_right_click_context(
                 let mut is_closed = first_closed;
                 MenuField::new("Shape").show(ui, |ui, _| {
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut is_closed, false, "⟵⟶ Open");
-                        ui.selectable_value(&mut is_closed, true, "⬛ Closed");
+                        ui.selectable_value(&mut is_closed, false, "Open");
+                        ui.selectable_value(&mut is_closed, true, "Closed");
                     })
                     .response
                 });
@@ -213,7 +217,7 @@ pub(crate) fn draw_right_click_context(
                 ui.separator();
             }
 
-            if ui.button("✖  Close").clicked() {
+            if ui.button("Close").clicked() {
                 commands.push(UiCommand::CloseCanvasContextMenu);
             }
         });
@@ -327,14 +331,8 @@ pub(crate) fn draw_set_selection_z_dialog(
         return;
     };
 
-    let z_value = dialog
-        .z_input
-        .trim()
-        .parse::<f64>()
-        .ok()
-        .filter(|value| value.is_finite());
     let object_count = dialog.object_ids.len();
-    let can_apply = z_value.is_some() && object_count > 0;
+    let can_apply = dialog.z_input.is_finite() && object_count > 0;
     let mut close = false;
     let mut apply = false;
     let mut open = true;
@@ -344,11 +342,10 @@ pub(crate) fn draw_set_selection_z_dialog(
         .min_width(260.0)
         .show(ui.ctx(), |ui| {
             ui.set_max_width(280.0);
-            let response = MenuFieldText::new("Z value", &mut dialog.z_input)
-                .hint_text("0.0")
+            let response = MenuFieldF64::new("Z value", &mut dialog.z_input, f64::MIN..=f64::MAX)
                 .width(120.0)
                 .show(ui);
-            if z_value.is_none() {
+            if !dialog.z_input.is_finite() {
                 ui.colored_label(
                     egui::Color32::from_rgb(200, 70, 70),
                     "Enter a valid Z value.",
@@ -374,10 +371,12 @@ pub(crate) fn draw_set_selection_z_dialog(
         });
 
     if apply {
-        if let Some(z) = z_value {
-            commands.push(UiCommand::BatchSetZValue(dialog.object_ids.clone(), z));
-            editor.z_input = dialog.z_input.clone();
-        }
+        commands.push(UiCommand::BatchSetZValue(
+            dialog.object_ids.clone(),
+            dialog.z_input,
+        ));
+        editor.z_input = dialog.z_input;
+        editor.z_level = dialog.z_input;
         editor.set_selection_z_dialog = None;
     } else if close || !open {
         editor.set_selection_z_dialog = None;
@@ -477,20 +476,177 @@ pub(crate) fn draw_move_layer_dialog(
 
 /// Draw the startup dialog prompting the user to open or create a .pidb file.
 pub(crate) fn draw_select_pidb_dialog(ui: &mut egui::Ui, commands: &mut Vec<UiCommand>) {
-    DragableMenu::new("Open or create a PIDB")
-        .min_width(300.0)
+    const PANEL_SIZE: f32 = 500.0;
+    const COLUMN_WIDTH: f32 = 190.0;
+    const ROW_HEIGHT: f32 = 22.0;
+
+    let panel_size = PANEL_SIZE.min(ui.ctx().content_rect().height() * 0.8);
+
+    egui::Area::new(egui::Id::new("select_pidb_dialog"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .order(egui::Order::Foreground)
         .show(ui.ctx(), |ui| {
-            ui.label("An active PIDB file and layer are required before editing.");
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("New PIDB").clicked() {
-                    commands.push(UiCommand::NewPidb);
-                }
-                if ui.button("Open PIDB").clicked() {
-                    commands.push(UiCommand::OpenPidb);
-                }
-            });
+            egui::Frame::new()
+                .fill(ui.visuals().window_fill())
+                .stroke(ui.visuals().window_stroke())
+                .corner_radius(egui::CornerRadius::ZERO)
+                .inner_margin(egui::Margin::ZERO)
+                .show(ui, |ui| {
+                    ui.set_width(panel_size);
+                    ui.set_height(panel_size * 0.7);
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 16.0);
+
+                    ui.add(egui::Image::new(unthemed_icon!("splash.svg")).shrink_to_fit());
+
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                        ui.add_space(30.0);
+                        select_pidb_action_column(ui, "Project", COLUMN_WIDTH, |ui| {
+                            if select_pidb_action_row(
+                                ui,
+                                egui::Image::new(themed_icon!(ui, "new_pidb.svg")),
+                                "New PIDB",
+                                COLUMN_WIDTH,
+                                ROW_HEIGHT,
+                            )
+                            .clicked()
+                            {
+                                commands.push(UiCommand::NewPidb);
+                            }
+                            if select_pidb_action_row(
+                                ui,
+                                egui::Image::new(themed_icon!(ui, "load_pidb.svg")),
+                                "Load PIDB",
+                                COLUMN_WIDTH,
+                                ROW_HEIGHT,
+                            )
+                            .clicked()
+                            {
+                                commands.push(UiCommand::OpenPidb);
+                            }
+                            if select_pidb_action_row(
+                                ui,
+                                egui::Image::new(themed_icon!(ui, "exit.svg")),
+                                "Close",
+                                COLUMN_WIDTH,
+                                ROW_HEIGHT,
+                            )
+                            .clicked()
+                            {
+                                commands.push(UiCommand::CloseStartupDialog);
+                            }
+                        });
+
+                        ui.add_space(panel_size - (COLUMN_WIDTH * 2.0) - 60.0);
+
+                        select_pidb_action_column(ui, "Application", COLUMN_WIDTH, |ui| {
+                            if select_pidb_action_row(
+                                ui,
+                                egui::Image::new(themed_icon!(ui, "preferences.svg")),
+                                "Preferences",
+                                COLUMN_WIDTH,
+                                ROW_HEIGHT,
+                            )
+                            .clicked()
+                            {
+                                commands.push(UiCommand::OpenPreferences);
+                            }
+                            if select_pidb_action_row(
+                                ui,
+                                egui::Image::new(themed_icon!(ui, "github.svg")),
+                                "GitHub",
+                                COLUMN_WIDTH,
+                                ROW_HEIGHT,
+                            )
+                            .clicked()
+                            {
+                                ui.ctx().open_url(egui::OpenUrl::new_tab(
+                                    "https://github.com/Incline-Developers/Incline",
+                                ));
+                            }
+                            if select_pidb_action_row(
+                                ui,
+                                egui::Image::new(unthemed_icon!("heart.svg")),
+                                "Donate",
+                                COLUMN_WIDTH,
+                                ROW_HEIGHT,
+                            )
+                            .clicked()
+                            {
+                                userspace_warn!("Donate not implemented");
+                            }
+                        });
+                    });
+                    egui::Panel::bottom("meta_splash")
+                        .show_separator_line(false)
+                        .show(ui, |ui| {
+                            ui.horizontal_centered(|ui| {
+                                ui.label("© 2026 Leo Timmins and Lucas Timmins");
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(format!(
+                                            "{}: {}",
+                                            crate::APP_NAME,
+                                            crate::APP_RELEASE
+                                        ))
+                                    },
+                                );
+                            });
+                        });
+                });
         });
+}
+
+fn select_pidb_action_column(
+    ui: &mut egui::Ui,
+    heading: &'static str,
+    width: f32,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    ui.vertical(|ui| {
+        ui.set_width(width);
+        ui.label(
+            egui::RichText::new(heading)
+                .size(12.0)
+                .color(ui.visuals().weak_text_color()),
+        );
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
+        add_contents(ui);
+    });
+}
+
+fn select_pidb_action_row(
+    ui: &mut egui::Ui,
+    icon: egui::Image<'static>,
+    label: &'static str,
+    width: f32,
+    height: f32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(2),
+            ui.visuals().widgets.hovered.bg_fill,
+        );
+    }
+
+    let icon_size = egui::vec2(22.0, 22.0);
+    let icon_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 2.0, rect.center().y - icon_size.y / 2.0),
+        icon_size,
+    );
+    icon.fit_to_exact_size(icon_size).paint_at(ui, icon_rect);
+
+    ui.painter().text(
+        egui::pos2(rect.left() + 30.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        ui.visuals().text_color(),
+    );
+
+    response
 }
 
 /// Draw the "Create a new layer" dialog (opened when NewLayer tool is active).
@@ -645,6 +801,7 @@ pub(crate) fn draw_text_edit_dialog(
                 MenuFieldF64::new("Height", &mut editor.pending_text_height, 0.001..=1.0e9)
                     .speed(0.25)
                     .max_decimals(3)
+                    .suffix("m")
                     .show(ui)
                     .changed();
             *geometry_dirty |= MenuFieldF64::new(
@@ -696,39 +853,25 @@ pub(crate) fn draw_finish_polygon_dialog(
     ui: &mut egui::Ui,
     commands: &mut Vec<UiCommand>,
     editor: &mut EditorState,
-    px: f32,
-    py: f32,
+    viewport_rect: egui::Rect,
 ) {
-    let ppp = ui.ctx().pixels_per_point();
-    let pos = egui::pos2(px / ppp + 14.0, py / ppp + 14.0);
-    let mut open = true;
-    DragableMenu::new("Finish polygon")
-        .open(&mut open)
-        .default_pos(pos)
-        .min_width(130.0)
-        .show(ui.ctx(), |ui| {
-            ui.set_max_width(280.0);
-            if ui.button("⬛ Close polygon").clicked() {
-                commands.push(UiCommand::FinishPolyClose);
-                editor.poly_finish_dialog = false;
-            }
-            if ui.button("╌ Leave open").clicked() {
-                commands.push(UiCommand::FinishPolyOpen);
-                editor.poly_finish_dialog = false;
-            }
-            ui.add_space(2.0);
-            ui.separator();
-            if ui.button("✖ Cancel").clicked() {
-                editor.poly_finish_dialog = false;
-                editor.poly_finish_dialog_px = None;
-            }
+    ViewportDockPanel::new("finish_poly_dialog", "Finish Polygon", viewport_rect).show(ui, |ui| {
+        MenuField::new("Shape").show(ui, |ui, _| {
+            ui.horizontal(|ui| {
+                if ui.button("Closed").clicked() {
+                    commands.push(UiCommand::FinishPolyClose);
+                    editor.poly_finish_dialog = false;
+                }
+                if ui.button("Open").clicked() {
+                    commands.push(UiCommand::FinishPolyOpen);
+                    editor.poly_finish_dialog = false;
+                }
+            });
         });
-    if !open {
-        editor.poly_finish_dialog = false;
-        editor.poly_finish_dialog_px = None;
-    }
+    });
 }
 
+// I dont like this - we need to clean this up later - too many options and sub menus
 /// Draw the Offset Element dialog (horizontal berm or angled batter projection).
 pub(crate) fn draw_offset_dialog(
     ui: &mut egui::Ui,
@@ -744,7 +887,7 @@ pub(crate) fn draw_offset_dialog(
         .min_width(350.0)
         .show(ui.ctx(), |ui| {
             // Projection row
-            MenuField::new("Projection").show(ui, |ui, row_height| {
+            MenuField::new("Projection").show(ui, |ui, _| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(
                         &mut editor.offset_projection,
@@ -758,25 +901,24 @@ pub(crate) fn draw_offset_dialog(
                         .clicked()
                         && !angle_active
                     {
-                        let deg = editor.offset_angle_input.parse::<f64>().unwrap_or(60.0);
-                        editor.offset_projection = OffsetProjection::Angled(deg);
-                    }
-                    if let OffsetProjection::Angled(ref mut deg) = editor.offset_projection {
-                        let resp = ui.add_sized(
-                            [48.0, row_height],
-                            egui::TextEdit::singleline(&mut editor.offset_angle_input)
-                                .hint_text("60"),
-                        );
-                        if resp.changed()
-                            && let Ok(v) = editor.offset_angle_input.parse::<f64>()
-                        {
-                            *deg = v;
-                        }
-                        ui.label("°");
+                        editor.offset_projection =
+                            OffsetProjection::Angled(editor.offset_angle_degrees);
                     }
                 })
                 .response
             });
+            if matches!(editor.offset_projection, OffsetProjection::Angled(_)) {
+                let response =
+                    MenuFieldF64::new("Angle", &mut editor.offset_angle_degrees, -89.9..=89.9)
+                        .width(70.0)
+                        .speed(0.5)
+                        .suffix("°")
+                        .show(ui);
+                if response.changed() {
+                    editor.offset_projection =
+                        OffsetProjection::Angled(editor.offset_angle_degrees);
+                }
+            }
 
             ui.add_space(4.0);
 
@@ -825,58 +967,62 @@ pub(crate) fn draw_offset_dialog(
             // Value label adapts to context
             let value_label = match (&editor.offset_projection, &editor.offset_measure) {
                 (OffsetProjection::Horizontal, _) => "Offset distance (m)",
-                (OffsetProjection::Angled(_), OffsetMeasure::Distance) => {
-                    "Distance along slope (m)"
-                }
-                (OffsetProjection::Angled(_), OffsetMeasure::Width) => "Horizontal distance (m)",
+                (OffsetProjection::Angled(_), OffsetMeasure::Distance) => "Distance along slope",
+                (OffsetProjection::Angled(_), OffsetMeasure::Width) => "Horizontal distance",
                 (OffsetProjection::Angled(_), OffsetMeasure::Height(HeightMode::Relative)) => {
-                    "Height change (m)"
+                    "Height change"
                 }
                 (OffsetProjection::Angled(_), OffsetMeasure::Height(HeightMode::AbsoluteRL)) => {
-                    "Target RL (m)"
+                    "Target RL"
                 }
             };
-            MenuFieldText::new(value_label, &mut editor.offset_value_input)
-                .hint_text("0.0")
+            MenuFieldF64::new(value_label, &mut editor.offset_value_input, 0.0..=f64::MAX)
+                .speed(0.1)
+                .suffix("m")
                 .show(ui);
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("✖ Cancel").clicked() {
+                if ui.button("Cancel").clicked() {
                     editor.offset_dialog_open = false;
                     editor.offset_target_id = None;
                     editor.active_tool = ActiveTool::None;
                 }
-                if ui.button("Apply — pick side →").clicked()
-                    && let Ok(raw_value) = editor.offset_value_input.parse::<f64>()
-                    && raw_value.is_finite()
-                {
+                if ui.button("Continue: Pick Side").clicked() {
                     // Compute horiz_dist and z_delta from projection + measure + value.
                     let (horiz_dist, z_delta, project_to_rl) = match editor.offset_projection {
-                        OffsetProjection::Horizontal => (raw_value, 0.0, None),
+                        OffsetProjection::Horizontal => (editor.offset_value_input, 0.0, None),
                         OffsetProjection::Angled(deg) => {
                             let rad = deg.to_radians();
                             let tan = rad.tan();
                             match editor.offset_measure {
                                 OffsetMeasure::Distance => {
                                     // distance along slope
-                                    let h = raw_value * rad.sin();
-                                    let horiz = raw_value * rad.cos();
+                                    let h = editor.offset_value_input * rad.sin();
+                                    let horiz = editor.offset_value_input * rad.cos();
                                     (horiz, h, None)
                                 }
-                                OffsetMeasure::Width => (raw_value, raw_value * tan, None),
+                                OffsetMeasure::Width => (
+                                    editor.offset_value_input,
+                                    editor.offset_value_input * tan,
+                                    None,
+                                ),
                                 OffsetMeasure::Height(HeightMode::Relative) => {
                                     if tan.abs() < 1e-9 {
-                                        (raw_value, 0.0, None)
+                                        (editor.offset_value_input, 0.0, None)
                                     } else {
-                                        (raw_value / tan, raw_value, None)
+                                        (
+                                            editor.offset_value_input / tan,
+                                            editor.offset_value_input,
+                                            None,
+                                        )
                                     }
                                 }
                                 OffsetMeasure::Height(HeightMode::AbsoluteRL) => {
                                     // Project each vertex individually along the batter
                                     // angle so the whole string lands flat at the target
                                     // RL, rather than uniformly shifting the string.
-                                    (0.0, 0.0, Some((tan, raw_value)))
+                                    (0.0, 0.0, Some((tan, editor.offset_value_input)))
                                 }
                             }
                         }
@@ -911,9 +1057,10 @@ pub(crate) fn draw_batter_berm_dialog(
     )
     .min_width(310.0)
     .show(ui.ctx(), |ui| {
-        MenuFieldF64::new("Berm width (m)", &mut editor.batter_berm_width, 0.1..=500.0)
+        MenuFieldF64::new("Berm width", &mut editor.batter_berm_width, 0.1..=500.0)
             .speed(0.1)
             .max_decimals(2)
+            .suffix("m")
             .show(ui);
         MenuFieldF64::new(
             "Batter angle (\u{b0})",
@@ -924,12 +1071,13 @@ pub(crate) fn draw_batter_berm_dialog(
         .max_decimals(1)
         .show(ui);
         MenuFieldF64::new(
-            "Bench height (m)",
+            "Bench height",
             &mut editor.batter_berm_bench_height,
             0.1..=500.0,
         )
         .speed(0.1)
         .max_decimals(2)
+        .suffix("m")
         .show(ui);
         let max_benches = editor.batter_berm_max_benches.max(1);
         MenuFieldU32::new("Benches", &mut editor.batter_berm_benches, 1..=max_benches)
@@ -951,13 +1099,13 @@ pub(crate) fn draw_batter_berm_dialog(
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
-            if ui.button("✖ Cancel").clicked() {
+            if ui.button("Cancel").clicked() {
                 commands.push(UiCommand::CancelBatterBerm);
             }
             if ui
                 .add_enabled(
                     !editor.batter_berm_rings_world.is_empty(),
-                    egui::Button::new("✔ Apply"),
+                    egui::Button::new("Apply"),
                 )
                 .clicked()
             {
@@ -1029,8 +1177,9 @@ pub(crate) fn draw_relimit_dialog(
                     } else {
                         "Delta length (m, use + or -)"
                     };
-                    MenuFieldText::new(label, &mut editor.relimit_value_input)
-                        .hint_text("0.0")
+                    MenuFieldF64::new(label, &mut editor.relimit_value_input, f64::MIN..=f64::MAX)
+                        .speed(0.1)
+                        .suffix("m")
                         .show(ui);
                     MenuField::new("Move which end").show(ui, |ui, _| {
                         ui.horizontal(|ui| {
@@ -1052,7 +1201,7 @@ pub(crate) fn draw_relimit_dialog(
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("✖ Cancel").clicked() {
+                if ui.button("Cancel").clicked() {
                     editor.relimit_dialog_open = false;
                     editor.relimit_awaiting_source_pick = false;
                     editor.relimit_source_id = None;
@@ -1075,16 +1224,13 @@ pub(crate) fn draw_relimit_dialog(
                     }
                     RelimitMode::AbsoluteLength | RelimitMode::RelativeLength => {
                         if ui.button("Apply").clicked()
-                            && let (Ok(value), Some(source_id)) = (
-                                editor.relimit_value_input.parse::<f64>(),
-                                editor.relimit_source_id,
-                            )
-                            && value.is_finite()
+                            && editor.relimit_value_input.is_finite()
+                            && let Some(source_id) = editor.relimit_source_id
                         {
                             commands.push(UiCommand::RelimitLineResize {
                                 source_id,
                                 mode: editor.relimit_mode,
-                                value,
+                                value: editor.relimit_value_input,
                             });
                             editor.relimit_dialog_open = false;
                         }
@@ -1290,66 +1436,42 @@ pub(crate) fn draw_road_dialog(
     ViewportDockPanel::new("road_panel", "Create Road", viewport_rect)
         .min_width(280.0)
         .show(ui.ctx(), |ui| {
-            MenuFieldF64::new("Width (m)", &mut editor.road_width, 0.5..=500.0)
+            MenuFieldF64::new("Width", &mut editor.road_width, 10.0..=100.0)
                 .speed(0.1)
                 .max_decimals(2)
+                .suffix("m")
                 .show(ui);
+
             MenuFieldF64::new(
-                "Max angle (\u{b0})",
+                "Max turning angle",
                 &mut editor.road_max_angle_degrees,
                 0.0..=89.9,
             )
             .speed(0.1)
             .max_decimals(2)
+            .suffix("\u{b0}")
             .show(ui);
 
-            // Camber input with % / ° toggle
-            MenuField::new("Camber").show(ui, |ui, _| {
-                ui.horizontal(|ui| {
-                    if editor.road_camber_is_percent {
-                        let mut pct = editor.road_camber_degrees.to_radians().tan() * 100.0;
-                        let drag = egui::DragValue::new(&mut pct)
-                            .speed(0.1)
-                            .range(0.0..=30.0)
-                            .max_decimals(2);
-                        if ui.add(drag).changed() {
-                            editor.road_camber_degrees = pct.atan2(100.0_f64).to_degrees();
-                        }
-                        ui.label("%");
-                    } else {
-                        let drag = egui::DragValue::new(&mut editor.road_camber_degrees)
-                            .speed(0.1)
-                            .range(0.0..=30.0)
-                            .max_decimals(2);
-                        ui.add(drag);
-                        ui.label("\u{b0}");
-                    }
-                    let toggle_label = if editor.road_camber_is_percent {
-                        "Switch to \u{b0}"
-                    } else {
-                        "Switch to %"
-                    };
-                    if ui.small_button(toggle_label).clicked() {
-                        editor.road_camber_is_percent = !editor.road_camber_is_percent;
-                    }
-                    ui.response()
-                })
-                .response
-            });
+            // Camber input (DEG)
+            MenuFieldF64::new("Camber", &mut editor.road_camber_degrees, 0.0..=30.0)
+                .max_decimals(2)
+                .speed(0.05)
+                .suffix("\u{b0}")
+                .show(ui);
 
             // Shape selector
             MenuField::new("Shape").show(ui, |ui, _| {
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut editor.road_shape, RoadShape::Crown, "^ Crown");
+                    ui.selectable_value(&mut editor.road_shape, RoadShape::Crown, "Crown");
                     ui.selectable_value(
                         &mut editor.road_shape,
                         RoadShape::CrossFallRight,
-                        "/ Right",
+                        "Slant Right",
                     );
                     ui.selectable_value(
                         &mut editor.road_shape,
                         RoadShape::CrossFallLeft,
-                        "\\ Left",
+                        "Slant Left",
                     );
                     ui.response()
                 })
@@ -1367,12 +1489,12 @@ pub(crate) fn draw_road_dialog(
             }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui.button("✖ Cancel").clicked() {
+                if ui.button("Cancel").clicked() {
                     commands.push(UiCommand::CancelRoad);
                 }
                 let can_finish = n >= 2;
                 if ui
-                    .add_enabled(can_finish, egui::Button::new("✔ Finish Road"))
+                    .add_enabled(can_finish, egui::Button::new("Finish Road"))
                     .clicked()
                 {
                     commands.push(UiCommand::CommitRoad);

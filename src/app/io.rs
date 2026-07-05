@@ -21,11 +21,11 @@ pub(crate) const fn default_resize_frame_rate_cap() -> u32 {
     80
 }
 
-pub(crate) const fn default_show_world_axis_gizmo() -> bool {
-    true
+pub(crate) const fn default_block_model_interaction_resolution_divisor() -> u32 {
+    3
 }
 
-pub(crate) const fn default_show_view_cube() -> bool {
+pub(crate) const fn default_show_world_axis_gizmo() -> bool {
     true
 }
 
@@ -71,12 +71,12 @@ pub(crate) struct Config {
     pub(crate) frame_rate_cap: u32,
     #[serde(default = "default_resize_frame_rate_cap")]
     pub(crate) resize_frame_rate_cap: u32,
+    #[serde(default = "default_block_model_interaction_resolution_divisor")]
+    pub(crate) block_model_interaction_resolution_divisor: u32,
     #[serde(default)]
     pub(crate) frame_counter_enabled: bool,
     #[serde(default = "default_show_world_axis_gizmo")]
     pub(crate) show_world_axis_gizmo: bool,
-    #[serde(default = "default_show_view_cube")]
-    pub(crate) show_view_cube: bool,
 }
 
 impl Default for Config {
@@ -89,9 +89,10 @@ impl Default for Config {
             snap_poll_rate: default_snap_poll_rate(),
             frame_rate_cap: default_frame_rate_cap(),
             resize_frame_rate_cap: default_resize_frame_rate_cap(),
+            block_model_interaction_resolution_divisor:
+                default_block_model_interaction_resolution_divisor(),
             frame_counter_enabled: false,
             show_world_axis_gizmo: default_show_world_axis_gizmo(),
-            show_view_cube: default_show_view_cube(),
         }
     }
 }

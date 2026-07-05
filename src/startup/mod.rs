@@ -1,9 +1,9 @@
 //! Code that runs on program Start
 
 #[cfg(target_os = "linux")]
-mod linux;
+pub(crate) mod linux;
 #[cfg(target_os = "macos")]
-mod macos;
+pub(crate) mod macos;
 
 use crate::userspace_log;
 
@@ -66,9 +66,5 @@ pub(crate) fn init() {
             std::env::var_os("USER"),
             std::env::var_os("SHELL")
         );
-
-        if let Err(error) = macos::set_dock_icon() {
-            log::warn!("Failed to set macOS Dock icon: {error}");
-        }
     }
 }

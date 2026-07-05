@@ -158,6 +158,7 @@ impl Gui {
             .viewport_output
             .get(&egui::ViewportId::ROOT)
             .is_some_and(|output| output.repaint_delay.is_zero());
+        let ui_pointer_active = self.ctx.dragged_id().is_some();
         self.state
             .handle_platform_output(window, full_output.platform_output);
 
@@ -211,6 +212,7 @@ impl Gui {
         UiFrameOutput {
             repaint,
             geometry_dirty,
+            ui_pointer_active,
             commands,
         }
     }
@@ -908,10 +910,13 @@ fn draw_ui(
     }
 
     // Polygon finish (MakePoly)
-    if editor.poly_finish_dialog
-        && let Some((px, py)) = editor.poly_finish_dialog_px
-    {
-        crate::ui::dialogs::editing::draw_finish_polygon_dialog(root_ui, commands, editor, px, py);
+    if editor.poly_finish_dialog {
+        crate::ui::dialogs::editing::draw_finish_polygon_dialog(
+            root_ui,
+            commands,
+            editor,
+            canvas_rect,
+        );
     }
 
     // --- Canvas overlays ---
@@ -927,40 +932,16 @@ fn draw_ui(
             canvas_rect,
             overlay.camera_forward,
             overlay.camera_up,
-        );
-    }
-    if editor.show_view_cube {
-        crate::ui::elements::cursors::draw_view_cube(
-            root_ui,
-            canvas_rect,
-            overlay.camera_forward,
-            overlay.camera_up,
             commands,
         );
     }
 
-    // Colour-scale legend for the first visible, grade-coloured block model.
-    // Deliberately independent of `editor.selected_handles`: a stray canvas
-    // click clearing the selection (e.g. while interacting with the
-    // legend's own dropdown) must not make the legend itself disappear.
-    let legend_model = block_models
-        .iter()
-        .find(|model| model.visible && model.active_numeric_variable.is_some());
-    if let Some(model) = legend_model {
-        // A variable with no usable range (e.g. every rendered block is the
-        // sentinel/default value) still needs its dropdown shown — losing
-        // the whole widget here would strand the user on a variable they
-        // can't switch away from through the UI.
-        let range = crate::ui::elements::block_model::active_color_scale(model)
-            .map(|(_, min, max)| (min, max));
-        crate::ui::widgets::viewport::ColorScaleLegend::new(
-            ("block_model_color_scale_legend", model.id),
-            model,
-            range,
-            canvas_rect,
-        )
-        .show(root_ui.ctx(), commands);
-    }
+    crate::ui::widgets::viewport::ColorScaleLegend::new(
+        "block_model_color_scale_legend",
+        block_models,
+        canvas_rect,
+    )
+    .show(root_ui.ctx(), editor, commands);
 
     // Exit confirmation
     if editor.exit_confirm_open {

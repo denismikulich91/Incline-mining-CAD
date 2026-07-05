@@ -73,9 +73,10 @@ pub(crate) fn closest_t_on_segment(p: DVec2, a: DVec2, b: DVec2) -> f64 {
 
 /// Find the entity geometry nearest the cursor within `threshold_px`.
 ///
-/// Stroke vertices arrive in quads (`start, start, end, end`) per segment, so
-/// we step in 4s and measure point-to-segment distance in screen space, which
-/// handles long straight lines correctly. Fill vertices are tested as points.
+/// Rendered stroke quads emit a fixed two-triangle index pattern. We recognize
+/// that pattern and test the centerline once, rather than testing every
+/// tessellated triangle edge. Screen-space markers and round joins use other
+/// index patterns, so they fall back to the triangle-edge path below.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pick_nearest(
     records: &[PickRecord],
@@ -104,31 +105,63 @@ pub(crate) fn pick_nearest(
             rec.stroke_index_range.0 as usize,
             (rec.stroke_index_range.1 as usize).min(stroke_indices.len()),
         );
-        for triangle in stroke_indices[s0..s1].chunks_exact(3) {
-            for (a, b) in [
-                (triangle[0], triangle[1]),
-                (triangle[1], triangle[2]),
-                (triangle[2], triangle[0]),
-            ] {
-                let (Some(a), Some(b)) =
-                    (stroke_verts.get(a as usize), stroke_verts.get(b as usize))
-                else {
-                    continue;
-                };
-                let wa = DVec3::from_array(a.pos.map(f64::from)) + scene_origin;
-                let wb = DVec3::from_array(b.pos.map(f64::from)) + scene_origin;
-                if let (Some(sa), Some(sb)) = (
-                    world_to_screen(view_proj, wa, screen),
-                    world_to_screen(view_proj, wb, screen),
-                ) {
-                    let t = closest_t_on_segment(cursor, sa, sb);
-                    let dist = (sa + (sb - sa) * t).distance(cursor);
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best_hit = Some(PickHit {
-                            entity: rec.entity,
-                            world: wa + (wb - wa) * t,
-                        });
+        let mut tested_stroke_centerlines = false;
+        for quad in stroke_indices[s0..s1].chunks_exact(6) {
+            let Some(base) = stroke_line_quad_base(quad) else {
+                continue;
+            };
+            let (Some(a), Some(b)) = (stroke_verts.get(base), stroke_verts.get(base + 2)) else {
+                continue;
+            };
+            let wa = DVec3::from_array(a.pos.map(f64::from)) + scene_origin;
+            let wb = DVec3::from_array(b.pos.map(f64::from)) + scene_origin;
+            if (wb - wa).length_squared() <= f64::EPSILON {
+                continue;
+            }
+            tested_stroke_centerlines = true;
+            if let (Some(sa), Some(sb)) = (
+                world_to_screen(view_proj, wa, screen),
+                world_to_screen(view_proj, wb, screen),
+            ) {
+                let t = closest_t_on_segment(cursor, sa, sb);
+                let dist = (sa + (sb - sa) * t).distance(cursor);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_hit = Some(PickHit {
+                        entity: rec.entity,
+                        world: wa + (wb - wa) * t,
+                    });
+                }
+            }
+        }
+
+        if !tested_stroke_centerlines {
+            for triangle in stroke_indices[s0..s1].chunks_exact(3) {
+                for (a, b) in [
+                    (triangle[0], triangle[1]),
+                    (triangle[1], triangle[2]),
+                    (triangle[2], triangle[0]),
+                ] {
+                    let (Some(a), Some(b)) =
+                        (stroke_verts.get(a as usize), stroke_verts.get(b as usize))
+                    else {
+                        continue;
+                    };
+                    let wa = DVec3::from_array(a.pos.map(f64::from)) + scene_origin;
+                    let wb = DVec3::from_array(b.pos.map(f64::from)) + scene_origin;
+                    if let (Some(sa), Some(sb)) = (
+                        world_to_screen(view_proj, wa, screen),
+                        world_to_screen(view_proj, wb, screen),
+                    ) {
+                        let t = closest_t_on_segment(cursor, sa, sb);
+                        let dist = (sa + (sb - sa) * t).distance(cursor);
+                        if dist < best_dist {
+                            best_dist = dist;
+                            best_hit = Some(PickHit {
+                                entity: rec.entity,
+                                world: wa + (wb - wa) * t,
+                            });
+                        }
                     }
                 }
             }
@@ -192,6 +225,12 @@ pub(crate) fn pick_nearest(
     }
 
     best_hit
+}
+
+fn stroke_line_quad_base(indices: &[u32]) -> Option<usize> {
+    let [a, b, c, d, e, f]: [u32; 6] = indices.try_into().ok()?;
+    (d == b && c == f && a == b.wrapping_add(1) && e == b.wrapping_add(2) && c == b.wrapping_add(3))
+        .then_some(b as usize)
 }
 
 pub(crate) fn pick_text(

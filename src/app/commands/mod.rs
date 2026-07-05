@@ -66,6 +66,10 @@ impl<'a> App<'a> {
                 self.choose_open_pidb();
                 Ok(())
             }
+            UiCommand::CloseStartupDialog => {
+                self.startup_dialog_dismissed = true;
+                Ok(())
+            }
             UiCommand::SaveAllPidbs => self.save_all_dirty_projects().map(|_| ()),
             UiCommand::ImportDxfInto(index) => {
                 self.choose_import_dxf_into(index);
@@ -415,7 +419,6 @@ impl<'a> App<'a> {
             UiCommand::SetDarkMode(enabled) => self.set_dark_mode(enabled),
             UiCommand::SetShowConsole(enabled) => self.set_show_console(enabled),
             UiCommand::SetShowWorldAxisGizmo(enabled) => self.set_show_world_axis_gizmo(enabled),
-            UiCommand::SetShowViewCube(enabled) => self.set_show_view_cube(enabled),
             UiCommand::SetStandardView(view) => {
                 if let Some(graphics) = self.graphics.as_mut() {
                     graphics.set_standard_view(view);
@@ -558,7 +561,7 @@ impl<'a> App<'a> {
                 self.editor.set_selection_z_dialog =
                     Some(crate::ui::dialogs::SetSelectionZDialog {
                         object_ids: selected_objects,
-                        z_input: self.editor.z_input.clone(),
+                        z_input: self.editor.z_input,
                     });
                 Ok(())
             }
@@ -655,8 +658,8 @@ impl<'a> App<'a> {
                         (b.min.z, b.max.z)
                     })
                     .unwrap_or((0.0, 100.0));
-                self.editor.tri_cut_z_min_input = format!("{z_min:.3}");
-                self.editor.tri_cut_z_max_input = format!("{z_max:.3}");
+                self.editor.tri_cut_z_min_input = z_min;
+                self.editor.tri_cut_z_max_input = z_max;
                 self.editor.tri_cut_z_name_input = self
                     .active_triangulation
                     .and_then(|id| self.triangulations.iter().find(|t| t.id == id))

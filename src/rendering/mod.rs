@@ -22,13 +22,18 @@ pub(crate) struct SurfaceVertex {
     pub(crate) pos: [f32; 3],
 }
 
-/// Block-model surface vertex. Grade is a normalized 0..1 value, or -1 when
-/// no numeric colour variable is active for the block.
+/// One instanced block: local-space axis-aligned bounds plus grade. The
+/// vertex shader expands this into a full cube and applies the model's
+/// local->scene rotation, so a block costs 32 B instead of eight vertices plus
+/// indices. Grade is a normalized 0..1 value, or a negative sentinel when no
+/// numeric colour variable is active / the block is hidden.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Debug)]
-pub(crate) struct BlockModelVertex {
-    pub(crate) pos: [f32; 3],
+pub(crate) struct BlockInstance {
+    pub(crate) lower: [f32; 3],
     pub(crate) grade: f32,
+    pub(crate) upper: [f32; 3],
+    pub(crate) _pad: f32,
 }
 
 #[repr(C)]

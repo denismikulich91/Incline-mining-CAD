@@ -96,6 +96,7 @@ pub(crate) struct App<'a> {
     last_snap_poll_instant: Option<Instant>,
     editor: EditorState,
     workspace: Workspace,
+    startup_dialog_dismissed: bool,
     triangulations: Vec<OpenTriangulation>,
     triangulation_dirs: Vec<PathBuf>,
     /// Supported mesh paths discovered in each tracked directory. Directory
@@ -159,6 +160,7 @@ impl<'a> App<'a> {
             last_snap_poll_instant: None,
             editor: EditorState::new(),
             workspace: Workspace::default(),
+            startup_dialog_dismissed: false,
             triangulations: Vec::new(),
             triangulation_dirs: Vec::new(),
             triangulation_dir_entries: BTreeMap::new(),
@@ -216,11 +218,13 @@ impl<'a> App<'a> {
         app.editor.dark_mode = config.dark_mode;
         app.editor.show_console = config.show_console;
         app.editor.show_world_axis_gizmo = config.show_world_axis_gizmo;
-        app.editor.show_view_cube = config.show_view_cube;
         app.editor.renderer_background_color = config.renderer_background_color;
         app.editor.snap_poll_rate = config.snap_poll_rate.clamp(5, 1000);
         app.editor.frame_rate_cap = config.frame_rate_cap.clamp(20, 1000);
         app.editor.resize_frame_rate_cap = config.resize_frame_rate_cap.clamp(20, 1000);
+        app.editor.block_model_interaction_resolution_divisor = config
+            .block_model_interaction_resolution_divisor
+            .clamp(1, 64);
         app.editor.frame_counter_enabled = config.frame_counter_enabled;
 
         Ok(app)
@@ -328,6 +332,25 @@ impl<'a> App<'a> {
             graphics.invalidate_geometry();
         }
         self.redraw_requested = true;
+    }
+
+    /// Request a redraw for topology-only style/selection changes without
+    /// rebuilding the document vector scene.
+    ///
+    /// Triangulations and block models render from their own per-item GPU
+    /// caches (`triangulation_gpu` / `block_model_gpu`), which re-sync every
+    /// frame with per-id dirty checks.
+    fn request_topology_redraw(&mut self) {
+        self.redraw_requested = true;
+    }
+
+    /// Request a topology redraw and refresh cached scene bounds, without
+    /// rebuilding the document vector scene.
+    fn invalidate_topology_bounds_and_redraw(&mut self) {
+        if let Some(graphics) = self.graphics.as_mut() {
+            graphics.invalidate_scene_bounds();
+        }
+        self.request_topology_redraw();
     }
 
     /// Rebuild the snap index from the current scene document if an edit
@@ -579,7 +602,8 @@ impl<'a> App<'a> {
             triangulations,
             block_models,
             active_index: self.workspace.active_index,
-            needs_startup_dialog: self.workspace.projects.is_empty(),
+            needs_startup_dialog: self.workspace.projects.is_empty()
+                && !self.startup_dialog_dismissed,
             active_path,
             active_triangulation_for_menu,
         }
@@ -768,6 +792,11 @@ impl<'a> ApplicationHandler for App<'a> {
             .with_maximized(true);
         #[cfg(target_os = "linux")]
         let window_attributes = window_attributes.with_name(crate::APP_ID, crate::APP_ID);
+        #[cfg(target_os = "macos")]
+        if let Err(error) = crate::startup::macos::set_dock_icon() {
+            log::warn!("Failed to set macOS Dock icon: {error}");
+        }
+
         let window = match event_loop.create_window(window_attributes) {
             Ok(window) => Arc::new(window),
             Err(e) => {

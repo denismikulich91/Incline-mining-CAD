@@ -98,31 +98,6 @@ impl Camera {
         self.target = center;
         self.position = center - forward * zoom.max(MIN_ORTHO_ZOOM);
     }
-
-    pub(crate) fn set_target_orientation(
-        &mut self,
-        forward: DVec3,
-        up_hint: DVec3,
-        target_distance: f64,
-    ) {
-        let forward = forward.normalize_or(self.forward());
-        let fallback_up = if forward.z.abs() > 0.9 {
-            DVec3::Y
-        } else {
-            DVec3::Z
-        };
-        let right = {
-            let preferred = forward.cross(up_hint);
-            if preferred.length_squared() > f64::EPSILON {
-                preferred.normalize()
-            } else {
-                forward.cross(fallback_up).normalize_or(DVec3::X)
-            }
-        };
-        self.up = right.cross(forward).normalize_or(up_hint);
-        self.position = self.target - forward * target_distance.max(MIN_ORTHO_ZOOM);
-        self.sync_angles_from_forward();
-    }
 }
 
 const MIN_ORTHO_ZOOM: f64 = 1.0e-4;
@@ -193,6 +168,7 @@ pub(crate) struct CameraUniform {
     cam_forward: [f32; 4],
     cam_position: [f32; 4],
     viewport: [f32; 4],
+    inv_view_proj: [[f32; 4]; 4],
 }
 
 impl CameraUniform {
@@ -202,6 +178,7 @@ impl CameraUniform {
             cam_forward: [0.; 4],
             cam_position: [0.; 4],
             viewport: [1.0, 1.0, 0.0, 0.0],
+            inv_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
         }
     }
 
@@ -218,9 +195,9 @@ impl CameraUniform {
             camera.up,
         );
         let exaggeration = DMat4::from_scale(DVec3::new(1.0, 1.0, vertical_exaggeration));
-        self.view_proj = (projection.calc_matrix() * rebased_view * exaggeration)
-            .as_mat4()
-            .to_cols_array_2d();
+        let view_proj = projection.calc_matrix() * rebased_view * exaggeration;
+        self.view_proj = view_proj.as_mat4().to_cols_array_2d();
+        self.inv_view_proj = view_proj.inverse().as_mat4().to_cols_array_2d();
         let forward = camera.forward();
         self.cam_forward = [forward.x as f32, forward.y as f32, forward.z as f32, 0.];
         self.cam_position = [
@@ -232,7 +209,32 @@ impl CameraUniform {
     }
 
     pub(crate) fn update_viewport(&mut self, width: u32, height: u32) {
-        self.viewport = [width.max(1) as f32, height.max(1) as f32, 0.0, 0.0];
+        self.viewport = [
+            width.max(1) as f32,
+            height.max(1) as f32,
+            self.viewport[2],
+            self.viewport[3],
+        ];
+    }
+
+    /// Interaction-quality knobs packed into the otherwise-unused `viewport.zw`
+    /// so no new bind group is needed. `lod_boost` (`z`) divides the volume
+    /// raycaster's LOD footprint threshold — `> 1` coarsens bricks sooner (and
+    /// also caps its per-ray step count). `render_scale` (`w`, `0..=1`) is the
+    /// fraction of full resolution the raycast is drawn at before upscaling.
+    /// Both revert to `1.0` (full quality) when the camera settles.
+    pub(crate) fn set_interaction_quality(&mut self, lod_boost: f32, render_scale: f32) {
+        self.viewport[2] = lod_boost;
+        self.viewport[3] = render_scale;
+    }
+
+    /// Fraction of full resolution the volume raycast is currently drawn at.
+    pub(crate) fn render_scale(&self) -> f32 {
+        if self.viewport[3] <= 0.0 {
+            1.0
+        } else {
+            self.viewport[3]
+        }
     }
 }
 
@@ -253,6 +255,7 @@ pub(crate) struct CameraController {
     rotate_sensitivity: f64,
     pub(crate) mouse_loc: (f32, f32),
     orbit_anchor: Option<DVec3>,
+    view_transition: Option<ViewTransition>,
 }
 
 impl CameraController {
@@ -273,15 +276,71 @@ impl CameraController {
             rotate_sensitivity,
             mouse_loc: (0., 0.),
             orbit_anchor: None,
+            view_transition: None,
         }
     }
 
     pub(crate) fn begin_orbit(&mut self, anchor: DVec3) {
+        self.view_transition = None;
         self.orbit_anchor = Some(anchor);
     }
 
     pub(crate) fn end_orbit(&mut self) {
         self.orbit_anchor = None;
+    }
+
+    pub(crate) fn begin_view_transition(
+        &mut self,
+        camera: &Camera,
+        forward: DVec3,
+        up_hint: DVec3,
+        target_distance: f64,
+    ) {
+        let end_forward = forward.normalize_or(camera.forward());
+        let end_up = orthonormal_up(end_forward, up_hint);
+        self.view_transition = Some(ViewTransition {
+            start_forward: camera.forward(),
+            end_forward,
+            start_up: camera.up(),
+            end_up,
+            target: camera.target(),
+            distance: target_distance.max(MIN_ORTHO_ZOOM),
+            elapsed: Duration::ZERO,
+            duration: Duration::from_millis(280),
+        });
+    }
+
+    pub(crate) fn has_view_transition(&self) -> bool {
+        self.view_transition.is_some()
+    }
+
+    pub(crate) fn update_view_transition(
+        &mut self,
+        camera: &mut Camera,
+        projection: &mut Projection,
+        dt: Duration,
+    ) {
+        let Some(transition) = self.view_transition.as_mut() else {
+            return;
+        };
+
+        transition.elapsed += dt;
+        let duration = transition.duration.as_secs_f64().max(f64::EPSILON);
+        let linear_t = (transition.elapsed.as_secs_f64() / duration).clamp(0.0, 1.0);
+        let t = ease_out_cubic(linear_t);
+        let forward = slerp_unit(transition.start_forward, transition.end_forward, t);
+        let up_hint = slerp_unit(transition.start_up, transition.end_up, t);
+        let up = orthonormal_up(forward, up_hint);
+
+        camera.target = transition.target;
+        camera.position = transition.target - forward * transition.distance;
+        camera.up = up;
+        camera.sync_angles_from_forward();
+        projection.zoom = transition.distance;
+
+        if linear_t >= 1.0 {
+            self.view_transition = None;
+        }
     }
 
     pub(crate) fn process_mouse(
@@ -293,11 +352,13 @@ impl CameraController {
         if let Some(button) = mouse_pressed {
             match button {
                 MouseButton::Right => {
+                    self.view_transition = None;
                     self.rotate_horizontal += mouse_dx;
                     self.rotate_vertical += mouse_dy;
                     return true;
                 }
                 MouseButton::Middle => {
+                    self.view_transition = None;
                     // Accumulate device deltas until next frame for smooth 1:1 drag.
                     self.pan.y += mouse_dy;
                     self.pan.x += -mouse_dx;
@@ -312,6 +373,7 @@ impl CameraController {
     }
 
     pub(crate) fn process_scroll(&mut self, delta: &MouseScrollDelta) {
+        self.view_transition = None;
         self.scroll += match delta {
             // Assuming a line is about 100 pixels
             MouseScrollDelta::LineDelta(_, scroll) => *scroll as f64 * 100.0,
@@ -330,6 +392,7 @@ impl CameraController {
             || self.rotate_horizontal != 0.0
             || self.rotate_vertical != 0.0
             || self.scroll != 0.0
+            || self.view_transition.is_some()
     }
 
     pub(crate) fn update_camera(
@@ -424,6 +487,68 @@ impl CameraController {
             .abs();
         projection.zoom = dist.max(MIN_ORTHO_ZOOM);
     }
+}
+
+#[derive(Debug)]
+struct ViewTransition {
+    start_forward: DVec3,
+    end_forward: DVec3,
+    start_up: DVec3,
+    end_up: DVec3,
+    target: DVec3,
+    distance: f64,
+    elapsed: Duration,
+    duration: Duration,
+}
+
+fn ease_out_cubic(t: f64) -> f64 {
+    1.0 - (1.0 - t).powi(3)
+}
+
+fn orthonormal_up(forward: DVec3, up_hint: DVec3) -> DVec3 {
+    let fallback_up = if forward.z.abs() > 0.9 {
+        DVec3::Y
+    } else {
+        DVec3::Z
+    };
+    let right = {
+        let preferred = forward.cross(up_hint);
+        if preferred.length_squared() > f64::EPSILON {
+            preferred.normalize()
+        } else {
+            forward.cross(fallback_up).normalize_or(DVec3::X)
+        }
+    };
+    right.cross(forward).normalize_or(up_hint)
+}
+
+fn slerp_unit(from: DVec3, to: DVec3, t: f64) -> DVec3 {
+    let from = from.normalize_or_zero();
+    let to = to.normalize_or(from);
+    let dot = from.dot(to).clamp(-1.0, 1.0);
+
+    if dot > 0.9995 {
+        return from.lerp(to, t).normalize_or(to);
+    }
+
+    if dot < -0.9995 {
+        let axis = from
+            .cross(if from.z.abs() < 0.9 {
+                DVec3::Z
+            } else {
+                DVec3::Y
+            })
+            .normalize_or(DVec3::X);
+        return DQuat::from_axis_angle(axis, std::f64::consts::PI * t)
+            .mul_vec3(from)
+            .normalize_or(to);
+    }
+
+    let theta = dot.acos();
+    let sin_theta = theta.sin();
+    let a = ((1.0 - t) * theta).sin() / sin_theta;
+    let b = (t * theta).sin() / sin_theta;
+    (from * a + to * b).normalize_or(to)
 }
 
 #[derive(Debug)]

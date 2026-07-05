@@ -13,5 +13,5 @@ pub(crate) mod triangulation;
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SetSelectionZDialog {
     pub(crate) object_ids: Vec<ObjectId>,
-    pub(crate) z_input: String,
+    pub(crate) z_input: f64,
 }

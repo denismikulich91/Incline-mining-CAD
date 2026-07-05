@@ -16,7 +16,7 @@ use strum::{Display, EnumIter};
 use crate::{
     model::{
         FillStyle, LayerId, ObjectColor, ObjectId, RoadShape, SceneEntityId,
-        block_model::{BlockModelId, BlockModelSource, ColorStop},
+        block_model::{BlockModelId, BlockModelSource, ColorStop, FIRST_CUSTOM_COLOR_STOP_ID},
         formats::MeshFormat,
         triangulation::TriangulationId,
     },
@@ -35,10 +35,10 @@ pub(crate) struct PreferencesDraft {
     pub(crate) dark_mode: bool,
     pub(crate) show_console: bool,
     pub(crate) show_world_axis_gizmo: bool,
-    pub(crate) show_view_cube: bool,
     pub(crate) snap_poll_rate: u32,
     pub(crate) frame_rate_cap: u32,
     pub(crate) resize_frame_rate_cap: u32,
+    pub(crate) block_model_interaction_resolution_divisor: u32,
     pub(crate) frame_counter_enabled: bool,
 }
 
@@ -64,10 +64,11 @@ impl Default for PreferencesDraft {
             dark_mode: false,
             show_console: false,
             show_world_axis_gizmo: crate::app::io::default_show_world_axis_gizmo(),
-            show_view_cube: crate::app::io::default_show_view_cube(),
             snap_poll_rate: crate::app::io::default_snap_poll_rate(),
             frame_rate_cap: crate::app::io::default_frame_rate_cap(),
             resize_frame_rate_cap: crate::app::io::default_resize_frame_rate_cap(),
+            block_model_interaction_resolution_divisor:
+                crate::app::io::default_block_model_interaction_resolution_divisor(),
             frame_counter_enabled: false,
         }
     }
@@ -187,7 +188,7 @@ pub(crate) enum TrimEnd {
     End,
 }
 
-/// Named orientations selectable from the view cube overlay.
+/// Named orientations selectable from the orientation gizmo.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StandardView {
     Up,
@@ -244,10 +245,8 @@ pub(crate) struct EditorState {
     pub(crate) dark_mode: bool,
     /// Show the console underneath the bottom toolbar.
     pub(crate) show_console: bool,
-    /// Show the world-space axis gizmo in the bottom-left of the viewport.
+    /// Show the world-space axis gizmo in the top-right of the viewport.
     pub(crate) show_world_axis_gizmo: bool,
-    /// Show the clickable view cube above the world-space axis gizmo.
-    pub(crate) show_view_cube: bool,
     /// Linear RGBA clear colour used behind the rendered scene.
     pub(crate) renderer_background_color: [f32; 4],
     /// Unsaved values currently being edited in the Preferences tab.
@@ -255,6 +254,7 @@ pub(crate) struct EditorState {
     pub(crate) snap_poll_rate: u32,
     pub(crate) frame_rate_cap: u32,
     pub(crate) resize_frame_rate_cap: u32,
+    pub(crate) block_model_interaction_resolution_divisor: u32,
     pub(crate) frame_counter_enabled: bool,
     pub(crate) measured_fps: Option<f32>,
     pub(crate) active_tool: ActiveTool,
@@ -300,8 +300,8 @@ pub(crate) struct EditorState {
     // Cursor & snapping
     /// Z plane used for all placement operations (point, line, poly vertices).
     pub(crate) z_level: f64,
-    /// Text-field string backing the Z level input (decoupled so partial edits work).
-    pub(crate) z_input: String,
+    /// Editable Z level value used by toolbar and Set Selection Z.
+    pub(crate) z_input: f64,
     /// True when the current `cursor_world` is a snapped position (not raw ray).
     pub(crate) cursor_snapped: bool,
     /// Physical-pixel cursor position, updated on every CursorMoved event.
@@ -326,7 +326,7 @@ pub(crate) struct EditorState {
     pub(crate) xray_enabled: bool,
     pub(crate) vertical_exaggeration_dialog_open: bool,
     pub(crate) vertical_exaggeration: f64,
-    pub(crate) vertical_exaggeration_input: String,
+    pub(crate) vertical_exaggeration_input: f64,
     pub(crate) fly_mode_enabled: bool, // Not sure if this belongs here
 
     // Selection box
@@ -338,9 +338,9 @@ pub(crate) struct EditorState {
     pub(crate) offset_dialog_open: bool,
     pub(crate) offset_target_id: Option<ObjectId>,
     pub(crate) offset_projection: OffsetProjection,
-    pub(crate) offset_angle_input: String,
+    pub(crate) offset_angle_degrees: f64,
     pub(crate) offset_measure: OffsetMeasure,
-    pub(crate) offset_value_input: String,
+    pub(crate) offset_value_input: f64,
     /// Phase 2: dialog closed, waiting for canvas click to pick side.
     pub(crate) offset_awaiting_side_pick: bool,
     /// Absolute horizontal offset distance (sign determined by cursor position).
@@ -366,7 +366,7 @@ pub(crate) struct EditorState {
     pub(crate) relimit_dialog_open: bool,
     pub(crate) relimit_source_id: Option<ObjectId>,
     pub(crate) relimit_mode: RelimitMode,
-    pub(crate) relimit_value_input: String,
+    pub(crate) relimit_value_input: f64,
     /// Phase 0: tool active, no source selected yet — waiting for canvas click to pick source.
     pub(crate) relimit_awaiting_source_pick: bool,
     /// Phase 1: source selected, dialog closed — waiting for canvas click to pick target line.
@@ -503,8 +503,8 @@ pub(crate) struct EditorState {
     // Cut Triangulation by Z Range
     pub(crate) tri_cut_z_open: bool,
     pub(crate) tri_cut_z_tri_id: Option<TriangulationId>,
-    pub(crate) tri_cut_z_min_input: String,
-    pub(crate) tri_cut_z_max_input: String,
+    pub(crate) tri_cut_z_min_input: f64,
+    pub(crate) tri_cut_z_max_input: f64,
     pub(crate) tri_cut_z_name_input: String,
 
     // Cut Triangulation by Surface
@@ -529,20 +529,23 @@ pub(crate) struct EditorState {
     // Contour Generation
     pub(crate) tri_contour_open: bool,
     pub(crate) tri_contour_tri_id: Option<TriangulationId>,
-    pub(crate) tri_contour_major_interval_input: String,
-    pub(crate) tri_contour_minor_interval_input: String,
+    pub(crate) tri_contour_major_interval_input: f64,
+    pub(crate) tri_contour_minor_interval_input: f64,
     pub(crate) tri_contour_major_color: [f32; 4],
     pub(crate) tri_contour_minor_color: [f32; 4],
     pub(crate) tri_contour_project_index: usize,
 
     // Block Models
     pub(crate) block_model_table_pages: HashMap<BlockModelId, usize>,
+    pub(crate) viewport_block_model_id: Option<BlockModelId>,
+    pub(crate) block_model_variable_ranges: HashMap<(BlockModelId, String), Option<(f64, f64)>>,
+    pub(crate) next_color_stop_id: u64,
     pub(crate) ore_triangulation_open: bool,
     pub(crate) ore_block_model_id: Option<BlockModelId>,
     pub(crate) ore_variable: String,
     pub(crate) ore_filter_mode: OreFilterMode,
-    pub(crate) ore_min_input: String,
-    pub(crate) ore_max_input: String,
+    pub(crate) ore_min_input: f64,
+    pub(crate) ore_max_input: f64,
     pub(crate) ore_name_input: String,
 
     // Road tool
@@ -550,7 +553,6 @@ pub(crate) struct EditorState {
     pub(crate) road_width: f64,
     pub(crate) road_max_angle_degrees: f64,
     pub(crate) road_camber_degrees: f64,
-    pub(crate) road_camber_is_percent: bool,
     pub(crate) road_shape: RoadShape,
     pub(crate) road_preview_left_world: Vec<DVec3>,
     pub(crate) road_preview_right_world: Vec<DVec3>,
@@ -623,16 +625,23 @@ impl EditorState {
             dark_mode: self.dark_mode,
             show_console: self.show_console,
             show_world_axis_gizmo: self.show_world_axis_gizmo,
-            show_view_cube: self.show_view_cube,
             snap_poll_rate: self.snap_poll_rate,
             frame_rate_cap: self.frame_rate_cap,
             resize_frame_rate_cap: self.resize_frame_rate_cap,
+            block_model_interaction_resolution_divisor: self
+                .block_model_interaction_resolution_divisor,
             frame_counter_enabled: self.frame_counter_enabled,
         }
     }
 
     pub(crate) fn reset_preferences_draft(&mut self) {
         self.preferences_draft = Some(self.current_preferences());
+    }
+
+    pub(crate) fn allocate_color_stop_id(&mut self) -> u64 {
+        let id = self.next_color_stop_id;
+        self.next_color_stop_id = self.next_color_stop_id.saturating_add(1);
+        id
     }
 
     pub(crate) fn new() -> Self {
@@ -645,12 +654,13 @@ impl EditorState {
             dark_mode: false,
             show_console: false,
             show_world_axis_gizmo: crate::app::io::default_show_world_axis_gizmo(),
-            show_view_cube: crate::app::io::default_show_view_cube(),
             renderer_background_color: crate::app::io::default_renderer_background_color(),
             preferences_draft: None,
             snap_poll_rate: crate::app::io::default_snap_poll_rate(),
             frame_rate_cap: crate::app::io::default_frame_rate_cap(),
             resize_frame_rate_cap: crate::app::io::default_resize_frame_rate_cap(),
+            block_model_interaction_resolution_divisor:
+                crate::app::io::default_block_model_interaction_resolution_divisor(),
             frame_counter_enabled: false,
             measured_fps: None,
             active_tool: ActiveTool::None,
@@ -680,7 +690,7 @@ impl EditorState {
             editing_labels_id: None,
             cursor_snapped: false,
             z_level: 0.0,
-            z_input: "0".to_owned(),
+            z_input: 0.0,
             cursor_screen_px: None,
             poly_finish_dialog: false,
             poly_finish_dialog_px: None,
@@ -693,16 +703,16 @@ impl EditorState {
             xray_enabled: false,
             vertical_exaggeration_dialog_open: false,
             vertical_exaggeration: 1.0,
-            vertical_exaggeration_input: "1.0".to_string(),
+            vertical_exaggeration_input: 1.,
             fly_mode_enabled: false,
             selection_box_start_px: None,
             selection_box_current_px: None,
             offset_dialog_open: false,
             offset_target_id: None,
             offset_projection: OffsetProjection::Horizontal,
-            offset_angle_input: "60".to_owned(),
+            offset_angle_degrees: 60.0,
             offset_measure: OffsetMeasure::Distance,
-            offset_value_input: String::new(),
+            offset_value_input: 0.0,
             offset_awaiting_side_pick: false,
             offset_horiz_dist: 0.0,
             offset_z_delta: 0.0,
@@ -715,7 +725,7 @@ impl EditorState {
             relimit_dialog_open: false,
             relimit_source_id: None,
             relimit_mode: RelimitMode::Intersect,
-            relimit_value_input: String::new(),
+            relimit_value_input: 0.0,
             relimit_awaiting_source_pick: false,
             relimit_waiting_for_pick: false,
             relimit_confirming_end: false,
@@ -791,8 +801,8 @@ impl EditorState {
             tri_cut_poly_name_input: String::new(),
             tri_cut_z_open: false,
             tri_cut_z_tri_id: None,
-            tri_cut_z_min_input: String::new(),
-            tri_cut_z_max_input: String::new(),
+            tri_cut_z_min_input: 0.0,
+            tri_cut_z_max_input: 100.0,
             tri_cut_z_name_input: String::new(),
             tri_cut_surface_open: false,
             tri_cut_surface_target_id: None,
@@ -809,24 +819,26 @@ impl EditorState {
             tri_include_solid_name_input: String::new(),
             tri_contour_open: false,
             tri_contour_tri_id: None,
-            tri_contour_major_interval_input: "10.0".to_owned(),
-            tri_contour_minor_interval_input: "2.0".to_owned(),
+            tri_contour_major_interval_input: 10.0,
+            tri_contour_minor_interval_input: 2.0,
             tri_contour_major_color: [1.0, 0.5, 0.0, 1.0],
             tri_contour_minor_color: [0.8, 0.8, 0.8, 1.0],
             tri_contour_project_index: 0,
             block_model_table_pages: HashMap::new(),
+            viewport_block_model_id: None,
+            block_model_variable_ranges: HashMap::new(),
+            next_color_stop_id: FIRST_CUSTOM_COLOR_STOP_ID,
             ore_triangulation_open: false,
             ore_block_model_id: None,
             ore_variable: String::new(),
             ore_filter_mode: OreFilterMode::GreaterOrEqual,
-            ore_min_input: "0.0".to_owned(),
-            ore_max_input: "1.0".to_owned(),
+            ore_min_input: 0.0,
+            ore_max_input: 1.0,
             ore_name_input: String::new(),
             road_dialog_open: false,
             road_width: 50.0,
             road_max_angle_degrees: 15.0,
-            road_camber_degrees: 2.0,
-            road_camber_is_percent: false,
+            road_camber_degrees: 1.73,
             road_shape: RoadShape::Crown,
             road_preview_left_world: Vec::new(),
             road_preview_right_world: Vec::new(),
@@ -839,7 +851,7 @@ impl EditorState {
             road_preview_affected_edges: Vec::new(),
             batter_berm_dialog_open: false,
             batter_berm_target_id: None,
-            batter_berm_width: 5.0,
+            batter_berm_width: 8.0,
             batter_berm_angle: 60.0,
             batter_berm_bench_height: 12.0,
             batter_berm_benches: 1,
@@ -1009,12 +1021,32 @@ pub(crate) enum EditorAction {
 }
 
 /// Cursor interaction mode for canvas picks.
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 pub(crate) enum CursorMode {
     Select,
     SnapToSurface,
     SnapToLine,
     SnapToPoint,
+}
+
+impl CursorMode {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            CursorMode::Select => CursorMode::SnapToSurface,
+            CursorMode::SnapToSurface => CursorMode::SnapToLine,
+            CursorMode::SnapToLine => CursorMode::SnapToPoint,
+            CursorMode::SnapToPoint => CursorMode::Select,
+        }
+    }
+
+    pub(crate) fn previous(self) -> Self {
+        match self {
+            CursorMode::Select => CursorMode::SnapToPoint,
+            CursorMode::SnapToSurface => CursorMode::Select,
+            CursorMode::SnapToLine => CursorMode::SnapToSurface,
+            CursorMode::SnapToPoint => CursorMode::SnapToLine,
+        }
+    }
 }
 
 /// Fill pattern for closed polylines.
@@ -1046,6 +1078,7 @@ impl ToolHatch {
 pub(crate) enum UiCommand {
     NewPidb,
     OpenPidb,
+    CloseStartupDialog,
     SaveAllPidbs,
     ImportDxfInto(usize),
     ImportTriangulation,
@@ -1081,7 +1114,6 @@ pub(crate) enum UiCommand {
     SetDarkMode(bool),
     SetShowConsole(bool),
     SetShowWorldAxisGizmo(bool),
-    SetShowViewCube(bool),
     SetStandardView(StandardView),
     ApplyPreferences(PreferencesDraft),
     OpenPreferences,
@@ -1301,6 +1333,10 @@ pub(crate) enum UiCommand {
 pub(crate) struct UiFrameOutput {
     pub(crate) repaint: bool,
     pub(crate) geometry_dirty: bool,
+    /// The pointer is actively pressed on an egui widget this frame (e.g.
+    /// dragging a colour-gradient stop). Used to drop the volume raycaster to
+    /// its low-quality interaction path, like camera drags and resizing.
+    pub(crate) ui_pointer_active: bool,
     pub(crate) commands: Vec<UiCommand>,
 }
 

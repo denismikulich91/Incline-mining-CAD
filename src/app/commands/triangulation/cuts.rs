@@ -393,9 +393,10 @@ pub(super) fn clip_topology_to_pit_shell(
     topology: &tri00t::Triangulation,
     envelope: &PitShellLowerEnvelope,
 ) -> (Vec<tri00t::Vertex>, Vec<[u32; 3]>) {
+    use rayon::prelude::*;
+
     let topology_vertices = topology.vertices();
-    let mut output_vertices = Vec::new();
-    let mut output_faces = Vec::new();
+    let topology_faces: Vec<[usize; 3]> = topology.face_vertex_indices_iter().collect();
 
     let pass_through = |target: &[tri00t::Vertex; 3],
                         vertices: &mut Vec<tri00t::Vertex>,
@@ -405,75 +406,103 @@ pub(super) fn clip_topology_to_pit_shell(
         faces.push([base, base + 1, base + 2]);
     };
 
-    for face in topology.face_vertex_indices_iter() {
-        let target = [
-            topology_vertices[face[0]],
-            topology_vertices[face[1]],
-            topology_vertices[face[2]],
-        ];
-        let bounds = triangle_xy_bounds(target);
-        let candidates =
-            envelope
-                .spatial
-                .xy_bounds_candidate_indices(&envelope.mesh, bounds.0, bounds.1);
+    let task_count = rayon::current_num_threads().saturating_mul(4).max(1);
+    let chunk_size = topology_faces.len().div_ceil(task_count).max(1);
+    let partials: Vec<(Vec<tri00t::Vertex>, Vec<[u32; 3]>)> = topology_faces
+        .par_chunks(chunk_size)
+        .map(|chunk| {
+            let mut chunk_vertices = Vec::new();
+            let mut chunk_faces = Vec::new();
+            let mut candidate_stack = Vec::new();
+            let mut fragments: Vec<Vec<SurfaceClipVertex>> = Vec::new();
 
-        if candidates.is_empty() {
-            // Beyond even the envelope's padding: keep the original geometry.
-            pass_through(&target, &mut output_vertices, &mut output_faces);
-            continue;
-        }
+            for face in chunk.iter().copied() {
+                let target = [
+                    topology_vertices[face[0]],
+                    topology_vertices[face[1]],
+                    topology_vertices[face[2]],
+                ];
+                let bounds = triangle_xy_bounds(target);
 
-        // Fragment the triangle across the overlapping cells. `height_delta` is linear over
-        // each fragment, so a positive delta at some overlap vertex is exactly the condition
-        // for that cell to excavate part of the triangle.
-        let mut fragments: Vec<Vec<SurfaceClipVertex>> = Vec::new();
-        let mut any_excavated = false;
-        for index in candidates {
-            let cell = envelope.triangles[index];
-            let overlap = clip_target_triangle_to_reference_xy(target, cell);
-            if overlap.len() < 3 {
-                continue;
+                // Fragment the triangle across the overlapping cells. `height_delta` is linear
+                // over each fragment, so a positive delta at some overlap vertex is exactly the
+                // condition for that cell to excavate part of the triangle.
+                fragments.clear();
+                let mut saw_candidate = false;
+                let mut any_excavated = false;
+                envelope
+                    .spatial
+                    .for_each_xy_bounds_candidate_index_with_stack(
+                        bounds.0,
+                        bounds.1,
+                        &mut candidate_stack,
+                        |index| {
+                            saw_candidate = true;
+                            let cell = envelope.triangles[index];
+                            let overlap = clip_target_triangle_to_reference_xy(target, cell);
+                            if overlap.len() < 3 {
+                                return;
+                            }
+                            if !envelope.covered[index] {
+                                fragments.push(
+                                    overlap
+                                        .into_iter()
+                                        .map(|point| SurfaceClipVertex {
+                                            point,
+                                            height_delta: 0.0,
+                                        })
+                                        .collect(),
+                                );
+                                return;
+                            }
+                            let polygon: Vec<SurfaceClipVertex> = overlap
+                                .into_iter()
+                                .map(|point| {
+                                    let reference_z = bary_z(point.x, point.y, cell);
+                                    SurfaceClipVertex {
+                                        point,
+                                        height_delta: point.z - reference_z,
+                                    }
+                                })
+                                .collect();
+                            if polygon.iter().any(|vertex| vertex.height_delta > 1e-9) {
+                                any_excavated = true;
+                            }
+                            // Keep the part below the envelope (height_delta <= 0): the shell
+                            // floats above the terrain there and removes nothing.
+                            fragments
+                                .push(clip_surface_polygon(polygon, TriSurfaceCutSide::CutTop));
+                        },
+                    );
+
+                if !saw_candidate || !any_excavated {
+                    // Beyond even the envelope's padding, or nothing under this triangle is
+                    // excavated (open cells only, or the shell floats above the terrain
+                    // everywhere here): keep it whole and unfragmented.
+                    pass_through(&target, &mut chunk_vertices, &mut chunk_faces);
+                    continue;
+                }
+
+                for fragment in &fragments {
+                    append_surface_clip_polygon(fragment, &mut chunk_vertices, &mut chunk_faces);
+                }
             }
-            if !envelope.covered[index] {
-                fragments.push(
-                    overlap
-                        .into_iter()
-                        .map(|point| SurfaceClipVertex {
-                            point,
-                            height_delta: 0.0,
-                        })
-                        .collect(),
-                );
-                continue;
-            }
-            let polygon: Vec<SurfaceClipVertex> = overlap
+
+            (chunk_vertices, chunk_faces)
+        })
+        .collect();
+
+    let mut output_vertices =
+        Vec::with_capacity(partials.iter().map(|(vertices, _)| vertices.len()).sum());
+    let mut output_faces = Vec::with_capacity(partials.iter().map(|(_, faces)| faces.len()).sum());
+    for (vertices, faces) in partials {
+        let base = output_vertices.len() as u32;
+        output_vertices.extend(vertices);
+        output_faces.extend(
+            faces
                 .into_iter()
-                .map(|point| {
-                    let reference_z = bary_z(point.x, point.y, cell);
-                    SurfaceClipVertex {
-                        point,
-                        height_delta: point.z - reference_z,
-                    }
-                })
-                .collect();
-            if polygon.iter().any(|vertex| vertex.height_delta > 1e-9) {
-                any_excavated = true;
-            }
-            // Keep the part below the envelope (height_delta <= 0): the shell floats above
-            // the terrain there and removes nothing.
-            fragments.push(clip_surface_polygon(polygon, TriSurfaceCutSide::CutTop));
-        }
-
-        if !any_excavated {
-            // Nothing under this triangle is excavated (open cells only, or the shell
-            // floats above the terrain everywhere here): keep it whole and unfragmented.
-            pass_through(&target, &mut output_vertices, &mut output_faces);
-            continue;
-        }
-
-        for fragment in &fragments {
-            append_surface_clip_polygon(fragment, &mut output_vertices, &mut output_faces);
-        }
+                .map(|face| [base + face[0], base + face[1], base + face[2]]),
+        );
     }
 
     (output_vertices, output_faces)
@@ -518,7 +547,7 @@ pub(super) fn validate_reference_surface(
     Ok(prepared)
 }
 
-fn reference_xy_overlap_area_tolerance(reference: &tri00t::Triangulation) -> f64 {
+pub(super) fn reference_xy_overlap_area_tolerance(reference: &tri00t::Triangulation) -> f64 {
     let bounds = reference.bounds();
     let dx = bounds.max.x - bounds.min.x;
     let dy = bounds.max.y - bounds.min.y;
@@ -586,7 +615,7 @@ pub(super) fn prepare_pit_shell_surface(
     })
 }
 
-fn triangle_area_3d(triangle: [tri00t::Vertex; 3]) -> f64 {
+pub(super) fn triangle_area_3d(triangle: [tri00t::Vertex; 3]) -> f64 {
     let a = glam::DVec3::new(triangle[0].x, triangle[0].y, triangle[0].z);
     let b = glam::DVec3::new(triangle[1].x, triangle[1].y, triangle[1].z);
     let c = glam::DVec3::new(triangle[2].x, triangle[2].y, triangle[2].z);
@@ -599,6 +628,7 @@ fn triangle_area_3d(triangle: [tri00t::Vertex; 3]) -> f64 {
 /// remove topology and carry no meaningful Z.
 #[derive(Debug)]
 pub(super) struct PitShellLowerEnvelope {
+    #[cfg_attr(not(test), allow(dead_code))]
     mesh: tri00t::Triangulation,
     triangles: Vec<[tri00t::Vertex; 3]>,
     covered: Vec<bool>,
@@ -608,7 +638,7 @@ pub(super) struct PitShellLowerEnvelope {
 /// How far beyond the shell bounds the envelope's open padding cells extend (metres).
 /// Larger than any real survey extent, so every topology triangle lands inside the padded
 /// triangulation and is handled by the same per-cell path.
-const ENVELOPE_PADDING: f64 = 1.0e7;
+pub(super) const ENVELOPE_PADDING: f64 = 1.0e7;
 
 /// Build the pit shell's lower envelope: the single-valued 2.5D surface giving, at every
 /// XY point of the shell's footprint, the lowest shell surface there. This reduces the
@@ -629,7 +659,8 @@ const ENVELOPE_PADDING: f64 = 1.0e7;
 pub(super) fn build_pit_shell_lower_envelope(
     pit_shell: &PreparedReferenceSurface,
 ) -> Result<PitShellLowerEnvelope> {
-    use spade::{ConstrainedDelaunayTriangulation, Point2};
+    use rayon::prelude::*;
+    use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation as _};
 
     // Work in coordinates local to the shell's minimum corner: at real-world (UTM-scale)
     // magnitudes the absolute coordinates would erode the precision of the CDT's
@@ -638,60 +669,114 @@ pub(super) fn build_pit_shell_lower_envelope(
     let origin = glam::DVec2::new(bounds.min.x, bounds.min.y);
     let extent = glam::DVec2::new(bounds.max.x - bounds.min.x, bounds.max.y - bounds.min.y);
 
-    let mut cdt: ConstrainedDelaunayTriangulation<Point2<f64>> =
-        ConstrainedDelaunayTriangulation::new();
+    // Dedup projected points exactly (by bit pattern, with -0.0 normalised so it cannot
+    // alias 0.0 under spade's positional dedup) and collect each undirected edge once, so
+    // the CDT can be bulk-loaded instead of point-located per triangle corner — the
+    // incremental build dominated the whole cut on large shells. Only edges the bulk
+    // loader rejects as conflicting (crossing another constraint in projection, i.e.
+    // walls over benches) go through the splitting insert.
+    let normalized = |value: f64| if value == 0.0 { 0.0 } else { value };
+    let mut points: Vec<Point2<f64>> = Vec::with_capacity(pit_shell.triangles.len() + 4);
     for (corner_x, corner_y) in [
         (-ENVELOPE_PADDING, -ENVELOPE_PADDING),
         (extent.x + ENVELOPE_PADDING, -ENVELOPE_PADDING),
         (extent.x + ENVELOPE_PADDING, extent.y + ENVELOPE_PADDING),
         (-ENVELOPE_PADDING, extent.y + ENVELOPE_PADDING),
     ] {
-        cdt.insert(Point2::new(corner_x, corner_y))
-            .map_err(|error| anyhow::anyhow!("Pit shell CDT insert failed: {error:?}"))?;
+        points.push(Point2::new(corner_x, corner_y));
     }
+    let mut point_indices: HashMap<(u64, u64), usize> = HashMap::new();
+    let mut edges: HashSet<(usize, usize)> = HashSet::new();
     for triangle in &pit_shell.triangles {
-        let mut handles = Vec::with_capacity(3);
-        for point in triangle {
+        let mut indices = [0usize; 3];
+        for (slot, point) in triangle.iter().enumerate() {
             if !point.x.is_finite() || !point.y.is_finite() {
                 anyhow::bail!("Pit shell contains non-finite coordinates");
             }
-            let handle = cdt
-                .insert(Point2::new(point.x - origin.x, point.y - origin.y))
-                .map_err(|error| anyhow::anyhow!("Pit shell CDT insert failed: {error:?}"))?;
-            handles.push(handle);
+            let local_x = normalized(point.x - origin.x);
+            let local_y = normalized(point.y - origin.y);
+            indices[slot] = *point_indices
+                .entry((local_x.to_bits(), local_y.to_bits()))
+                .or_insert_with(|| {
+                    points.push(Point2::new(local_x, local_y));
+                    points.len() - 1
+                });
         }
         for i in 0..3 {
-            let a = handles[i];
-            let b = handles[(i + 1) % 3];
+            let a = indices[i];
+            let b = indices[(i + 1) % 3];
             if a != b {
-                cdt.add_constraint_and_split(a, b, |point| point);
+                edges.insert(if a < b { (a, b) } else { (b, a) });
             }
         }
     }
+    let mut edge_list: Vec<[usize; 2]> = edges.into_iter().map(|(a, b)| [a, b]).collect();
+    edge_list.sort_unstable();
 
-    let mut vertices = Vec::new();
-    let mut faces = Vec::new();
-    let mut triangles = Vec::new();
-    let mut covered = Vec::new();
-    for face in cdt.inner_faces() {
-        let corners = face.vertices().map(|vertex| {
-            let position = vertex.position();
-            glam::DVec2::new(position.x + origin.x, position.y + origin.y)
+    let point_count = points.len();
+    let mut conflicting_edges: Vec<[usize; 2]> = Vec::new();
+    let mut cdt: ConstrainedDelaunayTriangulation<Point2<f64>> =
+        ConstrainedDelaunayTriangulation::try_bulk_load_cdt(points, edge_list, |edge| {
+            conflicting_edges.push(edge)
+        })
+        .map_err(|error| anyhow::anyhow!("Pit shell CDT bulk load failed: {error:?}"))?;
+    // Our exact dedup means spade removed no duplicates, so bulk-load vertex indices
+    // (which the conflict callback reports) still match ours; anything else would make
+    // the splitting inserts below connect the wrong points.
+    if cdt.num_vertices() != point_count {
+        anyhow::bail!("Pit shell CDT dropped vertices unexpectedly during bulk load");
+    }
+    for [a, b] in conflicting_edges {
+        cdt.add_constraint_and_split(
+            spade::handles::FixedVertexHandle::from_index(a),
+            spade::handles::FixedVertexHandle::from_index(b),
+            |point| point,
+        );
+    }
+
+    let cells: Vec<[glam::DVec2; 3]> = cdt
+        .inner_faces()
+        .map(|face| {
+            face.vertices().map(|vertex| {
+                let position = vertex.position();
+                glam::DVec2::new(position.x + origin.x, position.y + origin.y)
+            })
+        })
+        .collect();
+    let classified: Vec<([tri00t::Vertex; 3], bool)> = cells
+        .par_iter()
+        .fold(
+            || (Vec::new(), Vec::new()),
+            |(mut candidate_stack, mut output), corners| {
+                let centroid = (corners[0] + corners[1] + corners[2]) / 3.0;
+                let lowest =
+                    lowest_covering_shell_triangle(pit_shell, centroid, &mut candidate_stack);
+                let cell = corners.map(|corner| {
+                    let z = lowest.map_or(0.0, |lowest| bary_z(corner.x, corner.y, lowest));
+                    tri00t::Vertex::new(corner.x, corner.y, z)
+                });
+                if triangle_xy_area(cell).abs() > 1e-12 {
+                    output.push((cell, lowest.is_some()));
+                }
+                (candidate_stack, output)
+            },
+        )
+        .map(|(_, output)| output)
+        .reduce(Vec::new, |mut left, right| {
+            left.extend(right);
+            left
         });
-        let centroid = (corners[0] + corners[1] + corners[2]) / 3.0;
-        let lowest = lowest_covering_shell_triangle(pit_shell, centroid);
-        let cell = corners.map(|corner| {
-            let z = lowest.map_or(0.0, |lowest| bary_z(corner.x, corner.y, lowest));
-            tri00t::Vertex::new(corner.x, corner.y, z)
-        });
-        if triangle_xy_area(cell).abs() <= 1e-12 {
-            continue;
-        }
+
+    let mut vertices = Vec::with_capacity(classified.len() * 3);
+    let mut faces = Vec::with_capacity(classified.len());
+    let mut triangles = Vec::with_capacity(classified.len());
+    let mut covered = Vec::with_capacity(classified.len());
+    for (cell, is_covered) in classified {
         let base = vertices.len() as u32;
         vertices.extend_from_slice(&cell);
         faces.push([base, base + 1, base + 2]);
         triangles.push(cell);
-        covered.push(lowest.is_some());
+        covered.push(is_covered);
     }
 
     if !covered.iter().any(|&is_covered| is_covered) {
@@ -713,25 +798,25 @@ pub(super) fn build_pit_shell_lower_envelope(
 fn lowest_covering_shell_triangle(
     pit_shell: &PreparedReferenceSurface,
     point: glam::DVec2,
+    candidate_stack: &mut Vec<usize>,
 ) -> Option<[tri00t::Vertex; 3]> {
     let mut lowest: Option<(f64, [tri00t::Vertex; 3])> = None;
-    for index in pit_shell
+    pit_shell
         .spatial
-        .xy_bounds_candidate_indices(&pit_shell.mesh, point, point)
-    {
-        let triangle = pit_shell.triangles[index];
-        if let Some(z) = point_in_triangle_bary_z(point.x, point.y, triangle)
-            && lowest.is_none_or(|(lowest_z, _)| z < lowest_z)
-        {
-            lowest = Some((z, triangle));
-        }
-    }
+        .for_each_xy_bounds_candidate_index_with_stack(point, point, candidate_stack, |index| {
+            let triangle = pit_shell.triangles[index];
+            if let Some(z) = point_in_triangle_bary_z(point.x, point.y, triangle)
+                && lowest.is_none_or(|(lowest_z, _)| z < lowest_z)
+            {
+                lowest = Some((z, triangle));
+            }
+        });
     lowest.map(|(_, triangle)| triangle)
 }
 
 /// Barycentric Z of `(x, y)` on triangle `v`, inclusive of XY edges. `None` outside the
 /// triangle or when its XY projection is degenerate.
-fn point_in_triangle_bary_z(x: f64, y: f64, v: [tri00t::Vertex; 3]) -> Option<f64> {
+pub(super) fn point_in_triangle_bary_z(x: f64, y: f64, v: [tri00t::Vertex; 3]) -> Option<f64> {
     let denom = (v[1].y - v[2].y) * (v[0].x - v[2].x) + (v[2].x - v[1].x) * (v[0].y - v[2].y);
     if denom.abs() < 1e-12 {
         return None;
@@ -841,6 +926,9 @@ pub(super) fn clip_target_triangle_to_reference_xy(
     target: [tri00t::Vertex; 3],
     reference: [tri00t::Vertex; 3],
 ) -> Vec<glam::DVec3> {
+    if !triangles_overlap_xy_sat(target, reference) {
+        return Vec::new();
+    }
     let mut polygon: Vec<glam::DVec3> = target
         .iter()
         .map(|point| glam::DVec3::new(point.x, point.y, point.z))
@@ -859,6 +947,64 @@ pub(super) fn clip_target_triangle_to_reference_xy(
         }
     }
     polygon
+}
+
+#[inline(always)]
+fn triangles_overlap_xy_sat(a: [tri00t::Vertex; 3], b: [tri00t::Vertex; 3]) -> bool {
+    for triangle in [a, b] {
+        for edge_index in 0..3 {
+            if separates_triangles_xy(a, b, triangle[edge_index], triangle[(edge_index + 1) % 3]) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+#[inline(always)]
+fn separates_triangles_xy(
+    a: [tri00t::Vertex; 3],
+    b: [tri00t::Vertex; 3],
+    edge_a: tri00t::Vertex,
+    edge_b: tri00t::Vertex,
+) -> bool {
+    let edge_x = edge_b.x - edge_a.x;
+    let edge_y = edge_b.y - edge_a.y;
+    let edge_len_sq = edge_x * edge_x + edge_y * edge_y;
+    if edge_len_sq <= f64::EPSILON {
+        return false;
+    }
+
+    let (a_min, a_max) = project_triangle_onto_edge_normal_xy(a, edge_a, edge_x, edge_y);
+    let (b_min, b_max) = project_triangle_onto_edge_normal_xy(b, edge_a, edge_x, edge_y);
+    let gap = if a_max < b_min {
+        b_min - a_max
+    } else if b_max < a_min {
+        a_min - b_max
+    } else {
+        return false;
+    };
+
+    const XY_TOL_SQ: f64 = crate::model::kernel::XY_TOL * crate::model::kernel::XY_TOL;
+    gap * gap > XY_TOL_SQ * edge_len_sq
+}
+
+#[inline(always)]
+fn project_triangle_onto_edge_normal_xy(
+    triangle: [tri00t::Vertex; 3],
+    edge_a: tri00t::Vertex,
+    edge_x: f64,
+    edge_y: f64,
+) -> (f64, f64) {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for point in triangle {
+        let projected = edge_x * (point.y - edge_a.y) - edge_y * (point.x - edge_a.x);
+        min = min.min(projected);
+        max = max.max(projected);
+    }
+    (min, max)
 }
 
 pub(super) fn clip_polygon_3d_by_xy_edge(
@@ -1402,6 +1548,49 @@ mod tests {
                 "interior shell patch should not remain covered by topology"
             );
         }
+    }
+
+    /// Timing run of the full pit-shell cut on large local data. Run with
+    /// `cargo test --release -- --ignored` when the files are present.
+    #[test]
+    #[ignore]
+    fn diag_pit_shell_cut_large_local_data() {
+        let home = std::env::var("HOME").unwrap();
+        let topology = crate::model::formats::read_mesh(format!("{home}/Downloads/NW_Surface.obj"))
+            .expect("topo loads");
+        let pit_shell = crate::model::formats::read_mesh(format!(
+            "{home}/Downloads/20250520_ob35_604rl_osa.00t"
+        ))
+        .expect("pit shell loads");
+        eprintln!(
+            "topology {} faces, shell {} faces",
+            topology.face_count(),
+            pit_shell.face_count()
+        );
+
+        let start = std::time::Instant::now();
+        let prepared = prepare_pit_shell_surface(&pit_shell).expect("prepare");
+        eprintln!("prepare_pit_shell_surface: {:.2?}", start.elapsed());
+        let start = std::time::Instant::now();
+        let envelope = build_pit_shell_lower_envelope(&prepared).expect("envelope");
+        eprintln!(
+            "build_pit_shell_lower_envelope: {:.2?} ({} cells)",
+            start.elapsed(),
+            envelope.triangles.len()
+        );
+        let start = std::time::Instant::now();
+        let (verts, faces) = clip_topology_to_pit_shell(&topology, &envelope);
+        eprintln!(
+            "clip_topology_to_pit_shell: {:.2?} ({} verts, {} faces)",
+            start.elapsed(),
+            verts.len(),
+            faces.len()
+        );
+        assert!(!faces.is_empty());
+        assert!(
+            faces.len() < topology.face_count() + 4_000_000,
+            "unexpected output explosion"
+        );
     }
 
     #[test]

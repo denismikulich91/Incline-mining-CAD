@@ -36,6 +36,10 @@ pub struct DesignPoint {
     /// Whether the owning object (type-03 header) is a closed polygon. Vulcan
     /// does not repeat the first point, so closure can only come from this flag.
     pub closed: bool,
+    /// Vulcan object colour index from the owning type-03 header (byte 60), if
+    /// present. Maps to RGB through a project colour standard; `None` when the
+    /// field is blank or the point has no owning POLY header.
+    pub color_index: Option<u8>,
     pub x: f64,
     pub y: f64,
     pub z: f64,
@@ -55,7 +59,12 @@ pub struct DesignText {
     pub z: f64,
     /// Character height in world units.
     pub height: f64,
+    /// Baseline rotation in degrees, normalised to `[0, 360)` to match
+    /// Vulcan's "Drafting Angle" display.
     pub rotation_degrees: f64,
+    /// Vulcan object colour index from the text's type-04/0a header (byte 60),
+    /// if present. `None` when the field is blank.
+    pub color_index: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -239,6 +248,7 @@ fn scan_dgd_points(data: &[u8]) -> Vec<DesignPoint> {
                 seg_type,
                 geometry_kind: infer_dgd_geometry_kind(data, i),
                 closed: false,
+                color_index: None,
                 x,
                 y,
                 z,
@@ -527,15 +537,26 @@ struct DgdObjectHeader {
     kind: DgdObjectKind,
     /// Digit field at byte 76 of type-03 headers: `1` marks a closed polygon.
     closed: bool,
+    /// Vulcan colour index: the space-padded integer field at bytes 60..62 of
+    /// type-03 headers. `None` when blank/unparseable.
+    color_index: Option<u8>,
 }
 
 /// Scan for object header records: a type byte, a flag byte, a 40-byte
-/// space-padded name ("POLY", "3DTEXT", a reactive-text label, ...), eight
-/// zero bytes, then space/digit attribute fields for the rest of the record.
+/// space-padded name ("POLY", "3DTEXT", a reactive-text label, ...), then
+/// attribute fields. A plain POLY leaves bytes 42-116 blank, but contour/line
+/// features embed a feature/group name (e.g. "PIT$CREST") and sometimes a f64
+/// value there, so the header is validated on its structured fields — the
+/// space-padded numeric attribute block (bytes 60-75: colour, line type) and
+/// the closed flag (byte 76 = '0'/'1') — rather than requiring the name-bearing
+/// regions to be blank.
 fn scan_dgd_objects(data: &[u8]) -> Vec<DgdObjectHeader> {
     const NAME_LEN: usize = 40;
     const ZEROS_LEN: usize = 8;
     const CLOSED_FLAG_OFFSET: usize = 76;
+    // Space-padded colour-index field; 1-2 digits before the next space.
+    const COLOR_INDEX_OFFSET: usize = 60;
+    const COLOR_INDEX_LEN: usize = 2;
 
     let mut out = Vec::new();
     let mut i = 0;
@@ -549,37 +570,89 @@ fn scan_dgd_objects(data: &[u8]) -> Vec<DgdObjectHeader> {
                 continue;
             }
         };
-        let zeros = &data[i + 2 + NAME_LEN..i + 2 + NAME_LEN + ZEROS_LEN];
-        let rest = &data[i + 2 + NAME_LEN + ZEROS_LEN..i + DGD_COORD_RECORD_LEN];
-        if !matches!(data[i + 1], b' ' | b'D' | b'$')
-            || decode_ascii_name(&data[i + 2..i + 2 + NAME_LEN]).is_none()
-            || !zeros.iter().all(|byte| *byte == 0)
-            || !rest
-                .iter()
-                .all(|byte| *byte == b' ' || byte.is_ascii_digit())
-        {
+        // The name field must be printable ASCII up to its NUL terminator.
+        let name_field_ok = data[i + 2..i + 2 + NAME_LEN]
+            .iter()
+            .take_while(|&&byte| byte != 0)
+            .all(|&byte| (0x20..0x7f).contains(&byte));
+        let flag_ok = matches!(data[i + 1], b' ' | b'D' | b'$');
+        let attrs_ok = match kind {
+            // Numeric attribute block then the closed flag; the name may be
+            // blank (an unnamed POLY carrying only a Value) and a feature/group
+            // name may follow at byte 77+, so only these fixed fields are
+            // constrained — the 16-byte numeric block is signature enough.
+            DgdObjectKind::Poly => {
+                data[i + COLOR_INDEX_OFFSET..i + CLOSED_FLAG_OFFSET]
+                    .iter()
+                    .all(|byte| *byte == b' ' || byte.is_ascii_digit())
+                    && matches!(data[i + CLOSED_FLAG_OFFSET], b'0' | b'1')
+            }
+            // Text headers keep the simpler blank layout and always carry a name.
+            DgdObjectKind::Text | DgdObjectKind::Text3d => {
+                decode_ascii_name(&data[i + 2..i + 2 + NAME_LEN]).is_some()
+                    && data[i + 2 + NAME_LEN..i + 2 + NAME_LEN + ZEROS_LEN]
+                        .iter()
+                        .all(|byte| *byte == 0)
+                    && data[i + 2 + NAME_LEN + ZEROS_LEN..i + DGD_COORD_RECORD_LEN]
+                        .iter()
+                        .all(|byte| *byte == b' ' || byte.is_ascii_digit())
+            }
+        };
+        if !flag_ok || !name_field_ok || !attrs_ok {
             i += 1;
             continue;
         }
+        let color_index = std::str::from_utf8(
+            &data[i + COLOR_INDEX_OFFSET..i + COLOR_INDEX_OFFSET + COLOR_INDEX_LEN],
+        )
+        .ok()
+        .and_then(|field| field.trim().parse::<u8>().ok());
         out.push(DgdObjectHeader {
             offset: i,
             kind,
             closed: data[i + CLOSED_FLAG_OFFSET] == b'1',
+            color_index,
         });
         i += DGD_COORD_RECORD_LEN;
     }
     out
 }
 
-/// Mark points of closed polygon objects. Vulcan never repeats the first
-/// point of a closed shape, so this flag is the only closure signal.
+/// Attribute points to their owning type-03 POLY header: the closed flag
+/// (Vulcan never repeats a closed shape's first point, so this is the only
+/// closure signal) and the object colour index.
+///
+/// The closed flag only forms a polygon for a *single-string* object. A POLY
+/// header whose coordinates contain more than one segment header (a second
+/// `seg_type == 0` record, i.e. a point with its "connected" flag unticked) is a
+/// multi-string polyline: Vulcan renders the internal break as a disconnection
+/// and the line stays open. Splitting such an object into per-string polylines
+/// and closing each would fabricate closing edges (e.g. `LINE$11448` came
+/// through as two closed polygons instead of one open line), so closure is
+/// suppressed for every string of a multi-string object.
 fn attribute_dgd_closed(points: &mut [DesignPoint], objects: &[DgdObjectHeader]) {
-    for point in points {
-        let index = objects.partition_point(|object| object.offset < point.offset);
-        if let Some(object) = index.checked_sub(1).and_then(|index| objects.get(index))
-            && object.kind == DgdObjectKind::Poly
+    let owning_poly = |offset: usize| -> Option<usize> {
+        let index = objects
+            .partition_point(|object| object.offset < offset)
+            .checked_sub(1)?;
+        (objects[index].kind == DgdObjectKind::Poly).then_some(index)
+    };
+
+    let mut segment_headers: HashMap<usize, u32> = HashMap::new();
+    for point in points.iter() {
+        if point.seg_type == 0
+            && let Some(index) = owning_poly(point.offset)
         {
-            point.closed = object.closed;
+            *segment_headers.entry(index).or_default() += 1;
+        }
+    }
+
+    for point in points {
+        if let Some(index) = owning_poly(point.offset) {
+            let object = &objects[index];
+            let single_string = segment_headers.get(&index).copied().unwrap_or(0) <= 1;
+            point.closed = object.closed && single_string;
+            point.color_index = object.color_index;
         }
     }
 }
@@ -606,8 +679,15 @@ fn extract_dgd_texts(
         if object.kind == DgdObjectKind::Poly {
             continue;
         }
+        const COORD_NAME_OFFSET: usize = 37;
+        const COORD_NAME_LEN: usize = 40;
+
         let mut coords: Vec<(usize, f64, f64, f64)> = Vec::new();
-        let mut lines: Vec<String> = Vec::new();
+        let mut lines: Vec<DgdTextLine> = Vec::new();
+        // The map scale ("1:1250") is stored in the origin coordinate's name
+        // field; 3DTEXT needs it to convert its raw character size to world
+        // units (see `parse_dgd_text3d`).
+        let mut map_scale: Option<f64> = None;
         let mut i = object.offset + DGD_COORD_RECORD_LEN;
         for _ in 0..MAX_OBJECT_RECORDS {
             if i + DGD_COORD_RECORD_LEN > data.len() {
@@ -619,10 +699,15 @@ fn extract_dgd_texts(
                     let Some((x, y, z)) = try_read_xyz(data, i + 5) else {
                         break;
                     };
+                    if map_scale.is_none() {
+                        map_scale = parse_dgd_map_scale(
+                            &data[i + COORD_NAME_OFFSET..i + COORD_NAME_OFFSET + COORD_NAME_LEN],
+                        );
+                    }
                     coords.push((i, x, y, z));
                 }
                 0x06 => {
-                    lines.push(decode_name(&data[i + 2..i + 2 + CONTENT_LEN]));
+                    lines.push(decode_dgd_text_line(&data[i + 2..i + 2 + CONTENT_LEN]));
                 }
                 _ => break,
             }
@@ -630,7 +715,7 @@ fn extract_dgd_texts(
         }
         let parsed = match object.kind {
             DgdObjectKind::Text => parse_dgd_text(&coords, &lines),
-            DgdObjectKind::Text3d => parse_dgd_text3d(&coords, &lines),
+            DgdObjectKind::Text3d => parse_dgd_text3d(&coords, &lines, map_scale),
             DgdObjectKind::Poly => unreachable!(),
         };
         let Some((origin, height, rotation_degrees, content)) = parsed else {
@@ -646,6 +731,7 @@ fn extract_dgd_texts(
             z: origin.2,
             height,
             rotation_degrees,
+            color_index: object.color_index,
         });
     }
     out
@@ -653,24 +739,103 @@ fn extract_dgd_texts(
 
 type DgdParsedText = ((f64, f64, f64), f64, f64, String);
 
-fn parse_dgd_text(coords: &[(usize, f64, f64, f64)], lines: &[String]) -> Option<DgdParsedText> {
-    let &(_, x, y, z) = coords.first()?;
-    let &(_, height, _, rotation_degrees) = coords.get(1)?;
-    let content = join_dgd_text_lines(lines)?;
-    Some(((x, y, z), height, rotation_degrees, content))
+/// One type-06 text record: its decoded text and whether it soft-wraps into
+/// the next record. Vulcan wraps a long logical line across several records and
+/// marks each non-final piece with a `0x01` continuation byte; such pieces join
+/// with no line break, while a piece without it ends a visible line.
+struct DgdTextLine {
+    text: String,
+    continues: bool,
 }
 
-fn parse_dgd_text3d(coords: &[(usize, f64, f64, f64)], lines: &[String]) -> Option<DgdParsedText> {
+/// Decode a type-06 record's 80-byte content field into a [`DgdTextLine`]. A
+/// `0x01` byte marks a soft wrap: text before it is the fragment, and it joins
+/// to the following record without a newline.
+fn decode_dgd_text_line(bytes: &[u8]) -> DgdTextLine {
+    match bytes.iter().position(|&b| b == 0x01) {
+        Some(pos) => DgdTextLine {
+            text: decode_name(&bytes[..pos]),
+            continues: true,
+        },
+        None => DgdTextLine {
+            text: decode_name(bytes),
+            continues: false,
+        },
+    }
+}
+
+fn parse_dgd_text(
+    coords: &[(usize, f64, f64, f64)],
+    lines: &[DgdTextLine],
+) -> Option<DgdParsedText> {
+    let &(_, x, y, z) = coords.first()?;
+    // Params record: (world height, Vulcan "Size", drafting angle). The angle
+    // is stored in *radians* (and often wound past ±2π), so convert to degrees
+    // and normalise — a raw value like -12.573 rad is 359.61°, i.e. ~upright,
+    // not a -12.57° tilt.
+    let &(_, height, _, angle_radians) = coords.get(1)?;
+    let content = join_dgd_text_lines(lines)?;
+    Some((
+        (x, y, z),
+        height,
+        normalize_degrees(angle_radians.to_degrees()),
+        content,
+    ))
+}
+
+/// Wrap an angle in degrees into `[0, 360)`.
+fn normalize_degrees(degrees: f64) -> f64 {
+    degrees.rem_euclid(360.0)
+}
+
+fn parse_dgd_text3d(
+    coords: &[(usize, f64, f64, f64)],
+    lines: &[DgdTextLine],
+    map_scale: Option<f64>,
+) -> Option<DgdParsedText> {
     let &(_, x, y, z) = coords.first()?;
     let &(_, dir_x, dir_y, _) = coords.get(1)?;
-    let &(_, _, height, _) = coords.get(3)?;
+    // coords[3] is the raw character size (e.g. 0.08), matching Vulcan's "text
+    // height" panel value. Unlike a type-04 TEXT — whose parameter record stores
+    // an already world-scaled height — a 3DTEXT keeps the raw size and relies on
+    // the map scale to reach world units: world height = size × scale / 100
+    // (Size 1.0 at 1:1250 → 12.5, so 0.08 at 1:1250 → 1.0). Without the raw size
+    // a survey label like "H086825" renders ~0.08 units tall and is invisible.
+    let &(_, _, char_size, _) = coords.get(3)?;
+    let height = char_size * map_scale.unwrap_or(100.0) / 100.0;
     // The first type-06 record of a 3DTEXT is the font name, not content.
     let content = join_dgd_text_lines(lines.get(1..)?)?;
-    Some(((x, y, z), height, dir_y.atan2(dir_x).to_degrees(), content))
+    Some((
+        (x, y, z),
+        height,
+        normalize_degrees(dir_y.atan2(dir_x).to_degrees()),
+        content,
+    ))
 }
 
-fn join_dgd_text_lines(lines: &[String]) -> Option<String> {
-    let content = lines.join("\n").trim_end().to_owned();
+/// Parse a Vulcan map-scale label ("1:1250") from a coordinate record's name
+/// field into its denominator (1250.0). Returns `None` if the field is not a
+/// `1:<number>` scale.
+fn parse_dgd_map_scale(bytes: &[u8]) -> Option<f64> {
+    decode_name(bytes)
+        .strip_prefix("1:")?
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|scale| *scale > 0.0)
+}
+
+fn join_dgd_text_lines(lines: &[DgdTextLine]) -> Option<String> {
+    let mut content = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        content.push_str(&line.text);
+        // A soft-wrap fragment joins the next record with no break; a hard line
+        // gets a newline unless it is the last record.
+        if !line.continues && index + 1 < lines.len() {
+            content.push('\n');
+        }
+    }
+    let content = content.trim_end().to_owned();
     (!content.is_empty()).then_some(content)
 }
 
@@ -1189,6 +1354,8 @@ mod tests {
         let base = 0x1000;
         let mut bytes = vec![0_u8; base + 6 * rec];
         write_object_record(&mut bytes, base, 0x04, "REACTIVETEXT$1", false);
+        // Vulcan colour index on the text header (byte 60), like POLY headers.
+        bytes[base + 60..base + 62].copy_from_slice(b"7 ");
         write_coord_record_xyz(
             &mut bytes,
             base + rec,
@@ -1201,7 +1368,8 @@ mod tests {
             base + 2 * rec,
             b"44 ",
             "POINT_1",
-            (12.5, 1.0, -12.5),
+            // Real drafting angle from a company file: radians, wound past -2π.
+            (12.5, 1.0, -12.573177),
         );
         write_text_line_record(&mut bytes, base + 3 * rec, "300m Non-Vib");
         write_text_line_record(&mut bytes, base + 4 * rec, "Offset");
@@ -1214,11 +1382,51 @@ mod tests {
         assert_eq!(text.content, "300m Non-Vib\nOffset");
         assert_eq!((text.x, text.y, text.z), (1234.0, 5678.0, 500.0));
         assert_eq!(text.height, 12.5);
-        assert_eq!(text.rotation_degrees, -12.5);
+        // The stored angle is radians normalised to Vulcan's 0..360 display.
+        assert!(
+            (text.rotation_degrees - 359.61).abs() < 0.01,
+            "got {}",
+            text.rotation_degrees
+        );
         assert_eq!(text.layer_name.as_deref(), Some("BENCH"));
+        assert_eq!(text.color_index, Some(7), "text colour comes from byte 60");
         assert!(
             design.points.is_empty(),
             "text sub-coordinates must not surface as design points"
+        );
+    }
+
+    #[test]
+    fn joins_soft_wrapped_text_records_without_a_line_break() {
+        let rec = DGD_COORD_RECORD_LEN;
+        let base = 0x1000;
+        let mut bytes = vec![0_u8; base + 6 * rec];
+        write_object_record(&mut bytes, base, 0x04, "REACTIVETEXT$1", false);
+        write_coord_record_xyz(&mut bytes, base + rec, b"2  ", "1:1250", (0.0, 0.0, 0.0));
+        write_coord_record_xyz(
+            &mut bytes,
+            base + 2 * rec,
+            b"44 ",
+            "POINT_1",
+            (1.0, 1.0, 0.0),
+        );
+        // Vulcan wraps one logical line across records: a 0x01 byte marks the
+        // soft wrap, and "within" is split "wit" | "hin".
+        write_text_line_record(
+            &mut bytes,
+            base + 3 * rec,
+            "Mine Geology - No reactive material wit",
+        );
+        bytes[base + 3 * rec + 2 + "Mine Geology - No reactive material wit".len()] = 0x01;
+        write_text_line_record(&mut bytes, base + 4 * rec, "hin pit RL");
+        write_save_record(&mut bytes, base + 5 * rec, b' ', "BENCH");
+
+        let design = read_dgd_design_bytes(&bytes).unwrap();
+
+        assert_eq!(design.texts.len(), 1);
+        assert_eq!(
+            design.texts[0].content, "Mine Geology - No reactive material within pit RL",
+            "soft-wrapped records join with no newline and no stray '?'"
         );
     }
 
@@ -1269,7 +1477,9 @@ mod tests {
             text.content, "M_HEL0103",
             "the leading font record is not content"
         );
-        assert_eq!(text.height, 0.25);
+        // The raw character size (coord 4's y = 0.25) is scaled to world units
+        // by the map scale from the origin's name field: 0.25 × 1250 / 100.
+        assert_eq!(text.height, 3.125);
         assert_eq!(text.rotation_degrees, 0.0);
         assert!(design.points.is_empty());
     }
@@ -1293,6 +1503,93 @@ mod tests {
         assert_eq!(points.len(), 5);
         assert!(points[..3].iter().all(|point| point.closed));
         assert!(points[3..].iter().all(|point| !point.closed));
+    }
+
+    #[test]
+    fn suppresses_closure_for_multi_string_poly_objects() {
+        // A closed POLY (byte 76 = '1') whose coordinates contain a second
+        // segment header (a second `seg='0'`) is a multi-string line: Vulcan
+        // renders the internal break as a disconnection and the line stays open,
+        // so none of its points should carry the closed flag.
+        let rec = DGD_COORD_RECORD_LEN;
+        let base = 0x1000;
+        let mut bytes = vec![0_u8; base + 6 * rec];
+        write_object_record(&mut bytes, base, 0x03, "LINE$11448", true);
+        write_coord_record(&mut bytes, base + rec, b"0  ", "Rec#190695");
+        write_coord_record(&mut bytes, base + 2 * rec, b"1  ", "POINT_2");
+        // Second string: a new segment header mid-object (connected unticked).
+        write_coord_record(&mut bytes, base + 3 * rec, b"0  ", "POINT_3");
+        write_coord_record(&mut bytes, base + 4 * rec, b"1  ", "POINT_4");
+        write_save_record(&mut bytes, base + 5 * rec, b' ', "BENCH");
+
+        let points = read_dgd_points_bytes(&bytes).unwrap();
+
+        assert_eq!(points.len(), 4);
+        assert!(
+            points.iter().all(|point| !point.closed),
+            "a multi-string object must not close any of its strings"
+        );
+    }
+
+    #[test]
+    fn reads_the_colour_index_from_poly_object_headers() {
+        let rec = DGD_COORD_RECORD_LEN;
+        let base = 0x1000;
+        let mut bytes = vec![0_u8; base + 5 * rec];
+        write_object_record(&mut bytes, base, 0x03, "POLY", true);
+        // Colour-index field is the space-padded integer at byte 60.
+        bytes[base + 60..base + 62].copy_from_slice(b"7 ");
+        write_coord_record(&mut bytes, base + rec, b"0  ", "POINT_1");
+        write_coord_record(&mut bytes, base + 2 * rec, b"1  ", "POINT_2");
+        // A second, colourless POLY must not inherit the first's index.
+        write_object_record(&mut bytes, base + 3 * rec, 0x03, "POLY", false);
+        write_coord_record(&mut bytes, base + 4 * rec, b"0  ", "POINT_1");
+
+        let points = read_dgd_points_bytes(&bytes).unwrap();
+
+        assert_eq!(points.len(), 3);
+        assert_eq!(points[0].color_index, Some(7));
+        assert_eq!(points[1].color_index, Some(7));
+        assert_eq!(points[2].color_index, None);
+    }
+
+    #[test]
+    fn detects_unnamed_and_feature_named_poly_headers() {
+        let rec = DGD_COORD_RECORD_LEN;
+        let base = 0x1000;
+        let mut bytes = vec![0_u8; base + 4 * rec];
+
+        // An unnamed POLY carrying a Value f64 at bytes 42-49 (blank name), with
+        // colour 20 and the closed flag set — previously rejected for the empty
+        // name, dropping its colour and closure.
+        bytes[base] = 0x03;
+        bytes[base + 1] = b' ';
+        bytes[base + 2..base + rec].fill(b' ');
+        bytes[base + 42..base + 50].copy_from_slice(&3.0_f64.to_be_bytes());
+        bytes[base + 60..base + 62].copy_from_slice(b"20");
+        bytes[base + 76] = b'1';
+        write_coord_record(&mut bytes, base + rec, b"0  ", "POINT_1");
+
+        // A POLY whose attribute region embeds a feature/group name at byte 77+.
+        write_object_record(&mut bytes, base + 2 * rec, 0x03, "PRU578.8", false);
+        bytes[base + 2 * rec + 60..base + 2 * rec + 62].copy_from_slice(b"14");
+        bytes[base + 2 * rec + 77..base + 2 * rec + 86].copy_from_slice(b"PIT$CREST");
+        write_coord_record(&mut bytes, base + 3 * rec, b"0  ", "POINT_1");
+
+        let points = read_dgd_points_bytes(&bytes).unwrap();
+
+        assert_eq!(points.len(), 2);
+        assert_eq!(
+            points[0].color_index,
+            Some(20),
+            "unnamed valued POLY colour"
+        );
+        assert!(points[0].closed, "unnamed valued POLY closed flag");
+        assert_eq!(
+            points[1].color_index,
+            Some(14),
+            "feature-named POLY colour is still read"
+        );
     }
 
     #[test]

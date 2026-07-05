@@ -101,7 +101,10 @@ impl<'a> App<'a> {
                     }
                     self.topology_load_pending_gpu = true;
                     self.persist_session();
-                    self.invalidate_geometry();
+                    // The mesh renders from triangulation_gpu's per-id cache, not
+                    // the document scene. A full invalidate_geometry here would
+                    // re-upload every vector object per loaded tri.
+                    self.invalidate_topology_bounds_and_redraw();
                 }
                 Ok(Err(e)) => {
                     self.pending_loads -= 1;
@@ -145,14 +148,23 @@ impl<'a> App<'a> {
             self.active_triangulation = None;
             self.editor.selected_handles.remove(&handle);
             userspace_log!("Deselected triangulation '{}'", tri.name);
-            self.invalidate_geometry();
+            self.request_topology_redraw();
             return;
         }
+        let cleared_object_selection = self
+            .editor
+            .selected_handles
+            .iter()
+            .any(|handle| matches!(handle, crate::model::SceneEntityId::Object(_)));
         self.active_triangulation = Some(id);
         self.editor.selected_handles.clear();
         self.editor.selected_handles.insert(handle);
         userspace_log!("Activated triangulation '{}'", tri.name);
-        self.invalidate_geometry();
+        if cleared_object_selection {
+            self.invalidate_geometry();
+        } else {
+            self.request_topology_redraw();
+        }
     }
 
     pub(crate) fn toggle_triangulation_visible(&mut self, id: TriangulationId) {
@@ -162,7 +174,7 @@ impl<'a> App<'a> {
         tri.visible = !tri.visible;
         let action = if tri.visible { "Shown" } else { "Hidden" };
         userspace_log!("{} triangulation '{}'", action, tri.name);
-        self.invalidate_geometry();
+        self.invalidate_topology_bounds_and_redraw();
     }
 
     pub(crate) fn close_triangulation(&mut self, id: TriangulationId) {
@@ -176,7 +188,7 @@ impl<'a> App<'a> {
             self.active_triangulation = None;
         }
         userspace_log!("Closed triangulation '{}'", tri.name);
-        self.invalidate_geometry();
+        self.invalidate_topology_bounds_and_redraw();
         self.persist_session();
     }
 
@@ -190,7 +202,7 @@ impl<'a> App<'a> {
             if self.active_triangulation == Some(tri.id) {
                 self.active_triangulation = None;
             }
-            self.invalidate_geometry();
+            self.invalidate_topology_bounds_and_redraw();
             userspace_log!("Removed triangulation '{}'", tri.name);
         }
         self.triangulation_files.retain(|f| f != &path);
@@ -236,7 +248,7 @@ impl<'a> App<'a> {
         self.triangulation_excluded_paths
             .retain(|path| path.parent() != Some(dir.as_path()));
         self.triangulation_dir_entries.remove(&dir);
-        self.invalidate_geometry();
+        self.invalidate_topology_bounds_and_redraw();
         userspace_log!("Removed triangulation folder '{}'", dir.display());
         self.persist_session();
     }
@@ -286,7 +298,7 @@ impl<'a> App<'a> {
             tri.color = new_color;
         }
         userspace_log!("Set triangulation {:?} color to {:?}", tri_id, new_color);
-        self.invalidate_geometry();
+        self.request_topology_redraw();
     }
     /// Build the mesh/BVH/edges for a freshly generated triangulation, register
     /// it, and select it. Shared by the CDT and loft generation paths.
@@ -297,6 +309,40 @@ impl<'a> App<'a> {
         tri_faces: Vec<[u32; 3]>,
         surface_type: TriSurfaceType,
     ) -> Result<()> {
+        self.finish_generated_triangulation_with_edge_builder(
+            name,
+            tri_vertices,
+            tri_faces,
+            surface_type,
+            crate::model::triangulation::unique_edges,
+        )
+    }
+
+    pub(crate) fn finish_generated_triangulation_with_edges(
+        &mut self,
+        name: String,
+        tri_vertices: Vec<tri00t::Vertex>,
+        tri_faces: Vec<[u32; 3]>,
+        surface_type: TriSurfaceType,
+        edges: Vec<[u32; 2]>,
+    ) -> Result<()> {
+        self.finish_generated_triangulation_with_edge_builder(
+            name,
+            tri_vertices,
+            tri_faces,
+            surface_type,
+            |_| edges,
+        )
+    }
+
+    fn finish_generated_triangulation_with_edge_builder(
+        &mut self,
+        name: String,
+        tri_vertices: Vec<tri00t::Vertex>,
+        tri_faces: Vec<[u32; 3]>,
+        surface_type: TriSurfaceType,
+        build_edges: impl FnOnce(&tri00t::Triangulation) -> Vec<[u32; 2]>,
+    ) -> Result<()> {
         if tri_faces.is_empty() {
             anyhow::bail!("Triangulation produced no faces");
         }
@@ -304,13 +350,18 @@ impl<'a> App<'a> {
         let vertex_count = mesh.vertex_count();
         let face_count = mesh.face_count();
         let spatial = crate::model::spatial::TriangleBvh::build(&mesh);
-        let edges = crate::model::triangulation::unique_edges(&mesh);
+        let edges = build_edges(&mesh);
 
         let id = TriangulationId(self.next_triangulation_id);
         self.next_triangulation_id += 1;
 
         let synthetic_path = PathBuf::from(format!("generated::{}::{name}", id.0));
 
+        let cleared_object_selection = self
+            .editor
+            .selected_handles
+            .iter()
+            .any(|handle| matches!(handle, crate::model::SceneEntityId::Object(_)));
         self.triangulations.push(OpenTriangulation {
             id,
             name: name.clone(),
@@ -333,7 +384,11 @@ impl<'a> App<'a> {
             "Created triangulation '{name}' ({vertex_count} vertices, {face_count} faces) from surface type {:?}",
             surface_type
         );
-        self.invalidate_geometry();
+        if cleared_object_selection {
+            self.invalidate_geometry();
+        } else {
+            self.invalidate_topology_bounds_and_redraw();
+        }
         Ok(())
     }
 }

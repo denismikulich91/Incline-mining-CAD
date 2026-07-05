@@ -141,9 +141,16 @@ fn polyline_bbox(verts: &[PolyVertex]) -> (DVec3, DVec3) {
 pub(crate) struct TriangleBvh {
     /// World-space reference point subtracted before f32 conversion of node bounds.
     origin: DVec3,
+    xy_bounds: Vec<TriangleXyBounds>,
     order: Vec<u32>,
     /// Compact 28-byte nodes in depth-first layout (see `TriNode`).
     nodes: Vec<TriNode>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TriangleXyBounds {
+    min: [f32; 2],
+    max: [f32; 2],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -190,6 +197,14 @@ struct BuildNode {
     count: u32,
 }
 
+#[derive(Clone, Copy)]
+struct BuildTriangleInfo {
+    min: [f32; 3],
+    max: [f32; 3],
+    centroid: [f32; 3],
+    xy_bounds: TriangleXyBounds,
+}
+
 impl TriangleBvh {
     pub(crate) fn build(mesh: &tri00t::Triangulation) -> Self {
         let b = mesh.bounds();
@@ -215,15 +230,21 @@ impl TriangleBvh {
             .face_vertex_indices_iter()
             .map(|face| face.map(|i| i as u32))
             .collect();
+        let build_infos: Vec<BuildTriangleInfo> = build_triangles
+            .iter()
+            .map(|triangle| build_triangle_info(*triangle, &build_vertices))
+            .collect();
+        let xy_bounds = build_infos.iter().map(|info| info.xy_bounds).collect();
         let mut order: Vec<u32> = (0..build_triangles.len() as u32).collect();
         let nodes = if order.is_empty() {
             Vec::new()
         } else {
-            let wide = build_triangle_subtree(&mut order, 0, &build_triangles, &build_vertices);
+            let wide = build_triangle_subtree(&mut order, 0, &build_infos);
             flatten_to_dfs(&wide)
         };
         Self {
             origin,
+            xy_bounds,
             order,
             nodes,
         }
@@ -336,52 +357,73 @@ impl TriangleBvh {
     /// Return triangle indices whose XY bounds overlap the supplied rectangle.
     pub(crate) fn xy_bounds_candidate_indices(
         &self,
-        mesh: &tri00t::Triangulation,
+        _mesh: &tri00t::Triangulation,
         min: DVec2,
         max: DVec2,
     ) -> Vec<usize> {
-        if self.nodes.is_empty() {
-            return Vec::new();
-        }
         let mut result = Vec::new();
-        let mut stack = vec![0usize];
+        self.for_each_xy_bounds_candidate_index(min, max, |index| result.push(index));
+        result
+    }
+
+    /// Visit triangle indices whose XY bounds overlap the supplied rectangle.
+    ///
+    /// This is the allocation-free version used by clipping paths that run the
+    /// query thousands of times. It uses per-triangle XY bounds cached when the
+    /// BVH is built, so leaf filtering does not have to refetch vertices.
+    pub(crate) fn for_each_xy_bounds_candidate_index(
+        &self,
+        min: DVec2,
+        max: DVec2,
+        visit: impl FnMut(usize),
+    ) {
+        let mut stack = Vec::new();
+        self.for_each_xy_bounds_candidate_index_with_stack(min, max, &mut stack, visit);
+    }
+
+    pub(crate) fn for_each_xy_bounds_candidate_index_with_stack(
+        &self,
+        min: DVec2,
+        max: DVec2,
+        stack: &mut Vec<usize>,
+        mut visit: impl FnMut(usize),
+    ) {
+        if self.nodes.is_empty() {
+            return;
+        }
+        stack.clear();
+        stack.push(0);
+        let local_min_x = min.x - self.origin.x;
+        let local_min_y = min.y - self.origin.y;
+        let local_max_x = max.x - self.origin.x;
+        let local_max_y = max.y - self.origin.y;
+        let tol = crate::model::kernel::XY_TOL;
         while let Some(index) = stack.pop() {
             let node = self.nodes[index];
-            let nmin = self.node_min(&node);
-            let nmax = self.node_max(&node);
-            if nmin.x > max.x || nmax.x < min.x || nmin.y > max.y || nmax.y < min.y {
+            if f64::from(node.min[0]) > local_max_x + tol
+                || f64::from(node.max[0]) < local_min_x - tol
+                || f64::from(node.min[1]) > local_max_y + tol
+                || f64::from(node.max[1]) < local_min_y - tol
+            {
                 continue;
             }
             if node.count > 0 {
                 let start = node.right_child_or_start as usize;
-                result.extend(
-                    self.order[start..start + node.count as usize]
-                        .iter()
-                        .map(|&i| i as usize)
-                        .filter(|&i| {
-                            let triangle = self.triangle(mesh, i);
-                            let triangle_min = triangle
-                                .iter()
-                                .fold(DVec2::splat(f64::INFINITY), |bounds, point| {
-                                    bounds.min(point.truncate())
-                                });
-                            let triangle_max = triangle
-                                .iter()
-                                .fold(DVec2::splat(f64::NEG_INFINITY), |bounds, point| {
-                                    bounds.max(point.truncate())
-                                });
-                            triangle_min.x <= max.x
-                                && triangle_max.x >= min.x
-                                && triangle_min.y <= max.y
-                                && triangle_max.y >= min.y
-                        }),
-                );
+                for &triangle_index in &self.order[start..start + node.count as usize] {
+                    let bounds = self.xy_bounds[triangle_index as usize];
+                    if f64::from(bounds.min[0]) <= local_max_x + tol
+                        && f64::from(bounds.max[0]) >= local_min_x - tol
+                        && f64::from(bounds.min[1]) <= local_max_y + tol
+                        && f64::from(bounds.max[1]) >= local_min_y - tol
+                    {
+                        visit(triangle_index as usize);
+                    }
+                }
             } else {
                 stack.push(node.right_child_or_start as usize);
                 stack.push(index + 1);
             }
         }
-        result
     }
 
     fn triangle(&self, mesh: &tri00t::Triangulation, index: usize) -> [DVec3; 3] {
@@ -448,8 +490,7 @@ const PARALLEL_MIN_TRIANGLES: usize = 2048;
 fn build_triangle_subtree(
     order: &mut [u32],
     order_start: usize,
-    triangles: &[[u32; 3]],
-    vertices: &[[f32; 3]],
+    triangle_infos: &[BuildTriangleInfo],
 ) -> Vec<BuildNode> {
     let n = order.len();
 
@@ -458,17 +499,12 @@ fn build_triangle_subtree(
     let mut center_min = [f32::INFINITY; 3];
     let mut center_max = [f32::NEG_INFINITY; 3];
     for &idx in order.iter() {
-        let tri = triangles[idx as usize].map(|v| vertices[v as usize]);
-        for vertex in tri {
-            for i in 0..3 {
-                min[i] = min[i].min(vertex[i]);
-                max[i] = max[i].max(vertex[i]);
-            }
-        }
-        let c = centroid_f32(tri);
+        let info = triangle_infos[idx as usize];
         for i in 0..3 {
-            center_min[i] = center_min[i].min(c[i]);
-            center_max[i] = center_max[i].max(c[i]);
+            min[i] = min[i].min(info.min[i]);
+            max[i] = max[i].max(info.max[i]);
+            center_min[i] = center_min[i].min(info.centroid[i]);
+            center_max[i] = center_max[i].max(info.centroid[i]);
         }
     }
 
@@ -498,21 +534,21 @@ fn build_triangle_subtree(
 
     let middle = n / 2;
     order.select_nth_unstable_by(middle, |a, b| {
-        centroid_f32(triangles[*a as usize].map(|v| vertices[v as usize]))[axis]
-            .total_cmp(&centroid_f32(triangles[*b as usize].map(|v| vertices[v as usize]))[axis])
+        triangle_infos[*a as usize].centroid[axis]
+            .total_cmp(&triangle_infos[*b as usize].centroid[axis])
     });
 
     let (left_order, right_order) = order.split_at_mut(middle);
 
     let (mut left_nodes, mut right_nodes) = if n > PARALLEL_MIN_TRIANGLES * 2 {
         rayon::join(
-            || build_triangle_subtree(left_order, order_start, triangles, vertices),
-            || build_triangle_subtree(right_order, order_start + middle, triangles, vertices),
+            || build_triangle_subtree(left_order, order_start, triangle_infos),
+            || build_triangle_subtree(right_order, order_start + middle, triangle_infos),
         )
     } else {
         (
-            build_triangle_subtree(left_order, order_start, triangles, vertices),
-            build_triangle_subtree(right_order, order_start + middle, triangles, vertices),
+            build_triangle_subtree(left_order, order_start, triangle_infos),
+            build_triangle_subtree(right_order, order_start + middle, triangle_infos),
         )
     };
 
@@ -579,12 +615,27 @@ pub(crate) fn projected_box_overlaps(
         && cursor.y <= screen_max.y + threshold
 }
 
-fn centroid_f32(triangle: [[f32; 3]; 3]) -> [f32; 3] {
-    [
-        (triangle[0][0] + triangle[1][0] + triangle[2][0]) / 3.0,
-        (triangle[0][1] + triangle[1][1] + triangle[2][1]) / 3.0,
-        (triangle[0][2] + triangle[1][2] + triangle[2][2]) / 3.0,
-    ]
+fn build_triangle_info(triangle: [u32; 3], vertices: &[[f32; 3]]) -> BuildTriangleInfo {
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    let mut sum = [0.0; 3];
+    for vertex_index in triangle {
+        let vertex = vertices[vertex_index as usize];
+        for i in 0..3 {
+            min[i] = min[i].min(vertex[i]);
+            max[i] = max[i].max(vertex[i]);
+            sum[i] += vertex[i];
+        }
+    }
+    BuildTriangleInfo {
+        min,
+        max,
+        centroid: [sum[0] / 3.0, sum[1] / 3.0, sum[2] / 3.0],
+        xy_bounds: TriangleXyBounds {
+            min: [min[0], min[1]],
+            max: [max[0], max[1]],
+        },
+    }
 }
 
 fn safe_inverse(value: f64) -> f64 {

@@ -197,10 +197,12 @@ impl<'a> App<'a> {
                     })
                     .unwrap_or_default();
                 let active_project = self.workspace.active_index;
+                let active_object_ids = self.active_project_object_ids();
                 self.editor.selected_handles.clear();
                 for handle in enclosed {
                     if let crate::model::SceneEntityId::Object(id) = handle
-                        && self.workspace.project_index_for_object(id) == active_project
+                        && active_project.is_some()
+                        && active_object_ids.contains(&id)
                     {
                         self.editor.selected_handles.insert(handle);
                     }
@@ -310,9 +312,10 @@ impl<'a> App<'a> {
             })
             .unwrap_or_default();
         let active_project = self.workspace.active_index;
+        let active_object_ids = self.active_project_object_ids();
         enclosed.retain(|handle| match handle {
             SceneEntityId::Object(object_id) => {
-                self.workspace.project_index_for_object(*object_id) == active_project
+                active_project.is_some() && active_object_ids.contains(object_id)
             }
             SceneEntityId::Triangulation(_) => true,
             SceneEntityId::BlockModel(_) => true,
@@ -406,6 +409,21 @@ impl<'a> App<'a> {
             });
             self.workspace.mark_dirty();
         }
+    }
+
+    fn active_project_object_ids(&self) -> std::collections::HashSet<crate::model::ObjectId> {
+        self.workspace
+            .active_project()
+            .map(|project| {
+                project
+                    .pidb
+                    .document
+                    .objects()
+                    .iter()
+                    .map(Object::id)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 

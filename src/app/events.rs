@@ -26,14 +26,21 @@ impl<'a> App<'a> {
 
         if let WindowEvent::Focused(focused) = &event {
             self.window_focused = *focused;
-            if !focused && let Some(graphics) = self.graphics.as_mut() {
-                graphics.release_mouse_capture();
+            if !focused {
+                self.finish_left_button_interactions();
+                if let Some(graphics) = self.graphics.as_mut() {
+                    graphics.release_mouse_capture();
+                }
             }
             self.redraw_requested = true;
         }
 
         if let WindowEvent::MouseWheel { .. } = &event {
             self.last_scroll_instant = Some(Instant::now());
+        }
+
+        if self.handle_cursor_mode_cycle(&event) {
+            return;
         }
 
         if self.handle_mouse_fly_control(&event) {
@@ -69,6 +76,8 @@ impl<'a> App<'a> {
             self.handle_right_press_for_orbit(&event);
             self.handle_right_release(&event);
             self.handle_control_shortcuts(&event);
+        } else if is_left_mouse_release(&event) {
+            self.finish_left_button_interactions();
         }
 
         let graphics_consumed = self.graphics.as_mut().is_some_and(|graphics| {
@@ -122,8 +131,9 @@ impl<'a> App<'a> {
                     self.redraw_requested = false;
                     let project = self.project_view();
                     let completing_topology_load = self.topology_load_pending_gpu;
+                    let applied_resize = self.pending_resize.take();
                     if let Some(graphics) = self.graphics.as_mut() {
-                        if let Some(size) = self.pending_resize.take() {
+                        if let Some(size) = applied_resize {
                             graphics.resize(size);
                         }
                         let last_render_time = *self.last_render_time.get_or_insert(now);
@@ -136,7 +146,7 @@ impl<'a> App<'a> {
                                     fps * 0.9 + instantaneous_fps * 0.1
                                 }));
                         }
-                        graphics.update(dt);
+                        graphics.update(dt, self.editor.block_model_interaction_resolution_divisor);
                         self.editor.can_undo = self.history.can_undo();
                         self.editor.can_redo = self.history.can_redo();
                         match graphics.render(
@@ -499,6 +509,26 @@ impl<'a> App<'a> {
 }
 
 impl<'a> App<'a> {
+    fn handle_cursor_mode_cycle(&mut self, event: &WindowEvent) -> bool {
+        let WindowEvent::MouseInput {
+            state: ElementState::Pressed,
+            button,
+            ..
+        } = event
+        else {
+            return false;
+        };
+
+        self.editor.cursor_mode = match button {
+            MouseButton::Forward => self.editor.cursor_mode.next(),
+            MouseButton::Back => self.editor.cursor_mode.previous(),
+            _ => return false,
+        };
+        self.editor.cursor_snapped = false;
+        self.redraw_requested = true;
+        true
+    }
+
     fn handle_mouse_press(&mut self, event: &WindowEvent) {
         if let WindowEvent::MouseInput {
             state: ElementState::Pressed,
@@ -579,23 +609,24 @@ impl<'a> App<'a> {
     }
 
     fn handle_mouse_release(&mut self, event: &WindowEvent) {
-        if let WindowEvent::MouseInput {
-            state: ElementState::Released,
-            button: MouseButton::Left,
-            ..
-        } = event
-        {
-            self.finish_box_selection();
-            self.finish_drag();
-            if self.gizmo_drag.is_some() {
-                self.finish_gizmo_drag();
-            }
-            if self.editor.chamfer_gizmo_drag_start_px.is_some() {
-                self.editor.chamfer_gizmo_drag_start_px = None;
-            }
-            if self.editor.bezier_dragging_cp.is_some() {
-                self.editor.bezier_dragging_cp = None;
-            }
+        if is_left_mouse_release(event) {
+            self.finish_left_button_interactions();
+        }
+    }
+
+    fn finish_left_button_interactions(&mut self) {
+        self.finish_box_selection();
+        self.finish_drag();
+        if self.gizmo_drag.is_some() {
+            self.finish_gizmo_drag();
+        }
+        if self.editor.chamfer_gizmo_drag_start_px.is_some() {
+            self.editor.chamfer_gizmo_drag_start_px = None;
+            self.invalidate_overlay();
+        }
+        if self.editor.bezier_dragging_cp.is_some() {
+            self.editor.bezier_dragging_cp = None;
+            self.invalidate_overlay();
         }
     }
 
@@ -885,7 +916,7 @@ impl<'a> App<'a> {
                 {
                     let z = (world.z * 10_000.0).round() / 10_000.0;
                     self.editor.z_level = z;
-                    self.editor.z_input = format!("{z:.4}");
+                    self.editor.z_input = z;
                     self.redraw_requested = true;
                     userspace_log!("Backquote set Z level to cursor hit Z {:.4}", z);
                 }
@@ -994,6 +1025,17 @@ fn bezier_cp_hit(editor: &crate::ui::state::EditorState, cursor_px: (f32, f32)) 
         }
     }
     best.map(|(idx, _)| idx)
+}
+
+fn is_left_mouse_release(event: &WindowEvent) -> bool {
+    matches!(
+        event,
+        WindowEvent::MouseInput {
+            state: ElementState::Released,
+            button: MouseButton::Left,
+            ..
+        }
+    )
 }
 
 fn hit_gizmo_axis(

@@ -77,10 +77,6 @@ pub(crate) fn draw_main_menu(
                     {
                         commands.push(UiCommand::SetShowWorldAxisGizmo(show_world_axis_gizmo));
                     }
-                    let mut show_view_cube = editor.show_view_cube;
-                    if ui.checkbox(&mut show_view_cube, "Show View Cube").changed() {
-                        commands.push(UiCommand::SetShowViewCube(show_view_cube));
-                    }
                 });
 
                 // Not implemented

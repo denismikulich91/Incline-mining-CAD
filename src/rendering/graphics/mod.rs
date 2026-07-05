@@ -19,7 +19,7 @@ use crate::{
         triangulation::OpenTriangulation,
     },
     rendering::{
-        BlockModelVertex, StrokeVertex, SurfaceVertex, Vertex,
+        BlockInstance, StrokeVertex, SurfaceVertex, Vertex,
         camera::{
             Camera, CameraController, CameraUniform, FlyCameraController, Projection,
             screen_to_world_on_plane,
@@ -49,7 +49,6 @@ pub(crate) mod projections;
 pub(crate) mod targets;
 
 pub(super) const TEXT_CACHE_TRIM_INTERVAL_FRAMES: u64 = 300;
-pub(super) const TEXT_ATLAS_TRIM_INTERVAL_FRAMES: u64 = 600;
 pub(super) const MSAA_SAMPLE_COUNT: u32 = 4;
 pub(super) const CAMERA_ROTATE_SENSITIVITY: f64 = 0.003;
 pub(super) const REQUESTED_MAX_BUFFER_SIZE: u64 = 2 * 1024 * 1024 * 1024;
@@ -119,16 +118,28 @@ pub(super) fn text_bounds_corners(
     height: f64,
     rotation: f64,
 ) -> [DVec3; 4] {
+    // Mirror the glyph layout in the scene builder: width tracks the widest
+    // line and the box stacks one `height` per line, each extra line advancing
+    // by TextBox's line-height factor (1.1).
+    const LINE_HEIGHT_FACTOR: f64 = 1.1;
     let height = height.abs().max(0.001);
-    let width = height * 0.58 * content.chars().count().max(1) as f64;
+    let longest_line = content
+        .lines()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let line_count = content.lines().count().max(1);
+    let width = height * 0.58 * longest_line as f64;
+    let text_height = height * (1.0 + LINE_HEIGHT_FACTOR * (line_count - 1) as f64);
     let (sin, cos) = rotation.sin_cos();
     let right = DVec3::new(cos, sin, 0.0);
     let down = DVec3::new(sin, -cos, 0.0);
     let padding = height * 0.15;
     let top_left = pos - right * padding - down * padding;
     let top_right = pos + right * (width + padding) - down * padding;
-    let bottom_right = top_right + down * (height + padding * 2.0);
-    let bottom_left = top_left + down * (height + padding * 2.0);
+    let bottom_right = top_right + down * (text_height + padding * 2.0);
+    let bottom_left = top_left + down * (text_height + padding * 2.0);
     [top_left, top_right, bottom_right, bottom_left]
 }
 
@@ -149,7 +160,14 @@ pub(crate) struct Graphics<'a> {
     pub(super) surface_render_pipeline: wgpu::RenderPipeline,
     pub(super) transparent_surface_render_pipeline: wgpu::RenderPipeline,
     pub(super) block_model_render_pipeline: wgpu::RenderPipeline,
-    pub(super) transparent_block_model_render_pipeline: wgpu::RenderPipeline,
+    pub(super) block_model_volume_pipeline: wgpu::RenderPipeline,
+    pub(super) block_model_peel_pipeline: wgpu::RenderPipeline,
+    pub(super) block_model_peel_composite_pipeline: wgpu::RenderPipeline,
+    pub(super) block_model_volume_upscale_pipeline: wgpu::RenderPipeline,
+    pub(super) block_model_volume_upscale_bind_group_layout: wgpu::BindGroupLayout,
+    pub(super) block_model_peel_bind_group_layout: wgpu::BindGroupLayout,
+    pub(super) block_model_peel_composite_bind_group_layout: wgpu::BindGroupLayout,
+    pub(super) block_model_volume_bind_group_layout: wgpu::BindGroupLayout,
     pub(super) surface_style_bind_group_layout: wgpu::BindGroupLayout,
     pub(super) render_pipeline: wgpu::RenderPipeline,
     pub(super) xray_render_pipeline: wgpu::RenderPipeline,
@@ -171,6 +189,8 @@ pub(crate) struct Graphics<'a> {
     pub(super) msaa_view: wgpu::TextureView,
     pub(super) depth_texture: wgpu::Texture,
     pub(super) depth_view: wgpu::TextureView,
+    pub(super) block_model_peel_targets: BlockModelPeelTargets,
+    pub(super) block_model_volume_target: BlockModelVolumeTarget,
     pub(super) surface: wgpu::Surface<'a>,
     pub(super) queue: wgpu::Queue,
     pub(super) device: wgpu::Device,
@@ -204,7 +224,14 @@ pub(crate) struct Graphics<'a> {
     pub(super) fly_mode_enabled: bool,
     pub(super) cached_textareas: Vec<CachedTextArea>,
     pub(super) textarea_depths: Vec<f32>,
+    /// Glyph vertex data is camera-independent (the text shader applies
+    /// view_proj), so `TextRenderer::prepare` only needs to run when the
+    /// text areas themselves changed — not every frame.
+    pub(super) text_prepare_pending: bool,
     pub(super) frame_index: u64,
+    /// When the user last interacted with the view (camera drag or window
+    /// resize). Drives a short low-quality cooldown for the volume raycaster.
+    pub(super) last_interaction: Option<std::time::Instant>,
     pub(super) geometry_dirty: bool,
     pub(super) cached_document_revision: u64,
     pub(super) cached_bounds_document_revision: u64,
@@ -222,10 +249,30 @@ pub(crate) struct Graphics<'a> {
     pub(super) block_model_gpu: BlockModelGpuCache,
 }
 
+pub(super) struct BlockModelPeelTargets {
+    pub(super) _accum_textures: Vec<wgpu::Texture>,
+    pub(super) accum_views: Vec<wgpu::TextureView>,
+    pub(super) peel_bind_groups: Vec<wgpu::BindGroup>,
+    pub(super) composite_bind_groups: Vec<wgpu::BindGroup>,
+}
+
+pub(super) struct BlockModelVolumeTarget {
+    pub(super) _texture: wgpu::Texture,
+    pub(super) view: wgpu::TextureView,
+    pub(super) params_buffer: wgpu::Buffer,
+    pub(super) bind_group: wgpu::BindGroup,
+}
+
 impl<'a> Graphics<'a> {
     pub(crate) fn invalidate_geometry(&mut self) {
         self.geometry_dirty = true;
         self.overlay_dirty = true;
+        self.invalidate_scene_bounds();
+    }
+
+    pub(crate) fn invalidate_scene_bounds(&mut self) {
+        self.cached_bounds_document_revision = u64::MAX;
+        self.cached_scene_bounds = None;
     }
 
     pub(crate) fn invalidate_overlay(&mut self) {
@@ -281,6 +328,27 @@ impl<'a> Graphics<'a> {
     /// queries during camera movement.
     pub(crate) fn is_camera_active(&self) -> bool {
         self.mouse_pressed == Some(MouseButton::Right)
+    }
+
+    /// Record that the user is interacting with the view right now (camera
+    /// drag or window resize), starting the volume raycaster's low-quality
+    /// cooldown.
+    pub(super) fn mark_interaction(&mut self) {
+        self.last_interaction = Some(std::time::Instant::now());
+    }
+
+    /// True while the view is being changed (orbit/pan/zoom or resize) or
+    /// within a short cooldown afterwards. The cooldown guarantees the last
+    /// reduced-quality frame is followed by a full-quality one once motion
+    /// stops (see the redraw request in `render`), and covers window resizing,
+    /// which does not flow through the camera-motion signals.
+    pub(super) fn interaction_active(&self) -> bool {
+        const COOLDOWN: std::time::Duration = std::time::Duration::from_millis(150);
+        self.is_camera_active()
+            || self.needs_continuous_redraw()
+            || self
+                .last_interaction
+                .is_some_and(|when| when.elapsed() < COOLDOWN)
     }
 
     pub(crate) fn begin_right_orbit_drag(&mut self) {

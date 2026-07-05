@@ -1,5 +1,5 @@
 # Incline
-Incline is an open-pit mine design project to bring the ideals of free open-source software to the mining industry.
+Incline is an open-pit mine design project to bring the ideals of free source-available software to the mining industry.
 
 Cross-platform, lightweight, and built by mining engineers for mining engineers. Incline is free and open for everyone - aspiring students, professionals, and hobbists.
 

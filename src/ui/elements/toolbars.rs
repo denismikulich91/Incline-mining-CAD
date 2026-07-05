@@ -5,6 +5,7 @@ use crate::ui::{
     EditorState, UiProjectView, color32_to_rgba, rgba_to_color32,
     state::{ActiveTool, CursorMode, EditorAction, UiCommand},
     themed_icon, unthemed_icon,
+    widgets::menu::MenuFieldF64,
     widgets::toolbar::{ColorSquarePicker, HatchPicker, ToolbarButton},
 };
 
@@ -82,14 +83,12 @@ pub(crate) fn draw_top_toolbar(
                         }
                     });
 
-                ui.label("Z: ");
-                let z_resp =
-                    ui.add(egui::TextEdit::singleline(&mut editor.z_input).desired_width(80.));
-                if z_resp.changed()
-                    && let Ok(z) = editor.z_input.parse::<f64>()
-                    && z.is_finite()
-                {
-                    editor.z_level = z;
+                let z_resp = MenuFieldF64::new("Z:", &mut editor.z_input, f64::MIN..=f64::MAX)
+                    .width(80.0)
+                    .suffix("m")
+                    .show_inline(ui);
+                if z_resp.changed() && editor.z_input.is_finite() {
+                    editor.z_level = editor.z_input;
                 }
 
                 shifted_up(ui, 3.0, |ui| {
@@ -313,8 +312,7 @@ pub(crate) fn draw_right_toolbar(
                     .selected(editor.vertical_exaggeration != 1.0),
                 );
                 if response.clicked() {
-                    editor.vertical_exaggeration_input =
-                        format!("{}", editor.vertical_exaggeration);
+                    editor.vertical_exaggeration_input = editor.vertical_exaggeration;
                     editor.vertical_exaggeration_dialog_open = true;
                 }
 

@@ -1,8 +1,14 @@
 use std::{fmt::Debug, hash::Hash};
 
 use crate::{
-    model::block_model::{ColorStop, MAX_COLOR_STOPS, MIN_COLOR_STOPS},
-    ui::{fonts::bold, state::UiCommand},
+    model::block_model::{
+        ColorStop, MAX_COLOR_STOPS, MIN_COLOR_STOPS, OpenBlockModel, numeric_variable_default,
+        render_value_range,
+    },
+    ui::{
+        fonts::bold,
+        state::{EditorState, UiCommand},
+    },
 };
 
 /// A compact tool panel pinned inside the 3D viewport.
@@ -74,12 +80,51 @@ const COLOR_PICKER_BUTTON_WIDTH: f32 = 40.0;
 const COLOR_PICKER_BUTTON_HEIGHT: f32 = 18.0;
 const COLOR_PICKER_EDGE_BUFFER: f32 = 8.0;
 const LEGEND_SIDE_GUTTER: f32 = COLOR_PICKER_BUTTON_WIDTH * 0.5 + COLOR_PICKER_EDGE_BUFFER;
-const VISIBLE_ALPHA_EPSILON: f32 = 0.004;
 
-/// Interpolates a colour-transfer function's rgba at `t`, mirroring the
-/// shader's `ramp_color` (`src/rendering/shaders/block_model.wgsl`) so the
-/// legend matches what's actually drawn. Outside the first/last stop's
-/// position, the colour clamps to that endpoint.
+/// Clamps `raw_t` to `0..1` and, if that lands within `STOP_EPSILON` of an
+/// existing stop, nudges it just outside that stop's epsilon band.
+///
+/// Without this, a double-click meant to insert a new stop near (or, after
+/// edge-clamping, exactly on top of) an existing one produces a stop whose
+/// `t` is within the later dedup pass's `1e-4` tolerance of the existing
+/// stop — so the new stop is silently collapsed back out and insertion
+/// appears to do nothing. This is most visible at the bar's edges: clamping
+/// an overshot click to exactly `0.0`/`1.0` collides with a stop already
+/// sitting at that exact edge (the common case for default colour ramps).
+fn nudge_away_from_existing(stops: &[ColorStop], raw_t: f32) -> f32 {
+    let mut t = raw_t.clamp(0.0, 1.0);
+    for _ in 0..=stops.len() {
+        let Some(collision) = stops.iter().find(|stop| (stop.t - t).abs() < STOP_EPSILON) else {
+            return t;
+        };
+        t = if collision.t >= t {
+            (collision.t - STOP_EPSILON).max(0.0)
+        } else {
+            (collision.t + STOP_EPSILON).min(1.0)
+        };
+    }
+    t
+}
+
+/// Inserts a new stop at `t` into an already-sorted `stops` vec, keeping it
+/// sorted, and returns the index it landed at.
+///
+/// Inserting in sorted order (rather than appending and re-sorting later) is
+/// what keeps positional-neighbour logic correct on the very frame of
+/// insertion: the value popup and drag clamps derive a stop's allowed range
+/// from `stops[i-1]`/`stops[i+1]`, so a freshly-appended stop parked at the
+/// end of the vec would be treated as the right-most one and clamped to the
+/// old last stop's position.
+fn insert_stop_sorted(stops: &mut Vec<ColorStop>, id: u64, t: f32) -> usize {
+    let index = stops.partition_point(|stop| stop.t < t);
+    let color = color32_to_straight(interpolate_stops(stops, t));
+    stops.insert(index, ColorStop { id, t, color });
+    index
+}
+
+/// Samples a colour-transfer function's rgba at `t`, mirroring the shader's
+/// hard cutoffs. Values below the first stop are transparent; each stop then
+/// remains active until the next.
 fn interpolate_stops(stops: &[ColorStop], t: f32) -> egui::Color32 {
     let t = t.clamp(0.0, 1.0);
     if stops.is_empty() {
@@ -87,48 +132,18 @@ fn interpolate_stops(stops: &[ColorStop], t: f32) -> egui::Color32 {
     }
     let first = stops[0];
     let last = stops[stops.len() - 1];
-    if t <= first.t {
-        return color32_from_straight(first.color);
+    if t < first.t {
+        return egui::Color32::TRANSPARENT;
     }
     if t >= last.t {
         return color32_from_straight(last.color);
     }
-    for window in stops.windows(2) {
-        let (a, b) = (window[0], window[1]);
-        if t >= a.t && t <= b.t {
-            let mut mixed = color_at_visible_stops(stops, t);
-            mixed[3] = a.color[3].max(b.color[3]);
-            return color32_from_straight(mixed);
+    for i in 1..stops.len() {
+        if t < stops[i].t {
+            return color32_from_straight(stops[i - 1].color);
         }
     }
     color32_from_straight(last.color)
-}
-
-fn color_at_visible_stops(stops: &[ColorStop], t: f32) -> [f32; 4] {
-    let before = stops
-        .iter()
-        .rev()
-        .find(|stop| stop.t <= t && stop.color[3] >= VISIBLE_ALPHA_EPSILON);
-    let after = stops
-        .iter()
-        .find(|stop| stop.t >= t && stop.color[3] >= VISIBLE_ALPHA_EPSILON);
-
-    match (before, after) {
-        (Some(a), Some(b)) if (b.t - a.t).abs() > 1e-6 => {
-            let k = ((t - a.t) / (b.t - a.t)).clamp(0.0, 1.0);
-            let mut mixed = [0.0f32; 4];
-            for (mixed, (a, b)) in mixed[..3]
-                .iter_mut()
-                .zip(a.color[..3].iter().zip(b.color[..3].iter()))
-            {
-                *mixed = a + (b - a) * k;
-            }
-            mixed[3] = a.color[3].max(b.color[3]);
-            mixed
-        }
-        (Some(stop), _) | (_, Some(stop)) => stop.color,
-        (None, None) => [0.0, 0.0, 0.0, 0.0],
-    }
 }
 
 fn color32_from_straight(c: [f32; 4]) -> egui::Color32 {
@@ -152,64 +167,112 @@ fn unmultiplied_srgba_to_straight(c: [u8; 4]) -> [f32; 4] {
     c.map(|component| component as f32 / 255.0)
 }
 
+fn trim_decimal_zeros(mut value: String) -> String {
+    if let Some(dot) = value.find('.') {
+        while value.ends_with('0') {
+            value.pop();
+        }
+        if value.len() == dot + 1 {
+            value.pop();
+        }
+    }
+    if value == "-0" { "0".to_owned() } else { value }
+}
+
 /// Formats a grade value with a decimal precision that scales down as the
 /// magnitude grows, so labels stay short without losing meaningful digits.
 fn format_grade(value: f64) -> String {
-    if value.abs() >= 1000.0 {
-        format!("{value:.0}")
+    let decimals = if value.abs() >= 1000.0 {
+        0
     } else if value.abs() >= 10.0 {
-        format!("{value:.1}")
+        1
     } else {
-        format!("{value:.3}")
+        3
+    };
+    trim_decimal_zeros(format!("{value:.decimals$}"))
+}
+
+fn inferred_decimal_places(value: f64) -> usize {
+    for decimals in 0..=4 {
+        let scale = 10_f64.powi(decimals as i32);
+        let rounded = (value * scale).round() / scale;
+        let tolerance = 1e-8 * value.abs().max(1.0);
+        if (rounded - value).abs() <= tolerance {
+            return decimals;
+        }
     }
+    4
+}
+
+fn format_grade_range(min: f64, max: f64) -> String {
+    let decimals = inferred_decimal_places(min).max(inferred_decimal_places(max));
+    format!("({min:.decimals$} - {max:.decimals$})")
 }
 
 /// An interactive colour-scale legend/editor pinned to the bottom-center of
-/// the 3D viewport: a dropdown to pick which numeric variable colours the
-/// block model, and a multi-stop gradient bar whose handles can be dragged
-/// (to move a stop's position) and clicked (to open a colour+alpha picker).
-/// The number of tick labels along the bar scales with the bar's width.
+/// the 3D viewport.
 pub(crate) struct ColorScaleLegend<'a> {
     id: egui::Id,
-    model: &'a crate::model::block_model::OpenBlockModel,
-    /// `None` when the active variable has no usable render range (e.g.
-    /// every rendered block is the sentinel/default value) — the dropdown
-    /// still needs to be shown so the user isn't stuck on that variable.
-    range: Option<(f64, f64)>,
+    models: &'a [OpenBlockModel],
     viewport_rect: egui::Rect,
 }
 
 impl<'a> ColorScaleLegend<'a> {
     pub(crate) fn new(
         id_source: impl Hash + Debug,
-        model: &'a crate::model::block_model::OpenBlockModel,
-        range: Option<(f64, f64)>,
+        models: &'a [OpenBlockModel],
         viewport_rect: egui::Rect,
     ) -> Self {
         Self {
             id: egui::Id::new(id_source),
-            model,
-            range,
+            models,
             viewport_rect,
         }
     }
 
-    /// The gradient bar's (and therefore the whole legend's) width, which
-    /// scales with the viewport's own width up to a size that stays
-    /// readable. Applied to the enclosing frame too, so the window around
-    /// the bar always matches it instead of sizing itself independently.
     fn bar_width(&self) -> f32 {
-        (self.viewport_rect.width() * 0.35).clamp(200.0, 520.0)
+        (self.viewport_rect.width() * 0.35).clamp(220.0, 560.0)
     }
 
-    pub(crate) fn show(self, ctx: &egui::Context, commands: &mut Vec<UiCommand>) {
+    pub(crate) fn show(
+        self,
+        ctx: &egui::Context,
+        editor: &mut EditorState,
+        commands: &mut Vec<UiCommand>,
+    ) {
+        // Any visible block model that *can* be colour-mapped belongs in the
+        // legend's model selector, including one that has numeric variables but
+        // none currently chosen — it still shows the "Choose a variable" picker
+        // and a no-data bar, so requiring an active variable here would
+        // needlessly drop it from the selector.
+        let visible_models = self
+            .models
+            .iter()
+            .filter(|model| model.visible && model_has_selectable_variable(model))
+            .collect::<Vec<_>>();
+        if visible_models.is_empty() {
+            return;
+        }
+
+        editor.viewport_block_model_id = editor
+            .viewport_block_model_id
+            .filter(|id| visible_models.iter().any(|model| model.id == *id))
+            .or_else(|| visible_models.first().map(|model| model.id));
+        let Some(model) = editor
+            .viewport_block_model_id
+            .and_then(|id| visible_models.iter().copied().find(|model| model.id == id))
+        else {
+            return;
+        };
+
         let bar_width = self.bar_width();
         let content_width = bar_width + LEGEND_SIDE_GUTTER * 2.0;
+        let range = active_variable_range(editor, model);
         let pos = egui::pos2(
             self.viewport_rect.center().x,
             self.viewport_rect.bottom() - 14.0,
         );
-        egui::Area::new(self.id)
+        let area_response = egui::Area::new(self.id)
             .order(egui::Order::Foreground)
             .pivot(egui::Align2::CENTER_BOTTOM)
             .fixed_pos(pos)
@@ -220,36 +283,117 @@ impl<'a> ColorScaleLegend<'a> {
                         ui.set_min_width(content_width);
                         ui.set_max_width(content_width);
                         ui.vertical_centered(|ui| {
-                            self.draw_variable_dropdown(ui, content_width, commands);
+                            self.draw_model_dropdown(ui, content_width, &visible_models, editor);
+                            if visible_models.len() > 1 {
+                                ui.add_space(4.0);
+                            }
+                            self.draw_variable_dropdown(ui, content_width, model, editor, commands);
                             ui.add_space(4.0);
-                            self.draw_empty_values_toggle(ui, content_width, commands);
+                            self.draw_empty_values_toggle(ui, content_width, model, commands);
                             ui.add_space(4.0);
-                            if let Some((min, max)) = self.range {
-                                self.draw_bar(ui, content_width, bar_width, min, max, commands);
+                            if let Some((min, max)) = range {
+                                self.draw_bar(
+                                    ui,
+                                    content_width,
+                                    bar_width,
+                                    min,
+                                    max,
+                                    model,
+                                    editor,
+                                    commands,
+                                );
                             } else {
                                 self.draw_no_data(ui, content_width);
                             }
                         });
                     });
             });
+        // This HUD-style legend is meant to always float above other viewport
+        // panels. egui only brings an Area to front when a click hits it as
+        // the topmost layer, so once some other floating panel is brought
+        // forward and happens to overlap this one, clicks here would never
+        // land (the other panel would keep winning hit-tests) without this.
+        //
+        // Every popup the legend spawns (model/variable dropdowns, stop value
+        // input, colour picker) must be registered as a *sublayer* of this
+        // area at its call site. `move_to_top` only flags layers into a set
+        // that `Areas::end_pass` uses as a stable-sort key, so a popup that
+        // once sank below the legend (any frame it was closed while the
+        // legend was promoted) can never climb back past it by flagging —
+        // clicking the legend re-flags it in the same frame and the tie
+        // preserves the old order. Sublayers are re-inserted directly above
+        // their parent after the sort, which is the only deterministic way
+        // to keep the popups on top of this always-promoted panel.
+        ctx.move_to_top(area_response.response.layer_id);
+    }
+
+    fn draw_model_dropdown(
+        &self,
+        ui: &mut egui::Ui,
+        content_width: f32,
+        visible_models: &[&OpenBlockModel],
+        editor: &mut EditorState,
+    ) {
+        if visible_models.len() <= 1 {
+            return;
+        }
+        let current_id = editor.viewport_block_model_id;
+        let selected_text = current_id
+            .and_then(|id| visible_models.iter().find(|model| model.id == id))
+            .map(|model| model.name.as_str())
+            .unwrap_or("Choose a block model");
+
+        // Built on the same Button + `Popup::menu` pattern as the variable
+        // dropdown rather than `egui::ComboBox`: the combo's own popup did not
+        // stay above / clickable through this always-promoted legend, whereas
+        // capturing the real popup response and pinning it as a sublayer does.
+        let popup_id = self.id.with("block_model_popup");
+        let open = egui::Popup::is_id_open(ui.ctx(), popup_id);
+        let button_response = ui
+            .add_sized(
+                egui::vec2(content_width, 22.0),
+                egui::Button::selectable(open, egui::RichText::new(selected_text).strong()),
+            )
+            .on_hover_text("Choose the block model to colour");
+
+        let popup_response = egui::Popup::menu(&button_response)
+            .id(popup_id)
+            .width(content_width)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                for model in visible_models {
+                    let selected = Some(model.id) == current_id;
+                    if ui
+                        .selectable_label(selected, egui::RichText::new(&model.name).strong())
+                        .clicked()
+                    {
+                        editor.viewport_block_model_id = Some(model.id);
+                        egui::Popup::close_id(ui.ctx(), popup_id);
+                    }
+                }
+            });
+        // Pin the model-list popup above the self-promoting legend (see the
+        // sublayer comment in `show`), same as the variable dropdown.
+        if let Some(popup_response) = popup_response {
+            ui.ctx()
+                .set_sublayer(ui.layer_id(), popup_response.response.layer_id);
+        }
     }
 
     fn draw_empty_values_toggle(
         &self,
         ui: &mut egui::Ui,
         content_width: f32,
+        model: &OpenBlockModel,
         commands: &mut Vec<UiCommand>,
     ) {
-        let mut hide = self.model.hide_empty_color_values;
+        let mut hide = model.hide_empty_color_values;
         ui.allocate_ui_with_layout(
             egui::vec2(content_width, 20.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 if ui.checkbox(&mut hide, "Hide empty").changed() {
-                    commands.push(UiCommand::SetBlockModelHideEmptyValues {
-                        id: self.model.id,
-                        hide,
-                    });
+                    commands.push(UiCommand::SetBlockModelHideEmptyValues { id: model.id, hide });
                 }
             },
         );
@@ -258,45 +402,124 @@ impl<'a> ColorScaleLegend<'a> {
     fn draw_variable_dropdown(
         &self,
         ui: &mut egui::Ui,
-        bar_width: f32,
+        content_width: f32,
+        model: &OpenBlockModel,
+        editor: &mut EditorState,
         commands: &mut Vec<UiCommand>,
     ) {
-        let variables: Vec<&str> = self
-            .model
-            .model
-            .numeric_variables()
-            .into_iter()
-            .filter(|variable| !variable.special)
-            .map(|variable| variable.name.as_str())
-            .collect();
-        let current = self.model.active_numeric_variable.as_deref().unwrap_or("");
-        let selected_text = if current.is_empty() {
-            "Choose a variable"
-        } else {
-            current
-        };
-        egui::ComboBox::from_id_salt((self.id, "variable"))
-            .selected_text(egui::RichText::new(selected_text).strong())
-            .width(bar_width)
-            .show_ui(ui, |ui| {
-                for name in variables {
-                    if ui.selectable_label(name == current, name).clicked() {
-                        commands.push(UiCommand::SetBlockModelColorVariable {
-                            id: self.model.id,
-                            variable: name.to_owned(),
-                        });
-                    }
+        let current = model.active_numeric_variable.as_deref().unwrap_or("");
+        let selected_text = model
+            .active_numeric_variable
+            .as_deref()
+            .map(|name| {
+                if let Some((min, max)) = cached_variable_range(editor, model, name) {
+                    format!("{name} {}", format_grade_range(min, max))
+                } else {
+                    format!("{name} (no range)")
+                }
+            })
+            .unwrap_or_else(|| "Choose a variable".to_owned());
+        let filter_id = self.id.with(("variable_filter", model.id));
+        let mut filter = ui
+            .data_mut(|data| data.get_persisted::<String>(filter_id))
+            .unwrap_or_default();
+
+        let popup_id = self.id.with(("variable_popup", model.id));
+        let open = egui::Popup::is_id_open(ui.ctx(), popup_id);
+        let button_response = ui
+            .add_sized(
+                egui::vec2(content_width, 22.0),
+                egui::Button::selectable(open, egui::RichText::new(selected_text).strong()),
+            )
+            .on_hover_text("Choose the active block model variable");
+
+        let popup_response = egui::Popup::menu(&button_response)
+            .id(popup_id)
+            .width(content_width)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut filter)
+                        .hint_text("Filter variables")
+                        .desired_width(content_width - 12.0),
+                );
+                if response.changed() {
+                    ui.data_mut(|data| data.insert_persisted(filter_id, filter.clone()));
+                }
+                ui.add_space(4.0);
+
+                let needle = filter.trim().to_ascii_lowercase();
+                let mut any = false;
+                egui::ScrollArea::vertical()
+                    .max_height(220.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for variable in model
+                            .model
+                            .numeric_variables()
+                            .into_iter()
+                            .filter(|variable| !variable.special)
+                        {
+                            let name = variable.name.as_str();
+                            if !needle.is_empty() && !name.to_ascii_lowercase().contains(&needle) {
+                                continue;
+                            }
+                            any = true;
+                            let range_text = cached_variable_range(editor, model, name)
+                                .map(|(min, max)| format_grade_range(min, max))
+                                .unwrap_or_else(|| "(no usable range)".to_owned());
+                            let selected = name == current;
+                            let row = ui
+                                .horizontal(|ui| {
+                                    let response = ui.selectable_label(
+                                        selected,
+                                        egui::RichText::new(name).strong(),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new(range_text)
+                                                    .color(ui.visuals().weak_text_color()),
+                                            );
+                                        },
+                                    );
+                                    response
+                                })
+                                .inner;
+                            if row.clicked() {
+                                commands.push(UiCommand::SetBlockModelColorVariable {
+                                    id: model.id,
+                                    variable: name.to_owned(),
+                                });
+                                egui::Popup::close_id(ui.ctx(), popup_id);
+                            }
+                        }
+                    });
+                if !any {
+                    ui.label(
+                        egui::RichText::new("No matches").color(ui.visuals().weak_text_color()),
+                    );
                 }
             });
+        // Pin the variable-list popup above the self-promoting legend (see
+        // the sublayer comment in `show`). Without this, a popup small
+        // enough to sit *below* the anchor button (e.g. when a filter such
+        // as "dog" matches nothing) lands entirely over the legend's body
+        // and is hidden and un-clickable behind it — indistinguishable from
+        // the list having closed itself.
+        if let Some(popup_response) = popup_response {
+            ui.ctx()
+                .set_sublayer(ui.layer_id(), popup_response.response.layer_id);
+        }
     }
 
-    /// Reserves the same footprint as `draw_bar` so the legend doesn't
-    /// resize when a variable has no usable range, and explains why there's
-    /// no gradient instead of silently falling back to a plain colour.
     fn draw_no_data(&self, ui: &mut egui::Ui, content_width: f32) {
         let handle_height = 18.0;
         let bar_height = 16.0;
-        let editor_height = COLOR_PICKER_BUTTON_HEIGHT + 4.0;
+        // Must match `draw_bar`'s `editor_height` so switching to/from a
+        // variable with no usable range doesn't resize the legend.
+        let editor_height = COLOR_PICKER_BUTTON_HEIGHT + 6.0;
         let label_height = 16.0;
         let (rect, _response) = ui.allocate_exact_size(
             egui::vec2(
@@ -314,6 +537,7 @@ impl<'a> ColorScaleLegend<'a> {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_bar(
         &self,
         ui: &mut egui::Ui,
@@ -321,11 +545,13 @@ impl<'a> ColorScaleLegend<'a> {
         bar_width: f32,
         min: f64,
         max: f64,
+        model: &OpenBlockModel,
+        editor: &mut EditorState,
         commands: &mut Vec<UiCommand>,
     ) {
         let handle_height = 18.0;
         let bar_height = 16.0;
-        let editor_height = COLOR_PICKER_BUTTON_HEIGHT + 4.0;
+        let editor_height = COLOR_PICKER_BUTTON_HEIGHT + 6.0;
         let label_height = 16.0;
         let (rect, _response) = ui.allocate_exact_size(
             egui::vec2(
@@ -345,14 +571,23 @@ impl<'a> ColorScaleLegend<'a> {
             egui::vec2(content_width, editor_height),
         );
 
-        let mut stops = self.model.color_transfer.stops.clone();
+        let mut stops = model.color_transfer.stops.clone();
         let mut changed = false;
         let mut remove_index = None;
-        let selected_id = self.id.with("selected_color_stop");
+        let selected_id = self.id.with(("selected_color_stop", model.id));
         let mut selected_stop = ui
             .data_mut(|data| data.get_persisted::<usize>(selected_id))
             .unwrap_or(0)
             .min(stops.len().saturating_sub(1));
+        let value_popup_id = self.id.with(("stop_value_popup_open", model.id));
+        let mut value_popup_stop = ui
+            .data_mut(|data| data.get_persisted::<Option<usize>>(value_popup_id))
+            .flatten()
+            .filter(|index| *index < stops.len());
+        // Set whenever a stop interaction this frame opens/keeps the value
+        // popup, so the click-outside close below doesn't immediately undo it
+        // (clicking a handle is "outside" the popup's own rect).
+        let mut popup_kept_open = false;
 
         let text_color = ui.visuals().text_color();
         {
@@ -375,61 +610,87 @@ impl<'a> ColorScaleLegend<'a> {
             );
         }
 
-        let bar_response = ui.interact(
-            bar_rect,
-            self.id.with("color_stop_bar"),
-            egui::Sense::click(),
-        );
+        let bar_response = ui
+            .interact(
+                bar_rect,
+                self.id.with("color_stop_bar"),
+                egui::Sense::click(),
+            )
+            .on_hover_text("Double-click to add a stop here");
+        // A double-click on either the bar or a handle requests an insert.
+        // We record the target `t` and apply it *after* the handle loop so the
+        // insertion never shifts indices mid-iteration, and so it lands in
+        // sorted position (see `insert_stop_sorted`).
+        let mut pending_insert: Option<f32> = None;
         if bar_response.double_clicked()
             && stops.len() < MAX_COLOR_STOPS
             && let Some(pos) = bar_response.interact_pointer_pos()
         {
-            let t = ((pos.x - bar_rect.left()) / bar_rect.width().max(1.0)).clamp(0.0, 1.0);
-            stops.push(ColorStop {
-                t,
-                color: color32_to_straight(interpolate_stops(&stops, t)),
-            });
-            selected_stop = stops.len() - 1;
-            changed = true;
+            let raw_t = (pos.x - bar_rect.left()) / bar_rect.width().max(1.0);
+            pending_insert = Some(nudge_away_from_existing(&stops, raw_t));
         }
 
-        // Draggable position handles, drawn just above the bar. Position comes
-        // from the pointer rather than accumulated drag deltas, so handles stay
-        // attached to the cursor even on long drags.
         for i in 0..stops.len() {
             let x = bar_rect.left() + bar_rect.width() * stops[i].t;
             let handle_rect = egui::Rect::from_center_size(
                 egui::pos2(x, handle_row_rect.center().y),
                 egui::vec2(COLOR_STOP_HANDLE_WIDTH, handle_height),
             );
-            let handle_id = self.id.with(("color_stop_handle", i));
-            let response = ui.interact(handle_rect, handle_id, egui::Sense::click_and_drag());
-            if response.secondary_clicked() && stops.len() > MIN_COLOR_STOPS {
-                remove_index = Some(i);
-            }
-            if response.clicked() {
-                selected_stop = i;
-            }
-            if response.dragged() {
-                let lower = if i == 0 {
-                    0.0
+            let handle_id = self.id.with(("color_stop_handle", stops[i].id));
+            let response = ui
+                .interact(handle_rect, handle_id, egui::Sense::click_and_drag())
+                .on_hover_text(if stops.len() > MIN_COLOR_STOPS {
+                    "Drag to move · Right-click to remove"
                 } else {
-                    stops[i - 1].t + STOP_EPSILON
-                };
-                let upper = if i + 1 == stops.len() {
-                    1.0
-                } else {
-                    stops[i + 1].t - STOP_EPSILON
-                };
-                let (lo, hi) = (lower.min(upper), lower.max(upper));
-                if let Some(pos) = response.interact_pointer_pos() {
-                    let t = ((pos.x - bar_rect.left()) / bar_rect.width().max(1.0)).clamp(lo, hi);
-                    if (stops[i].t - t).abs() > f32::EPSILON {
-                        stops[i].t = t;
-                        changed = true;
+                    "Drag to move"
+                });
+            // Handles sit directly above the gradient strip, so a
+            // double-click aimed at the bar near an existing stop (most
+            // often the last one, at the visually prominent right edge)
+            // lands on the handle instead. Without this, that click is
+            // swallowed as an ordinary single click that just reselects the
+            // handle, and no new stop is ever added.
+            if response.double_clicked()
+                && stops.len() < MAX_COLOR_STOPS
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                let raw_t = (pos.x - bar_rect.left()) / bar_rect.width().max(1.0);
+                pending_insert = Some(nudge_away_from_existing(&stops, raw_t));
+            } else {
+                if response.secondary_clicked() && stops.len() > MIN_COLOR_STOPS {
+                    remove_index = Some(i);
+                }
+                if response.clicked() {
+                    selected_stop = i;
+                    value_popup_stop = Some(i);
+                    popup_kept_open = true;
+                }
+                if response.dragged() {
+                    let lower = if i == 0 {
+                        0.0
+                    } else {
+                        stops[i - 1].t + STOP_EPSILON
+                    };
+                    let upper = if i + 1 == stops.len() {
+                        1.0
+                    } else {
+                        stops[i + 1].t - STOP_EPSILON
+                    };
+                    let (lo, hi) = (lower.min(upper), lower.max(upper));
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let t =
+                            ((pos.x - bar_rect.left()) / bar_rect.width().max(1.0)).clamp(lo, hi);
+                        if (stops[i].t - t).abs() > f32::EPSILON {
+                            stops[i].t = t;
+                            changed = true;
+                        }
+                    }
+                    selected_stop = i;
+                    if value_popup_stop.is_some() {
+                        value_popup_stop = Some(i);
+                        popup_kept_open = true;
                     }
                 }
-                selected_stop = i;
             }
             let painter = ui.painter();
             let marker_color = interpolate_stops(&stops, stops[i].t);
@@ -460,16 +721,50 @@ impl<'a> ColorScaleLegend<'a> {
             );
         }
 
+        if let Some(t) = pending_insert
+            && stops.len() < MAX_COLOR_STOPS
+        {
+            let new_index = insert_stop_sorted(&mut stops, editor.allocate_color_stop_id(), t);
+            selected_stop = new_index;
+            value_popup_stop = Some(new_index);
+            popup_kept_open = true;
+            changed = true;
+        }
+
         if let Some(index) = remove_index {
             stops.remove(index);
+            value_popup_stop = match value_popup_stop {
+                Some(open_index) if open_index == index => None,
+                Some(open_index) if open_index > index => Some(open_index - 1),
+                other => other,
+            };
             selected_stop = selected_stop.min(stops.len().saturating_sub(1));
             changed = true;
         }
 
-        // Keep the always-visible legend clean: only the selected stop exposes
-        // the full colour+alpha picker, instead of placing a button under every
-        // marker where they collide as soon as stops move close together.
         if !stops.is_empty() {
+            if value_popup_stop == Some(selected_stop) {
+                let popup_response = self.draw_stop_value_popup(
+                    ui,
+                    &mut stops,
+                    selected_stop,
+                    bar_rect,
+                    handle_row_rect,
+                    min,
+                    max,
+                    &mut changed,
+                );
+                // Close the value input when the user clicks anywhere outside
+                // it — unless this frame's click was on a stop handle, which
+                // (re)opens it for that stop. Clicking inside the popup to edit
+                // the value is not "elsewhere", so it stays open.
+                if !popup_kept_open
+                    && popup_response.is_some_and(|response| response.clicked_elsewhere())
+                {
+                    value_popup_stop = None;
+                }
+            }
+
             let selected_x = bar_rect.left() + bar_rect.width() * stops[selected_stop].t;
             let swatch_x = selected_x.clamp(
                 rect.left() + COLOR_PICKER_BUTTON_WIDTH * 0.5,
@@ -481,11 +776,25 @@ impl<'a> ColorScaleLegend<'a> {
             );
             let mut srgba = straight_to_unmultiplied_srgba(stops[selected_stop].color);
             let response = ui
-                .scope_builder(egui::UiBuilder::new().max_rect(swatch_rect), |ui| {
-                    ui.spacing_mut().interact_size =
-                        egui::vec2(COLOR_PICKER_BUTTON_WIDTH, COLOR_PICKER_BUTTON_HEIGHT);
-                    ui.color_edit_button_srgba_unmultiplied(&mut srgba)
-                })
+                .scope_builder(
+                    egui::UiBuilder::new()
+                        .id_salt("color_stop_color_picker")
+                        .max_rect(swatch_rect),
+                    |ui| {
+                        ui.spacing_mut().interact_size =
+                            egui::vec2(COLOR_PICKER_BUTTON_WIDTH, COLOR_PICKER_BUTTON_HEIGHT);
+                        // Pin the colour-picker popup above the self-promoting
+                        // legend (see the sublayer comment in `show`). egui 0.35
+                        // opens it under `ui.auto_id_with("popup")`, computed
+                        // before the button is allocated; `auto_id_with` does not
+                        // advance the id source, so recomputing it here yields
+                        // the same id.
+                        let picker_popup_layer =
+                            egui::LayerId::new(egui::Order::Foreground, ui.auto_id_with("popup"));
+                        ui.ctx().set_sublayer(ui.layer_id(), picker_popup_layer);
+                        ui.color_edit_button_srgba_unmultiplied(&mut srgba)
+                    },
+                )
                 .inner
                 .on_hover_text("Click to edit color; right-click to remove");
             let picker_remove_clicked = (response.secondary_clicked()
@@ -493,6 +802,7 @@ impl<'a> ColorScaleLegend<'a> {
                     && ui.input(|input| input.pointer.secondary_clicked())))
                 && stops.len() > MIN_COLOR_STOPS;
             if picker_remove_clicked {
+                value_popup_stop = None;
                 stops.remove(selected_stop);
                 selected_stop = selected_stop.min(stops.len().saturating_sub(1));
                 changed = true;
@@ -505,9 +815,8 @@ impl<'a> ColorScaleLegend<'a> {
 
         if changed {
             let selected_t = stops.get(selected_stop).map(|stop| stop.t);
-            // Keep the array sorted by position; drags are already clamped
-            // between neighbours, but colour-only edits leave order intact,
-            // so a defensive sort here is cheap insurance against drift.
+            let value_popup_t =
+                value_popup_stop.and_then(|index| stops.get(index).map(|stop| stop.t));
             stops.sort_by(|a, b| a.t.total_cmp(&b.t));
             stops.dedup_by(|a, b| (a.t - b.t).abs() < 1e-4);
             selected_stop = selected_t
@@ -519,12 +828,20 @@ impl<'a> ColorScaleLegend<'a> {
                         .map(|(index, _)| index)
                 })
                 .unwrap_or(0);
+            value_popup_stop = value_popup_t.and_then(|t| {
+                stops
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| (a.t - t).abs().total_cmp(&(b.t - t).abs()))
+                    .map(|(index, _)| index)
+            });
             commands.push(UiCommand::SetBlockModelColorStops {
-                id: self.model.id,
+                id: model.id,
                 stops,
             });
         }
         ui.data_mut(|data| data.insert_persisted(selected_id, selected_stop));
+        ui.data_mut(|data| data.insert_persisted(value_popup_id, value_popup_stop));
 
         let fractions: &[f32] = if bar_width < 260.0 {
             &[0.0, 1.0]
@@ -536,7 +853,7 @@ impl<'a> ColorScaleLegend<'a> {
         let painter = ui.painter();
         for &t in fractions {
             let x = bar_rect.left() + bar_rect.width() * t;
-            let value = min + (max - min) * t as f64;
+            let value = normalized_to_value(t, min, max);
             let anchor = if t <= 0.01 {
                 egui::Align2::LEFT_TOP
             } else if t >= 0.99 {
@@ -553,6 +870,116 @@ impl<'a> ColorScaleLegend<'a> {
                 text_color,
             );
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_stop_value_popup(
+        &self,
+        ui: &mut egui::Ui,
+        stops: &mut [ColorStop],
+        selected_stop: usize,
+        bar_rect: egui::Rect,
+        handle_row_rect: egui::Rect,
+        min: f64,
+        max: f64,
+        changed: &mut bool,
+    ) -> Option<egui::Response> {
+        let stop = stops.get(selected_stop).copied()?;
+        let selected_x = bar_rect.left() + bar_rect.width() * stop.t;
+        let popup_pos = egui::pos2(selected_x, handle_row_rect.top() - 6.0);
+        let area_response = egui::Area::new(self.id.with("stop_value_popup"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .fixed_pos(popup_pos)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    let lower_t = if selected_stop == 0 {
+                        0.0
+                    } else {
+                        stops[selected_stop - 1].t + STOP_EPSILON
+                    };
+                    let upper_t = if selected_stop + 1 == stops.len() {
+                        1.0
+                    } else {
+                        stops[selected_stop + 1].t - STOP_EPSILON
+                    };
+                    let mut value = normalized_to_value(stop.t, min, max);
+                    let min_value = normalized_to_value(lower_t.min(upper_t), min, max);
+                    let max_value = normalized_to_value(lower_t.max(upper_t), min, max);
+                    // No forced width: the popup frame hugs the drag value
+                    // instead of leaving empty space the number sat
+                    // left-aligned against.
+                    let response = ui.add(
+                        egui::DragValue::new(&mut value)
+                            .range(min_value..=max_value)
+                            .speed(((max - min).abs() / 250.0).max(0.0001))
+                            .max_decimals(6),
+                    );
+                    if response.changed() {
+                        stops[selected_stop].t = value_to_normalized(value, min, max)
+                            .clamp(lower_t.min(upper_t), lower_t.max(upper_t));
+                        *changed = true;
+                    }
+                });
+            });
+        // Pin the value popup above the self-promoting legend (see the
+        // sublayer comment in `show`); it overlaps the legend's own settings
+        // controls, and promoting it via `move_to_top` cannot outrank a
+        // layer that is itself re-promoted every frame.
+        ui.ctx()
+            .set_sublayer(ui.layer_id(), area_response.response.layer_id);
+        Some(area_response.response)
+    }
+}
+
+fn active_variable_range(editor: &mut EditorState, model: &OpenBlockModel) -> Option<(f64, f64)> {
+    let name = model.active_numeric_variable.as_deref()?;
+    cached_variable_range(editor, model, name)
+}
+
+/// Whether the legend can show this model: it already has an active variable,
+/// or it has at least one non-special numeric variable the user could pick.
+fn model_has_selectable_variable(model: &OpenBlockModel) -> bool {
+    model.active_numeric_variable.is_some()
+        || model
+            .model
+            .numeric_variables()
+            .into_iter()
+            .any(|variable| !variable.special)
+}
+
+fn cached_variable_range(
+    editor: &mut EditorState,
+    model: &OpenBlockModel,
+    name: &str,
+) -> Option<(f64, f64)> {
+    let key = (model.id, name.to_owned());
+    if let Some(range) = editor.block_model_variable_ranges.get(&key) {
+        return *range;
+    }
+    let range = if model.active_numeric_variable.as_deref() == Some(name) {
+        model.active_value_range()
+    } else {
+        model.model.variable(name).and_then(|variable| {
+            let default = numeric_variable_default(variable);
+            model.model.numeric_values(name).ok().and_then(|values| {
+                render_value_range(&values, &model.renderable_block_indices, default)
+            })
+        })
+    };
+    editor.block_model_variable_ranges.insert(key, range);
+    range
+}
+
+fn normalized_to_value(t: f32, min: f64, max: f64) -> f64 {
+    min + (max - min) * t.clamp(0.0, 1.0) as f64
+}
+
+fn value_to_normalized(value: f64, min: f64, max: f64) -> f32 {
+    if (max - min).abs() <= f64::EPSILON {
+        0.0
+    } else {
+        ((value - min) / (max - min)).clamp(0.0, 1.0) as f32
     }
 }
 
@@ -628,5 +1055,108 @@ impl ViewportLabel {
                         ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Extend));
                     });
             });
+    }
+}
+
+#[cfg(test)]
+mod color_stop_insert_tests {
+    use super::*;
+
+    fn stops_at(ts: &[f32]) -> Vec<ColorStop> {
+        ts.iter()
+            .enumerate()
+            .map(|(index, &t)| ColorStop {
+                id: index as u64 + 1,
+                t,
+                color: [1.0, 1.0, 1.0, 1.0],
+            })
+            .collect()
+    }
+
+    /// Mirrors the positional-neighbour bounds that
+    /// `draw_stop_value_popup` and the handle drag-clamp derive for a stop at
+    /// `index`. The root cause of the insertion bug was a freshly-inserted
+    /// stop parked at the *end* of the vec: its neighbours were then the old
+    /// last stop and itself, collapsing these bounds onto the right edge and
+    /// clamping the new stop away from where the user clicked.
+    fn neighbour_bounds(stops: &[ColorStop], index: usize) -> (f32, f32) {
+        let lower = if index == 0 {
+            0.0
+        } else {
+            stops[index - 1].t + STOP_EPSILON
+        };
+        let upper = if index + 1 == stops.len() {
+            1.0
+        } else {
+            stops[index + 1].t - STOP_EPSILON
+        };
+        (lower.min(upper), lower.max(upper))
+    }
+
+    #[test]
+    fn insert_lands_in_sorted_position() {
+        let mut stops = stops_at(&[0.0, 0.5, 1.0]);
+        let index = insert_stop_sorted(&mut stops, 99, 0.27);
+        assert_eq!(index, 1, "0.27 belongs between 0.0 and 0.5");
+        let ts: Vec<f32> = stops.iter().map(|s| s.t).collect();
+        assert_eq!(ts, vec![0.0, 0.27, 0.5, 1.0]);
+        assert_eq!(stops[index].id, 99);
+    }
+
+    #[test]
+    fn insert_keeps_stops_sorted_and_returns_the_new_index() {
+        for &t in &[0.0, 0.12, 0.5, 0.51, 0.999, 1.0] {
+            let mut stops = stops_at(&[0.0, 0.5, 1.0]);
+            let index = insert_stop_sorted(&mut stops, 99, t);
+            assert!(
+                stops.windows(2).all(|w| w[0].t <= w[1].t),
+                "stops stayed sorted after inserting t={t}: {:?}",
+                stops.iter().map(|s| s.t).collect::<Vec<_>>()
+            );
+            assert!(
+                (stops[index].t - t).abs() < f32::EPSILON,
+                "returned index {index} should point at the new stop t={t}"
+            );
+            assert_eq!(stops[index].id, 99);
+        }
+    }
+
+    /// The regression guard: for any click position, the inserted stop must
+    /// sit within its own positional-neighbour bounds, so the value popup /
+    /// drag clamp leaves it exactly where it was placed. Reverting to an
+    /// append-at-end insert would return `len - 1` for a mid-range click,
+    /// whose neighbour bounds exclude the click position, and this fails.
+    #[test]
+    fn inserted_stop_is_never_clamped_away_by_its_neighbours() {
+        for existing in [
+            vec![0.0, 0.5, 1.0],
+            vec![0.0, 0.8],
+            vec![0.0, 0.2, 0.4, 0.9, 1.0],
+        ] {
+            for &click in &[0.05_f32, 0.27, 0.5, 0.63, 0.95] {
+                let mut stops = stops_at(&existing);
+                let t = nudge_away_from_existing(&stops, click);
+                let index = insert_stop_sorted(&mut stops, 99, t);
+                let (lo, hi) = neighbour_bounds(&stops, index);
+                let placed = stops[index].t;
+                assert!(
+                    placed >= lo && placed <= hi,
+                    "stop at t={placed} (click {click}, stops {existing:?}) fell outside its \
+                     neighbour bounds [{lo}, {hi}] — the popup clamp would move it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nudge_keeps_inserts_clear_of_an_edge_stop() {
+        // Overshot click past the right edge clamps to 1.0; nudge must move it
+        // clear of the stop already at 1.0 so it survives the dedup pass.
+        let stops = stops_at(&[0.0, 0.5, 1.0]);
+        let t = nudge_away_from_existing(&stops, 1.2);
+        assert!(
+            t < 1.0 && (1.0 - t) >= STOP_EPSILON - f32::EPSILON,
+            "expected nudge clear of the edge stop, got t={t}"
+        );
     }
 }

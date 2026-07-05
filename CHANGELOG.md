@@ -2,10 +2,19 @@
 
 - Misc bug fixes
 
-- Improved road tool
+- Improved the road tool
 
-- Added image to readme
+- Added a screenshot to readme
 
-- Imrpoved compatability with certain file-formats
+- Improved compatability with certain file-formats
 
 - UI improvements
+
+## V0.1.2
+
+- Further compatabaility with dgd.isis files
+
+- Welcome splashscreen
+
+- Blockmodel improvements
+

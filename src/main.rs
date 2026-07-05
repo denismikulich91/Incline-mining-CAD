@@ -17,9 +17,9 @@ pub(crate) type Size = (f32, f32);
 /// Name of the design software
 pub(crate) const APP_NAME: &str = "Incline";
 /// Internal name of the design software
-pub(crate) const APP_ID: &str = "incline-mine-designer";
+pub(crate) const APP_ID: &str = env!("CARGO_PKG_NAME");
 /// Version of release
-pub(crate) const APP_RELEASE: &str = "0.1.1";
+pub(crate) const APP_RELEASE: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> Result<()> {
     logging::init();

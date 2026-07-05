@@ -12,7 +12,7 @@ use crate::{
         SceneEntityId,
         block_model::{
             BlockModelId, BlockModelSource, ColorStop, ColorTransferFunction, LoadedBlockModel,
-            MAX_COLOR_STOPS, MIN_COLOR_STOPS, OpenBlockModel,
+            MAX_COLOR_STOPS, MIN_COLOR_STOPS, OpenBlockModel, compute_world_bounds,
         },
         formats::{
             bmf::{self, BmfModel},
@@ -99,6 +99,10 @@ impl<'a> App<'a> {
                     .with_context(|| "Failed to read companion .bdf")?;
                 let renderable_block_indices = model.renderable_block_indices()?;
                 let blocks = model.block_bounds()?;
+                // Computed once here (off the UI thread) so the per-frame
+                // transparency sort and scene-bounds queries never re-walk
+                // every block's rotated corners.
+                let world_bounds = compute_world_bounds(&model, &blocks, &renderable_block_indices);
                 if !model.has_verified_rotation() {
                     userspace_warn!(
                         "Block model {} has non-zero dip/plunge; only the bearing rotation is \
@@ -130,6 +134,7 @@ impl<'a> App<'a> {
                     bdf,
                     blocks,
                     renderable_block_indices,
+                    world_bounds,
                     scene_was_empty,
                 })
             })();
@@ -165,6 +170,7 @@ impl<'a> App<'a> {
                         color_transfer: ColorTransferFunction::default(),
                         hide_empty_color_values: true,
                         active_values_cache: Default::default(),
+                        world_bounds: loaded.world_bounds,
                     });
                     if !self.block_model_files.contains(&loaded.source) {
                         self.block_model_files.push(loaded.source);
@@ -174,7 +180,10 @@ impl<'a> App<'a> {
                     }
                     self.topology_load_pending_gpu = true;
                     self.persist_session();
-                    self.invalidate_geometry();
+                    // The model renders from block_model_gpu's per-id cache, not
+                    // the document scene. A full invalidate_geometry here would
+                    // re-upload every vector object per loaded model.
+                    self.invalidate_topology_bounds_and_redraw();
                 }
                 Ok(Err(error)) => {
                     self.pending_loads = self.pending_loads.saturating_sub(1);
@@ -196,7 +205,7 @@ impl<'a> App<'a> {
             return;
         };
         model.visible = !model.visible;
-        self.invalidate_geometry();
+        self.invalidate_topology_bounds_and_redraw();
     }
 
     pub(crate) fn set_block_model_color_variable(&mut self, id: BlockModelId, variable: String) {
@@ -206,7 +215,7 @@ impl<'a> App<'a> {
         if model.active_numeric_variable.as_deref() != Some(variable.as_str()) {
             model.active_numeric_variable = Some(variable);
             model.color_transfer = ColorTransferFunction::default();
-            self.invalidate_geometry();
+            self.request_topology_redraw();
         }
     }
 
@@ -215,7 +224,7 @@ impl<'a> App<'a> {
             return;
         };
         model.color_transfer.stops = normalized_color_stops(stops);
-        self.invalidate_geometry();
+        self.request_topology_redraw();
     }
 
     pub(crate) fn set_block_model_hide_empty_values(&mut self, id: BlockModelId, hide: bool) {
@@ -224,7 +233,7 @@ impl<'a> App<'a> {
         };
         if model.hide_empty_color_values != hide {
             model.hide_empty_color_values = hide;
-            self.invalidate_geometry();
+            self.request_topology_redraw();
         }
     }
 
@@ -235,10 +244,17 @@ impl<'a> App<'a> {
         let model = self.block_models.remove(index);
         self.clear_block_model_entity_state(model.entity_id());
         self.editor.block_model_table_pages.remove(&id);
+        self.editor.viewport_block_model_id = self
+            .editor
+            .viewport_block_model_id
+            .filter(|active| *active != id);
+        self.editor
+            .block_model_variable_ranges
+            .retain(|(model_id, _), _| *model_id != id);
         if self.active_block_model == Some(id) {
             self.active_block_model = None;
         }
-        self.invalidate_geometry();
+        self.invalidate_topology_bounds_and_redraw();
     }
 
     pub(crate) fn remove_block_model(&mut self, source: BlockModelSource) {
@@ -254,7 +270,7 @@ impl<'a> App<'a> {
         self.block_model_files
             .retain(|existing| existing.bmf_path != source.bmf_path);
         self.persist_session();
-        self.invalidate_geometry();
+        self.request_topology_redraw();
     }
 
     pub(crate) fn set_block_model_definition(
