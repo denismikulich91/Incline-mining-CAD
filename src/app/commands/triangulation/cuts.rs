@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::geometry::{clip_polygon_by_xy_edge, signed_area_xy, triangle_xy_area};
 
 impl<'a> App<'a> {
     /// Cut the triangulation, clipping each triangle against the XY polygon boundary
@@ -27,13 +28,42 @@ impl<'a> App<'a> {
             _ => anyhow::bail!("Selected object is not a closed polygon"),
         };
 
-        let (new_verts, new_faces) = clip_mesh_by_polygon_xy(&mesh, &poly_verts);
-
-        if new_faces.is_empty() {
-            anyhow::bail!("No triangulation geometry falls inside the selected polygon");
-        }
-        userspace_log!("Cut triangulation '{}' by polygon", tri_name);
-        self.finish_generated_triangulation(name, new_verts, new_faces, TriSurfaceType::Surface)
+        // Run the clip + mesh/BVH build off the UI thread; the polygon and mesh
+        // are snapshotted above so the worker never touches `self`.
+        let compute = move |cancel: &crate::app::jobs::CancelFlag|
+              -> Result<crate::model::triangulation::GeneratedTriangulationLog> {
+            let (new_verts, new_faces) = clip_mesh_by_polygon_xy(&mesh, &poly_verts);
+            if cancel.is_cancelled() {
+                anyhow::bail!("Cancelled");
+            }
+            if new_faces.is_empty() {
+                anyhow::bail!("No triangulation geometry falls inside the selected polygon");
+            }
+            let generated = super::session::build_generated_triangulation(
+                name,
+                new_verts,
+                new_faces,
+                TriSurfaceType::Surface,
+                crate::model::triangulation::unique_edges,
+            )?;
+            Ok(crate::model::triangulation::GeneratedTriangulationLog {
+                generated,
+                message: format!("Cut triangulation '{tri_name}' by polygon"),
+            })
+        };
+        let apply = move |app: &mut App,
+                          result: Result<
+            crate::model::triangulation::GeneratedTriangulationLog,
+        >| {
+            app.apply_generated_triangulation_job(result);
+        };
+        self.spawn_job(
+            "Cutting triangulation by polygon…",
+            crate::app::jobs::JobKey::Triangulation(tri_id),
+            compute,
+            apply,
+        );
+        Ok(())
     }
 
     /// Trim a topology to the region a pit shell does not excavate, so the two meshes meet at
@@ -172,72 +202,211 @@ impl<'a> App<'a> {
 }
 
 /// Clip a mesh against an XY polygon, keeping the inside (the polygon's own footprint).
+///
+/// The polygon is triangulated once with earcut, then each mesh triangle is clipped against
+/// every overlapping polygon triangle using the in-house Sutherland–Hodgman + SAT path
+/// (`clip_target_triangle_to_reference_xy`) shared with the pit-shell and include tools.
+/// This avoids the `geo` boolean-op allocation storm on large meshes and lets the per-face
+/// work run in parallel.
 pub(super) fn clip_mesh_by_polygon_xy(
     mesh: &tri00t::Triangulation,
     polygon: &[glam::DVec3],
 ) -> (Vec<tri00t::Vertex>, Vec<[u32; 3]>) {
-    let verts_raw = mesh.vertices();
-    let mut new_verts: Vec<tri00t::Vertex> = Vec::new();
-    let mut new_faces: Vec<[u32; 3]> = Vec::new();
+    use rayon::prelude::*;
 
-    for face in mesh.face_vertex_indices_iter() {
-        let raw = [verts_raw[face[0]], verts_raw[face[1]], verts_raw[face[2]]];
-        for clipped in clip_triangle_by_polygon_concave(raw, polygon) {
-            let base = new_verts.len() as u32;
-            new_verts.extend_from_slice(&clipped);
-            new_faces.push([base, base + 1, base + 2]);
-        }
+    let prepared = match PreparedClipPolygon::build(polygon) {
+        Some(p) => p,
+        None => return (Vec::new(), Vec::new()),
+    };
+
+    let target_vertices = mesh.vertices();
+    let faces: Vec<[usize; 3]> = mesh.face_vertex_indices_iter().collect();
+
+    let task_count = rayon::current_num_threads().saturating_mul(4).max(1);
+    let chunk_size = faces.len().div_ceil(task_count).max(1);
+    let partials: Vec<(Vec<tri00t::Vertex>, Vec<[u32; 3]>)> = faces
+        .par_chunks(chunk_size)
+        .map(|chunk| {
+            let mut chunk_vertices = Vec::new();
+            let mut chunk_faces = Vec::new();
+            let mut candidate_stack: Vec<usize> = Vec::new();
+            // Scratch buffer reused across (mesh_triangle, polygon_triangle) pairs.
+            // Cleared before each clip; capacity grows once to the worst-case ~6-gon.
+            let mut overlap_polygon: Vec<glam::DVec3> = Vec::new();
+
+            for face in chunk.iter().copied() {
+                let target = [
+                    target_vertices[face[0]],
+                    target_vertices[face[1]],
+                    target_vertices[face[2]],
+                ];
+
+                // AABB reject against the polygon's overall XY footprint. For a small
+                // polygon on a large mesh this alone skips ~99% of triangles.
+                let (tri_min, tri_max) = triangle_xy_bounds(target);
+                if !prepared.xy_bounds_overlap(tri_min, tri_max) {
+                    continue;
+                }
+
+                prepared
+                    .spatial
+                    .for_each_xy_bounds_candidate_index_with_stack(
+                        tri_min,
+                        tri_max,
+                        &mut candidate_stack,
+                        |index| {
+                            let poly_triangle = prepared.triangles[index];
+                            overlap_polygon.clear();
+                            clip_target_triangle_to_reference_xy_into(
+                                target,
+                                poly_triangle,
+                                &mut overlap_polygon,
+                            );
+                            if overlap_polygon.len() < 3 {
+                                return;
+                            }
+                            // Each overlap is a convex polygon (≤6 verts: a triangle
+                            // clipped by 3 half-planes), so a fan triangulates it
+                            // exactly without earcut. Z is preserved from the mesh
+                            // triangle by the clip, so no per-vertex bary_z either.
+                            emit_convex_polygon_as_fan(
+                                &overlap_polygon,
+                                &mut chunk_vertices,
+                                &mut chunk_faces,
+                            );
+                        },
+                    );
+            }
+
+            (chunk_vertices, chunk_faces)
+        })
+        .collect();
+
+    let mut output_vertices = Vec::with_capacity(partials.iter().map(|(v, _)| v.len()).sum());
+    let mut output_faces = Vec::with_capacity(partials.iter().map(|(_, f)| f.len()).sum());
+    for (vertices, faces) in partials {
+        let base = output_vertices.len() as u32;
+        output_vertices.extend(vertices);
+        output_faces.extend(
+            faces
+                .into_iter()
+                .map(|face| [base + face[0], base + face[1], base + face[2]]),
+        );
     }
-    (new_verts, new_faces)
+
+    (output_vertices, output_faces)
 }
 
-pub(super) fn clip_triangle_by_polygon_concave(
-    v: [tri00t::Vertex; 3],
+/// Push a convex polygon into the mesh buffers as a triangle fan. Degenerate
+/// (zero-area) triangles are dropped, matching `append_surface_clip_polygon`.
+fn emit_convex_polygon_as_fan(
     polygon: &[glam::DVec3],
-) -> Vec<[tri00t::Vertex; 3]> {
-    use geo::{BooleanOps, Coord, LineString, Polygon as GeoPoly};
-
+    vertices: &mut Vec<tri00t::Vertex>,
+    faces: &mut Vec<[u32; 3]>,
+) {
     if polygon.len() < 3 {
-        return vec![];
+        return;
     }
-
-    // Build triangle as a geo Polygon (closed ring: repeat first vertex at end)
-    let mut tri_coords: Vec<Coord<f64>> = v.iter().map(|p| Coord { x: p.x, y: p.y }).collect();
-    tri_coords.push(tri_coords[0]);
-    let tri_poly = GeoPoly::new(LineString::new(tri_coords), vec![]);
-
-    // Build clip polygon (closed ring)
-    let mut clip_coords: Vec<Coord<f64>> =
-        polygon.iter().map(|p| Coord { x: p.x, y: p.y }).collect();
-    clip_coords.push(clip_coords[0]);
-    let clip_poly = GeoPoly::new(LineString::new(clip_coords), vec![]);
-
-    let result = tri_poly.intersection(&clip_poly);
-
-    let mut output = Vec::new();
-    for poly in &result {
-        let exterior: Vec<Coord<f64>> = poly.exterior().coords().copied().collect();
-        // geo closes rings (last == first), skip the duplicate
-        let n = exterior.len().saturating_sub(1);
-        if n < 3 {
-            continue;
-        }
-        let flat: Vec<[f64; 2]> = exterior[..n].iter().map(|c| [c.x, c.y]).collect();
-        let mut indices: Vec<usize> = Vec::new();
-        earcut::Earcut::new().earcut(flat.iter().copied(), &[], &mut indices);
-        for tri_idx in indices.chunks_exact(3) {
-            let make_vert = |i: usize| {
-                let [x, y] = flat[i];
-                tri00t::Vertex::new(x, y, bary_z(x, y, v))
-            };
-            output.push([
-                make_vert(tri_idx[0]),
-                make_vert(tri_idx[1]),
-                make_vert(tri_idx[2]),
-            ]);
+    let base = vertices.len() as u32;
+    vertices.extend(polygon.iter().map(|p| tri00t::Vertex::new(p.x, p.y, p.z)));
+    for i in 1..(polygon.len() - 1) as u32 {
+        let face = [base, base + i, base + i + 1];
+        let a = vertices[face[0] as usize];
+        let b = vertices[face[1] as usize];
+        let c = vertices[face[2] as usize];
+        let ab = glam::DVec3::new(b.x - a.x, b.y - a.y, b.z - a.z);
+        let ac = glam::DVec3::new(c.x - a.x, c.y - a.y, c.z - a.z);
+        if ab.cross(ac).length_squared() > 1e-20 {
+            faces.push(face);
         }
     }
-    output
+}
+
+/// A closed XY polygon pre-triangulated (via earcut) and indexed by a `TriangleBvh`
+/// for fast candidate enumeration against many mesh triangles. Built once per
+/// `clip_mesh_by_polygon_xy` call.
+///
+/// Mirrors `PreparedReferenceSurface` but the source is a flat polygon ring instead
+/// of a triangulation, and the polygon triangles' Z is irrelevant (only XY drives
+/// the containment test — Z on the output mesh comes from the target triangle via
+/// `clip_target_triangle_to_reference_xy_into`).
+pub(super) struct PreparedClipPolygon {
+    pub(super) triangles: Vec<[tri00t::Vertex; 3]>,
+    pub(super) spatial: crate::model::spatial::TriangleBvh,
+    pub(super) xy_min: glam::DVec2,
+    pub(super) xy_max: glam::DVec2,
+}
+
+impl PreparedClipPolygon {
+    /// Returns `None` if the polygon has fewer than 3 vertices or no XY area.
+    pub(super) fn build(polygon: &[glam::DVec3]) -> Option<Self> {
+        if polygon.len() < 3 {
+            return None;
+        }
+
+        let mut xy_min = glam::DVec2::splat(f64::INFINITY);
+        let mut xy_max = glam::DVec2::splat(f64::NEG_INFINITY);
+        let flat: Vec<[f64; 2]> = polygon
+            .iter()
+            .map(|p| {
+                xy_min = xy_min.min(glam::DVec2::new(p.x, p.y));
+                xy_max = xy_max.max(glam::DVec2::new(p.x, p.y));
+                [p.x, p.y]
+            })
+            .collect();
+
+        let mut earcut_indices: Vec<usize> = Vec::new();
+        earcut::Earcut::new().earcut(flat.iter().copied(), &[], &mut earcut_indices);
+        if earcut_indices.len() < 3 {
+            return None;
+        }
+
+        // Build unindexed triangle vertices. Z is unused by the clip path; 0.0 is
+        // a stable placeholder that won't perturb the SAT or edge-clip math.
+        let mut prepared_vertices: Vec<tri00t::Vertex> = Vec::with_capacity(earcut_indices.len());
+        let mut prepared_faces: Vec<[u32; 3]> = Vec::with_capacity(earcut_indices.len() / 3);
+        let mut triangles: Vec<[tri00t::Vertex; 3]> = Vec::with_capacity(earcut_indices.len() / 3);
+        for tri in earcut_indices.chunks_exact(3) {
+            let corners = [
+                tri00t::Vertex::new(flat[tri[0]][0], flat[tri[0]][1], 0.0),
+                tri00t::Vertex::new(flat[tri[1]][0], flat[tri[1]][1], 0.0),
+                tri00t::Vertex::new(flat[tri[2]][0], flat[tri[2]][1], 0.0),
+            ];
+            // Skip zero-area sliver triangles earcut occasionally emits on near-
+            // collinear input — they would never produce overlap with anything.
+            if triangle_xy_area(corners).abs() <= 1e-18 {
+                continue;
+            }
+            let base = prepared_vertices.len() as u32;
+            prepared_vertices.extend_from_slice(&corners);
+            prepared_faces.push([base, base + 1, base + 2]);
+            triangles.push(corners);
+        }
+        if triangles.is_empty() {
+            return None;
+        }
+
+        let mesh =
+            tri00t::Triangulation::from_vertices_and_faces(prepared_vertices, prepared_faces);
+        let spatial = crate::model::spatial::TriangleBvh::build(&mesh);
+
+        Some(Self {
+            triangles,
+            spatial,
+            xy_min,
+            xy_max,
+        })
+    }
+
+    /// Cheap broad-phase check: does the supplied XY AABB touch this polygon's
+    /// overall footprint (with `XY_TOL` padding)?
+    fn xy_bounds_overlap(&self, min: glam::DVec2, max: glam::DVec2) -> bool {
+        const TOL: f64 = crate::model::kernel::XY_TOL;
+        max.x >= self.xy_min.x - TOL
+            && min.x <= self.xy_max.x + TOL
+            && max.y >= self.xy_min.y - TOL
+            && min.y <= self.xy_max.y + TOL
+    }
 }
 
 /// Barycentric Z interpolation: given XY point (x, y) inside triangle `v`, return its Z.
@@ -510,7 +679,7 @@ pub(super) fn clip_topology_to_pit_shell(
 
 #[derive(Debug)]
 pub(super) struct PreparedReferenceSurface {
-    pub(super) mesh: tri00t::Triangulation,
+    pub(super) mesh: std::sync::Arc<tri00t::Triangulation>,
     pub(super) triangles: Vec<[tri00t::Vertex; 3]>,
     pub(super) spatial: crate::model::spatial::TriangleBvh,
     pub(super) skipped_vertical_faces: usize,
@@ -533,7 +702,7 @@ pub(super) fn validate_reference_surface(
                 continue;
             }
             let overlap = triangle_intersection_xy(triangle, prepared.triangles[other_index]);
-            let overlap_area = polygon_area_xy(&overlap).abs();
+            let overlap_area = signed_area_xy(&overlap).abs();
             if overlap_area > overlap_area_tolerance {
                 let z_delta = overlap_z_delta(triangle, prepared.triangles[other_index], &overlap);
                 anyhow::bail!(
@@ -608,7 +777,7 @@ pub(super) fn prepare_pit_shell_surface(
     let mesh = tri00t::Triangulation::from_vertices_and_faces(prepared_vertices, prepared_faces);
     let spatial = crate::model::spatial::TriangleBvh::build(&mesh);
     Ok(PreparedReferenceSurface {
-        mesh,
+        mesh: std::sync::Arc::new(mesh),
         triangles,
         spatial,
         skipped_vertical_faces: 0,
@@ -629,10 +798,55 @@ pub(super) fn triangle_area_3d(triangle: [tri00t::Vertex; 3]) -> f64 {
 #[derive(Debug)]
 pub(super) struct PitShellLowerEnvelope {
     #[cfg_attr(not(test), allow(dead_code))]
-    mesh: tri00t::Triangulation,
+    _mesh: std::sync::Arc<tri00t::Triangulation>,
     triangles: Vec<[tri00t::Vertex; 3]>,
     covered: Vec<bool>,
     spatial: crate::model::spatial::TriangleBvh,
+}
+
+/// Insert the constraint edges the bulk loader rejected as crossing, splitting them at
+/// the intersections. spade's splitting insert asserts internally when the computed
+/// intersection point snaps onto nearby existing geometry that still blocks the
+/// constraint — near-coincident constraint sets do this, e.g. re-running Include over a
+/// footprint whose contact ring a previous run already stitched into the topology. The
+/// CDTs built here only classify cells by an interior sample, so a dropped hairline
+/// constraint is harmless; recover from the panic, keep the remaining constraints, and
+/// warn instead of crashing.
+pub(super) fn add_split_constraints(
+    cdt: &mut spade::ConstrainedDelaunayTriangulation<spade::Point2<f64>>,
+    conflicting_edges: Vec<[usize; 2]>,
+    site: &str,
+    origin: glam::DVec2,
+) {
+    use spade::Triangulation as _;
+
+    let mut skipped = 0usize;
+    for [a, b] in conflicting_edges {
+        let handle_a = spade::handles::FixedVertexHandle::from_index(a);
+        let handle_b = spade::handles::FixedVertexHandle::from_index(b);
+        let inserted = crate::logging::catch_panic_quietly(|| {
+            cdt.add_constraint_and_split(handle_a, handle_b, |point| point);
+        });
+        if inserted.is_none() {
+            skipped += 1;
+            let from = cdt.vertex(handle_a).position();
+            let to = cdt.vertex(handle_b).position();
+            userspace_warn!(
+                "{site}: skipped constraint ({:.4}, {:.4}) -> ({:.4}, {:.4}) the triangulator \
+                 could not split",
+                from.x + origin.x,
+                from.y + origin.y,
+                to.x + origin.x,
+                to.y + origin.y,
+            );
+        }
+    }
+    if skipped > 0 {
+        userspace_warn!(
+            "{site}: skipped {skipped} near-degenerate constraint edge(s); the cut boundary may \
+             be off by a hairline near them"
+        );
+    }
 }
 
 /// How far beyond the shell bounds the envelope's open padding cells extend (metres).
@@ -726,13 +940,7 @@ pub(super) fn build_pit_shell_lower_envelope(
     if cdt.num_vertices() != point_count {
         anyhow::bail!("Pit shell CDT dropped vertices unexpectedly during bulk load");
     }
-    for [a, b] in conflicting_edges {
-        cdt.add_constraint_and_split(
-            spade::handles::FixedVertexHandle::from_index(a),
-            spade::handles::FixedVertexHandle::from_index(b),
-            |point| point,
-        );
-    }
+    add_split_constraints(&mut cdt, conflicting_edges, "Pit shell envelope", origin);
 
     let cells: Vec<[glam::DVec2; 3]> = cdt
         .inner_faces()
@@ -786,7 +994,7 @@ pub(super) fn build_pit_shell_lower_envelope(
     let mesh = tri00t::Triangulation::from_vertices_and_faces(vertices, faces);
     let spatial = crate::model::spatial::TriangleBvh::build(&mesh);
     Ok(PitShellLowerEnvelope {
-        mesh,
+        _mesh: std::sync::Arc::new(mesh),
         triangles,
         covered,
         spatial,
@@ -863,16 +1071,11 @@ pub(super) fn prepare_reference_surface_relaxed(
     let mesh = tri00t::Triangulation::from_vertices_and_faces(prepared_vertices, prepared_faces);
     let spatial = crate::model::spatial::TriangleBvh::build(&mesh);
     Ok(PreparedReferenceSurface {
-        mesh,
+        mesh: std::sync::Arc::new(mesh),
         triangles,
         spatial,
         skipped_vertical_faces,
     })
-}
-
-pub(super) fn triangle_xy_area(triangle: [tri00t::Vertex; 3]) -> f64 {
-    let [a, b, c] = triangle;
-    ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)) * 0.5
 }
 
 pub(super) fn triangle_xy_bounds(triangle: [tri00t::Vertex; 3]) -> (glam::DVec2, glam::DVec2) {
@@ -908,45 +1111,46 @@ pub(super) fn triangle_intersection_xy(
     polygon
 }
 
-pub(super) fn polygon_area_xy(polygon: &[glam::DVec2]) -> f64 {
-    if polygon.len() < 3 {
-        return 0.0;
-    }
-    (0..polygon.len())
-        .map(|index| {
-            let a = polygon[index];
-            let b = polygon[(index + 1) % polygon.len()];
-            a.x * b.y - b.x * a.y
-        })
-        .sum::<f64>()
-        * 0.5
-}
-
 pub(super) fn clip_target_triangle_to_reference_xy(
     target: [tri00t::Vertex; 3],
     reference: [tri00t::Vertex; 3],
 ) -> Vec<glam::DVec3> {
+    let mut out = Vec::new();
+    clip_target_triangle_to_reference_xy_into(target, reference, &mut out);
+    out
+}
+
+/// In-place variant of `clip_target_triangle_to_reference_xy`: clears `out` and
+/// appends the convex overlap polygon (possibly empty). Lets high-frequency
+/// callers (e.g. `clip_mesh_by_polygon_xy`) reuse one scratch buffer across
+/// many triangle-pair tests instead of allocating per call.
+pub(super) fn clip_target_triangle_to_reference_xy_into(
+    target: [tri00t::Vertex; 3],
+    reference: [tri00t::Vertex; 3],
+    out: &mut Vec<glam::DVec3>,
+) {
+    out.clear();
     if !triangles_overlap_xy_sat(target, reference) {
-        return Vec::new();
+        return;
     }
-    let mut polygon: Vec<glam::DVec3> = target
-        .iter()
-        .map(|point| glam::DVec3::new(point.x, point.y, point.z))
-        .collect();
-    let reference_points = reference.map(|point| glam::DVec2::new(point.x, point.y));
+    out.extend(target.iter().map(|p| glam::DVec3::new(p.x, p.y, p.z)));
+    let reference_points = reference.map(|p| glam::DVec2::new(p.x, p.y));
     let reference_ccw = triangle_xy_area(reference) > 0.0;
+    // Sutherland–Hodgman against the 3 reference half-planes. Each iteration
+    // may shrink the polygon; bail early if it empties out.
     for edge_index in 0..3 {
-        polygon = clip_polygon_3d_by_xy_edge(
-            &polygon,
+        let next = clip_polygon_by_xy_edge(
+            out,
             reference_points[edge_index],
             reference_points[(edge_index + 1) % 3],
             reference_ccw,
         );
-        if polygon.len() < 3 {
-            break;
+        *out = next;
+        if out.len() < 3 {
+            out.clear();
+            return;
         }
     }
-    polygon
 }
 
 #[inline(always)]
@@ -1005,111 +1209,6 @@ fn project_triangle_onto_edge_normal_xy(
         max = max.max(projected);
     }
     (min, max)
-}
-
-pub(super) fn clip_polygon_3d_by_xy_edge(
-    polygon: &[glam::DVec3],
-    edge_a: glam::DVec2,
-    edge_b: glam::DVec2,
-    clip_ccw: bool,
-) -> Vec<glam::DVec3> {
-    if polygon.is_empty() {
-        return Vec::new();
-    }
-    // Signed distance in metres (scale-independent of edge length), so the
-    // on-boundary tolerance means the same thing for every clip edge.
-    let signed_distance = |point: glam::DVec3| {
-        let d = crate::model::kernel::signed_distance_to_line(
-            glam::DVec2::new(point.x, point.y),
-            edge_a,
-            edge_b,
-        );
-        if clip_ccw { d } else { -d }
-    };
-    const INSIDE_TOL: f64 = crate::model::kernel::XY_TOL;
-
-    let mut output = Vec::new();
-    let mut previous = polygon[polygon.len() - 1];
-    let mut previous_distance = signed_distance(previous);
-    let mut previous_inside = previous_distance >= -INSIDE_TOL;
-    for &current in polygon {
-        let current_distance = signed_distance(current);
-        let current_inside = current_distance >= -INSIDE_TOL;
-        if current_inside != previous_inside {
-            let denominator = previous_distance - current_distance;
-            if denominator.abs() > 1e-20 {
-                output.push(
-                    previous.lerp(current, (previous_distance / denominator).clamp(0.0, 1.0)),
-                );
-            }
-        }
-        if current_inside {
-            output.push(current);
-        }
-        previous = current;
-        previous_distance = current_distance;
-        previous_inside = current_inside;
-    }
-    deduplicate_polygon_3d(output)
-}
-
-pub(super) fn deduplicate_polygon_3d(mut polygon: Vec<glam::DVec3>) -> Vec<glam::DVec3> {
-    polygon.dedup_by(|a, b| a.distance_squared(*b) <= 1e-20);
-    if polygon.len() > 1 && polygon[0].distance_squared(polygon[polygon.len() - 1]) <= 1e-20 {
-        polygon.pop();
-    }
-    polygon
-}
-
-pub(super) fn clip_polygon_by_xy_edge(
-    polygon: &[glam::DVec2],
-    edge_a: glam::DVec2,
-    edge_b: glam::DVec2,
-    clip_ccw: bool,
-) -> Vec<glam::DVec2> {
-    if polygon.is_empty() {
-        return Vec::new();
-    }
-    // Signed distance in metres (scale-independent of edge length), so the
-    // on-boundary tolerance means the same thing for every clip edge.
-    let signed_distance = |point: glam::DVec2| {
-        let d = crate::model::kernel::signed_distance_to_line(point, edge_a, edge_b);
-        if clip_ccw { d } else { -d }
-    };
-    const INSIDE_TOL: f64 = crate::model::kernel::XY_TOL;
-
-    let mut output = Vec::new();
-    let mut previous = *polygon.last().expect("polygon is non-empty");
-    let mut previous_distance = signed_distance(previous);
-    let mut previous_inside = previous_distance >= -INSIDE_TOL;
-    for &current in polygon {
-        let current_distance = signed_distance(current);
-        let current_inside = current_distance >= -INSIDE_TOL;
-        if current_inside != previous_inside {
-            let denominator = previous_distance - current_distance;
-            if denominator.abs() > 1e-20 {
-                let t = (previous_distance / denominator).clamp(0.0, 1.0);
-                output.push(previous.lerp(current, t));
-            }
-        }
-        if current_inside {
-            output.push(current);
-        }
-        previous = current;
-        previous_distance = current_distance;
-        previous_inside = current_inside;
-    }
-    deduplicate_polygon_xy(output)
-}
-
-pub(super) fn deduplicate_polygon_xy(mut polygon: Vec<glam::DVec2>) -> Vec<glam::DVec2> {
-    polygon.dedup_by(|a, b| a.distance_squared(*b) <= 1e-20);
-    if polygon.len() > 1
-        && polygon[0].distance_squared(*polygon.last().expect("non-empty")) <= 1e-20
-    {
-        polygon.pop();
-    }
-    polygon
 }
 
 pub(super) fn clip_surface_polygon(
@@ -1172,682 +1271,5 @@ pub(super) fn append_surface_clip_polygon(
         if ab.cross(ac).length_squared() > 1e-20 {
             faces.push(face);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn kept_area(verts: &[tri00t::Vertex], faces: &[[u32; 3]]) -> f64 {
-        faces
-            .iter()
-            .map(|face| {
-                let tri = [
-                    verts[face[0] as usize],
-                    verts[face[1] as usize],
-                    verts[face[2] as usize],
-                ];
-                triangle_xy_area(tri).abs()
-            })
-            .sum()
-    }
-
-    fn covering_z_with_bvh(
-        mesh: &tri00t::Triangulation,
-        bvh: &crate::model::spatial::TriangleBvh,
-        x: f64,
-        y: f64,
-    ) -> Option<f64> {
-        let point = glam::DVec2::new(x, y);
-        let vertices = mesh.vertices();
-        bvh.xy_bounds_candidate_indices(mesh, point, point)
-            .into_iter()
-            .find_map(|index| {
-                let face = mesh.face_vertex_indices(index)?;
-                let triangle = [vertices[face[0]], vertices[face[1]], vertices[face[2]]];
-                point_in_triangle_bary_z(x, y, triangle)
-            })
-    }
-
-    fn envelope_of(pit_shell_mesh: &tri00t::Triangulation) -> PitShellLowerEnvelope {
-        build_pit_shell_lower_envelope(&prepare_pit_shell_surface(pit_shell_mesh).unwrap()).unwrap()
-    }
-
-    fn envelope_z(envelope: &PitShellLowerEnvelope, x: f64, y: f64) -> Option<f64> {
-        let point = glam::DVec2::new(x, y);
-        envelope
-            .spatial
-            .xy_bounds_candidate_indices(&envelope.mesh, point, point)
-            .into_iter()
-            .filter(|&index| envelope.covered[index])
-            .find_map(|index| point_in_triangle_bary_z(x, y, envelope.triangles[index]))
-    }
-
-    #[test]
-    fn clip_topology_to_pit_shell_follows_the_true_contact_line() {
-        // Pit shell: flat quad at z=0 over x:[0,10], y:[0,10].
-        let pit_shell_mesh = tri00t::Triangulation::from_vertices_and_faces(
-            vec![
-                tri00t::Vertex::new(0.0, 0.0, 0.0),
-                tri00t::Vertex::new(10.0, 0.0, 0.0),
-                tri00t::Vertex::new(10.0, 10.0, 0.0),
-                tri00t::Vertex::new(0.0, 10.0, 0.0),
-            ],
-            vec![[0, 1, 2], [0, 2, 3]],
-        );
-        // Topology: tilted plane z = x - 5, crossing the shell's z=0 exactly at x=5. Only the
-        // half of the footprint where the topology is above the shell (x:[5,10]) is excavated;
-        // where the shell floats above the topology (x:[0,5]) the topology is kept.
-        let topology_mesh = tri00t::Triangulation::from_vertices_and_faces(
-            vec![
-                tri00t::Vertex::new(-10.0, -10.0, -15.0),
-                tri00t::Vertex::new(20.0, -10.0, 15.0),
-                tri00t::Vertex::new(20.0, 20.0, 15.0),
-                tri00t::Vertex::new(-10.0, 20.0, -15.0),
-            ],
-            vec![[0, 1, 2], [0, 2, 3]],
-        );
-
-        let envelope = envelope_of(&pit_shell_mesh);
-        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &envelope);
-
-        assert!(!faces.is_empty());
-        // 900 topology - 50 removed (rectangle x:[5,10], y:[0,10]).
-        let total_area = kept_area(&verts, &faces);
-        assert!(
-            (total_area - 850.0).abs() < 1e-6,
-            "expected kept area 850, got {total_area}"
-        );
-
-        // No kept vertex should fall strictly inside the removed rectangle x:[5,10],y:[0,10].
-        for v in &verts {
-            let inside_removed =
-                v.x > 5.0 + 1e-9 && v.x < 10.0 - 1e-9 && v.y > 1e-9 && v.y < 10.0 - 1e-9;
-            assert!(
-                !inside_removed,
-                "vertex ({}, {}) should have been clipped away",
-                v.x, v.y
-            );
-        }
-    }
-
-    #[test]
-    fn clip_topology_to_pit_shell_closed_solid_cap_does_not_cancel_footprint() {
-        // A watertight solid whose up-facing crest cap and down-facing floor project onto
-        // the same XY footprint. The lower envelope must resolve to the floor, and the
-        // topology above it must be removed over the full footprint.
-        let r0 = tri00t::Vertex::new(0.0, 0.0, 0.0);
-        let r1 = tri00t::Vertex::new(10.0, 0.0, 0.0);
-        let r2 = tri00t::Vertex::new(10.0, 10.0, 0.0);
-        let r3 = tri00t::Vertex::new(0.0, 10.0, 0.0);
-        let f0 = tri00t::Vertex::new(0.0, 0.0, -10.0);
-        let f1 = tri00t::Vertex::new(10.0, 0.0, -10.0);
-        let f2 = tri00t::Vertex::new(10.0, 10.0, -10.0);
-        let f3 = tri00t::Vertex::new(0.0, 10.0, -10.0);
-        let pit_shell_mesh = tri00t::Triangulation::from_vertices_and_faces(
-            vec![r0, r1, r2, r3, f0, f1, f2, f3],
-            vec![
-                // crest cap, up-facing (CCW in XY)
-                [0, 1, 2],
-                [0, 2, 3],
-                // floor, down-facing (CW in XY)
-                [4, 6, 5],
-                [4, 7, 6],
-                // walls
-                [0, 5, 1],
-                [0, 4, 5],
-                [1, 6, 2],
-                [1, 5, 6],
-                [2, 7, 3],
-                [2, 6, 7],
-                [3, 4, 0],
-                [3, 7, 4],
-            ],
-        );
-        let topology_mesh = tri00t::Triangulation::from_vertices_and_faces(
-            vec![
-                tri00t::Vertex::new(-10.0, -10.0, 5.0),
-                tri00t::Vertex::new(20.0, -10.0, 5.0),
-                tri00t::Vertex::new(20.0, 20.0, 5.0),
-                tri00t::Vertex::new(-10.0, 20.0, 5.0),
-            ],
-            vec![[0, 1, 2], [0, 2, 3]],
-        );
-
-        let envelope = envelope_of(&pit_shell_mesh);
-        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &envelope);
-        let total_area = kept_area(&verts, &faces);
-        assert!(
-            (total_area - 800.0).abs() < 1e-6,
-            "closed-solid footprint (100) must be removed, got kept {total_area}"
-        );
-    }
-
-    #[test]
-    fn lower_envelope_of_closed_solid_is_the_floor() {
-        // Same watertight box as above: crest cap at z=0, floor at z=-10 over [0,10]^2,
-        // exactly vertical walls. The envelope must be the floor everywhere inside the
-        // footprint and absent outside it.
-        let r0 = tri00t::Vertex::new(0.0, 0.0, 0.0);
-        let r1 = tri00t::Vertex::new(10.0, 0.0, 0.0);
-        let r2 = tri00t::Vertex::new(10.0, 10.0, 0.0);
-        let r3 = tri00t::Vertex::new(0.0, 10.0, 0.0);
-        let f0 = tri00t::Vertex::new(0.0, 0.0, -10.0);
-        let f1 = tri00t::Vertex::new(10.0, 0.0, -10.0);
-        let f2 = tri00t::Vertex::new(10.0, 10.0, -10.0);
-        let f3 = tri00t::Vertex::new(0.0, 10.0, -10.0);
-        let pit_shell_mesh = tri00t::Triangulation::from_vertices_and_faces(
-            vec![r0, r1, r2, r3, f0, f1, f2, f3],
-            vec![
-                [0, 1, 2],
-                [0, 2, 3],
-                [4, 6, 5],
-                [4, 7, 6],
-                [0, 5, 1],
-                [0, 4, 5],
-                [1, 6, 2],
-                [1, 5, 6],
-                [2, 7, 3],
-                [2, 6, 7],
-                [3, 4, 0],
-                [3, 7, 4],
-            ],
-        );
-
-        let envelope = envelope_of(&pit_shell_mesh);
-        for (x, y) in [(5.0, 5.0), (0.5, 0.5), (9.5, 9.5), (5.0, 0.5)] {
-            let z = envelope_z(&envelope, x, y);
-            assert!(
-                z.is_some_and(|z| (z - -10.0).abs() < 1e-9),
-                "envelope at ({x}, {y}) should be the floor (-10), got {z:?}"
-            );
-        }
-        assert!(
-            envelope_z(&envelope, -1.0, 5.0).is_none(),
-            "envelope should not extend outside the shell footprint"
-        );
-    }
-
-    #[test]
-    fn lower_envelope_of_frustum_follows_walls_down_to_the_floor() {
-        // Frustum: crest rim at z=0 over [0,10]^2 sloping down to a floor at z=-10 over
-        // [3,7]^2 (walls only, no crest cap). The envelope is the wall surface over the
-        // wall band and the floor inside it.
-        let pit_shell_mesh = frustum_pit_shell();
-        let envelope = envelope_of(&pit_shell_mesh);
-
-        // Floor.
-        let z = envelope_z(&envelope, 5.0, 5.0);
-        assert!(
-            z.is_some_and(|z| (z - -10.0).abs() < 1e-9),
-            "envelope at the pit centre should be the floor (-10), got {z:?}"
-        );
-        // Front wall band: the wall plane there is z = -10 * (y / 3).
-        let z = envelope_z(&envelope, 5.0, 1.5);
-        assert!(
-            z.is_some_and(|z| (z - -5.0).abs() < 1e-9),
-            "envelope on the front wall band should be -5, got {z:?}"
-        );
-        // Outside the rim.
-        assert!(envelope_z(&envelope, 12.0, 5.0).is_none());
-    }
-
-    /// Frustum pit shell: crest rim at z=0 over [0,10]^2 sloping down to a floor at z=-10
-    /// over [3,7]^2 (walls + floor, no crest cap).
-    fn frustum_pit_shell() -> tri00t::Triangulation {
-        let r0 = tri00t::Vertex::new(0.0, 0.0, 0.0);
-        let r1 = tri00t::Vertex::new(10.0, 0.0, 0.0);
-        let r2 = tri00t::Vertex::new(10.0, 10.0, 0.0);
-        let r3 = tri00t::Vertex::new(0.0, 10.0, 0.0);
-        let f0 = tri00t::Vertex::new(3.0, 3.0, -10.0);
-        let f1 = tri00t::Vertex::new(7.0, 3.0, -10.0);
-        let f2 = tri00t::Vertex::new(7.0, 7.0, -10.0);
-        let f3 = tri00t::Vertex::new(3.0, 7.0, -10.0);
-        tri00t::Triangulation::from_vertices_and_faces(
-            vec![r0, r1, r2, r3, f0, f1, f2, f3],
-            vec![
-                [0, 1, 5],
-                [0, 5, 4],
-                [1, 2, 6],
-                [1, 6, 5],
-                [2, 3, 7],
-                [2, 7, 6],
-                [3, 0, 4],
-                [3, 4, 7],
-                [4, 5, 6],
-                [4, 6, 7],
-            ],
-        )
-    }
-
-    #[test]
-    fn clip_topology_to_pit_shell_removes_floaters_but_keeps_outside_geometry() {
-        let envelope = envelope_of(&frustum_pit_shell());
-
-        // Three planted quads (two triangles each):
-        //   A) at the pit centre, z=-5 — above the floor (-10): inside the void, must be dropped.
-        //   B) near the rim, z=+2 — above the wall band there: excavated too, must be dropped.
-        //   C) outside the footprint entirely: must be kept.
-        let planted = [
-            ([4.0, 4.0], -5.0),  // A: void
-            ([1.0, 1.0], 2.0),   // B: excavated near rim
-            ([20.0, 20.0], 5.0), // C: outside, keep
-        ];
-        let mut vertices = Vec::new();
-        let mut faces = Vec::new();
-        for ([x, y], z) in planted {
-            let quad = [
-                tri00t::Vertex::new(x, y, z),
-                tri00t::Vertex::new(x + 1.0, y, z),
-                tri00t::Vertex::new(x + 1.0, y + 1.0, z),
-                tri00t::Vertex::new(x, y + 1.0, z),
-            ];
-            let base = vertices.len() as u32;
-            vertices.extend_from_slice(&quad);
-            faces.push([base, base + 1, base + 2]);
-            faces.push([base, base + 2, base + 3]);
-        }
-        let topology_mesh = tri00t::Triangulation::from_vertices_and_faces(vertices, faces);
-
-        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &envelope);
-
-        // Only the outside quad (2 triangles) should survive.
-        assert_eq!(
-            faces.len(),
-            2,
-            "only the outside-footprint quad should remain"
-        );
-        for face in &faces {
-            let cx =
-                (verts[face[0] as usize].x + verts[face[1] as usize].x + verts[face[2] as usize].x)
-                    / 3.0;
-            assert!(cx > 15.0, "a void/excavated triangle survived the cut");
-        }
-    }
-
-    #[test]
-    fn clip_topology_to_pit_shell_clips_partial_lips() {
-        let pit_shell_mesh = tri00t::Triangulation::from_vertices_and_faces(
-            vec![
-                tri00t::Vertex::new(0.0, 0.0, 0.0),
-                tri00t::Vertex::new(10.0, 0.0, 0.0),
-                tri00t::Vertex::new(10.0, 10.0, 0.0),
-                tri00t::Vertex::new(0.0, 10.0, 0.0),
-            ],
-            vec![[0, 1, 2], [0, 2, 3]],
-        );
-        let envelope = envelope_of(&pit_shell_mesh);
-
-        // One topology triangle whose corner near (3, 2) pokes above the flat shell at z=0:
-        // only that 2 m^2 lip is excavated.
-        let topology_mesh = tri00t::Triangulation::from_vertices_and_faces(
-            vec![
-                tri00t::Vertex::new(3.0, 2.0, 1.0),
-                tri00t::Vertex::new(9.0, 2.0, -2.0),
-                tri00t::Vertex::new(3.0, 8.0, -2.0),
-            ],
-            vec![[0, 1, 2]],
-        );
-
-        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &envelope);
-
-        let kept = kept_area(&verts, &faces);
-        assert!(
-            (kept - 16.0).abs() < 1e-4,
-            "expected only the lip corner clipped away, got kept_area={kept}"
-        );
-        assert!(
-            verts.iter().all(|vertex| vertex.z <= 1e-9),
-            "cut left a vertex above the shell lower envelope"
-        );
-        assert!(
-            faces.len() > 1,
-            "the cut should trim the triangle instead of dropping or keeping it whole"
-        );
-    }
-
-    #[test]
-    fn clip_topology_to_pit_shell_clips_interior_lips() {
-        // A small shell patch strictly inside one big topology triangle: the removed region
-        // is a hole in the triangle's interior.
-        let pit_shell_mesh = tri00t::Triangulation::from_vertices_and_faces(
-            vec![
-                tri00t::Vertex::new(7.0, 1.0, -10.0),
-                tri00t::Vertex::new(9.0, 1.0, -10.0),
-                tri00t::Vertex::new(7.0, 3.0, -10.0),
-            ],
-            vec![[0, 1, 2]],
-        );
-        let envelope = envelope_of(&pit_shell_mesh);
-
-        let topology_mesh = tri00t::Triangulation::from_vertices_and_faces(
-            vec![
-                tri00t::Vertex::new(0.0, 0.0, -5.0),
-                tri00t::Vertex::new(10.0, 0.0, -5.0),
-                tri00t::Vertex::new(0.0, 10.0, -5.0),
-            ],
-            vec![[0, 1, 2]],
-        );
-
-        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &envelope);
-
-        let kept = kept_area(&verts, &faces);
-        assert!(
-            (kept - 48.0).abs() < 1e-6,
-            "expected the interior 2 m^2 lip clipped away, got kept_area={kept}"
-        );
-        for face in &faces {
-            let triangle = [
-                verts[face[0] as usize],
-                verts[face[1] as usize],
-                verts[face[2] as usize],
-            ];
-            assert!(
-                point_in_triangle_bary_z(7.25, 1.25, triangle).is_none(),
-                "interior shell patch should not remain covered by topology"
-            );
-        }
-    }
-
-    /// Timing run of the full pit-shell cut on large local data. Run with
-    /// `cargo test --release -- --ignored` when the files are present.
-    #[test]
-    #[ignore]
-    fn diag_pit_shell_cut_large_local_data() {
-        let home = std::env::var("HOME").unwrap();
-        let topology = crate::model::formats::read_mesh(format!("{home}/Downloads/NW_Surface.obj"))
-            .expect("topo loads");
-        let pit_shell = crate::model::formats::read_mesh(format!(
-            "{home}/Downloads/20250520_ob35_604rl_osa.00t"
-        ))
-        .expect("pit shell loads");
-        eprintln!(
-            "topology {} faces, shell {} faces",
-            topology.face_count(),
-            pit_shell.face_count()
-        );
-
-        let start = std::time::Instant::now();
-        let prepared = prepare_pit_shell_surface(&pit_shell).expect("prepare");
-        eprintln!("prepare_pit_shell_surface: {:.2?}", start.elapsed());
-        let start = std::time::Instant::now();
-        let envelope = build_pit_shell_lower_envelope(&prepared).expect("envelope");
-        eprintln!(
-            "build_pit_shell_lower_envelope: {:.2?} ({} cells)",
-            start.elapsed(),
-            envelope.triangles.len()
-        );
-        let start = std::time::Instant::now();
-        let (verts, faces) = clip_topology_to_pit_shell(&topology, &envelope);
-        eprintln!(
-            "clip_topology_to_pit_shell: {:.2?} ({} verts, {} faces)",
-            start.elapsed(),
-            verts.len(),
-            faces.len()
-        );
-        assert!(!faces.is_empty());
-        assert!(
-            faces.len() < topology.face_count() + 4_000_000,
-            "unexpected output explosion"
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn reported_lip_point_not_covered_on_tutorial_data() {
-        let topology = crate::model::formats::read_mesh("tutorial/example_data/topology.obj")
-            .expect("topology.obj loads");
-        let pit_surface =
-            crate::model::formats::read_mesh("tutorial/example_data/tutorial_pit_surface.00t")
-                .expect("pit surface loads");
-        let envelope = envelope_of(&pit_surface);
-        let (verts, faces) = clip_topology_to_pit_shell(&topology, &envelope);
-        let x = 194_396.016;
-        let y = 7_954_711.042;
-        let shell_z = envelope_z(&envelope, x, y);
-        eprintln!(
-            "output verts={} faces={} envelope_z_at_reported={shell_z:?}",
-            verts.len(),
-            faces.len()
-        );
-        for (face_index, face) in faces.iter().enumerate() {
-            let triangle = [
-                verts[face[0] as usize],
-                verts[face[1] as usize],
-                verts[face[2] as usize],
-            ];
-            if let Some(z) = point_in_triangle_bary_z(x, y, triangle) {
-                eprintln!(
-                    "contains face={face_index} topo_z={z:.6} delta={:?} tri={triangle:?}",
-                    shell_z.map(|s| z - s)
-                );
-                panic!("reported point is still covered by output topology");
-            }
-        }
-    }
-
-    /// Full-footprint verification of the pit-shell cut against real tutorial data, in both
-    /// directions: no output geometry encroaches into the excavated void, and no topology
-    /// that should survive goes missing. Run with `cargo test -- --ignored` when the
-    /// tutorial example data is present.
-    #[test]
-    #[ignore]
-    fn pit_shell_cut_preserves_coverage_and_removes_encroachment_on_tutorial_data() {
-        let topology = crate::model::formats::read_mesh("tutorial/example_data/topology.obj")
-            .expect("topology.obj loads");
-        let pit_surface =
-            crate::model::formats::read_mesh("tutorial/example_data/tutorial_pit_surface.00t")
-                .expect("pit surface loads");
-        let envelope = envelope_of(&pit_surface);
-        let (verts, faces) = clip_topology_to_pit_shell(&topology, &envelope);
-        let output = tri00t::Triangulation::from_vertices_and_faces(verts, faces);
-        let input_bvh = crate::model::spatial::TriangleBvh::build(&topology);
-        let output_bvh = crate::model::spatial::TriangleBvh::build(&output);
-
-        // Samples closer than this (vertically) to the contact line are skipped: right on
-        // the seam, coverage legitimately switches between topology and pit shell.
-        const CONTACT_MARGIN: f64 = 0.01;
-
-        let bounds = topology.bounds();
-        let steps = 400;
-        let step_x = (bounds.max.x - bounds.min.x) / steps as f64;
-        let step_y = (bounds.max.y - bounds.min.y) / steps as f64;
-        let mut worst_encroachment: Option<(f64, f64, f64)> = None;
-        let mut missing: Vec<(f64, f64, f64, Option<f64>)> = Vec::new();
-        let mut checked = 0usize;
-        for yi in 0..=steps {
-            for xi in 0..=steps {
-                let x = bounds.min.x + xi as f64 * step_x;
-                let y = bounds.min.y + yi as f64 * step_y;
-                let Some(input_z) = covering_z_with_bvh(&topology, &input_bvh, x, y) else {
-                    continue;
-                };
-                checked += 1;
-                let shell_z = envelope_z(&envelope, x, y);
-                let output_z = covering_z_with_bvh(&output, &output_bvh, x, y);
-                match shell_z {
-                    // Excavated: the topology is clearly above the envelope, so the output
-                    // must not cover this point at all.
-                    Some(shell_z) if input_z > shell_z + CONTACT_MARGIN => {
-                        if output_z.is_some()
-                            && worst_encroachment
-                                .is_none_or(|(depth, ..)| input_z - shell_z > depth)
-                        {
-                            worst_encroachment = Some((input_z - shell_z, x, y));
-                        }
-                    }
-                    // Kept: clearly below the envelope, or outside the shell footprint —
-                    // the output must still cover this point.
-                    Some(shell_z) if input_z < shell_z - CONTACT_MARGIN => {
-                        if output_z.is_none() {
-                            missing.push((x, y, input_z, Some(shell_z)));
-                        }
-                    }
-                    None => {
-                        if output_z.is_none() {
-                            missing.push((x, y, input_z, None));
-                        }
-                    }
-                    // Within the contact margin: either outcome is correct.
-                    Some(_) => {}
-                }
-            }
-        }
-        eprintln!(
-            "checked={checked} worst_encroachment={worst_encroachment:?} missing={} first_missing={:?}",
-            missing.len(),
-            missing.iter().take(20).collect::<Vec<_>>()
-        );
-        assert!(
-            worst_encroachment.is_none(),
-            "output topology encroaches into the excavated void: {worst_encroachment:?}"
-        );
-        assert!(
-            missing.is_empty(),
-            "{} should-keep samples missing from output",
-            missing.len()
-        );
-    }
-
-    #[test]
-    fn clip_topology_to_pit_shell_is_robust_at_utm_coordinates() {
-        // Real mine data lives in UTM-scale coordinates; the boolean ops must still work.
-        let ox = 194_500.0;
-        let oy = 7_954_800.0;
-        let v = |x: f64, y: f64, z: f64| tri00t::Vertex::new(ox + x, oy + y, z);
-        let pit_shell_mesh = tri00t::Triangulation::from_vertices_and_faces(
-            vec![
-                v(0.0, 0.0, 250.0),
-                v(10.0, 0.0, 250.0),
-                v(10.0, 10.0, 250.0),
-                v(0.0, 10.0, 250.0),
-            ],
-            vec![[0, 1, 2], [0, 2, 3]],
-        );
-        let topology_mesh = tri00t::Triangulation::from_vertices_and_faces(
-            vec![
-                v(-10.0, -10.0, 260.0),
-                v(20.0, -10.0, 260.0),
-                v(20.0, 20.0, 260.0),
-                v(-10.0, 20.0, 260.0),
-            ],
-            vec![[0, 1, 2], [0, 2, 3]],
-        );
-
-        let envelope = envelope_of(&pit_shell_mesh);
-        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &envelope);
-        let total_area = kept_area(&verts, &faces);
-        assert!(
-            (total_area - 800.0).abs() < 1e-3,
-            "expected kept area 800 at UTM scale, got {total_area}"
-        );
-    }
-
-    #[test]
-    fn clip_topology_to_pit_shell_passes_through_when_no_overlap() {
-        let pit_shell_mesh = tri00t::Triangulation::from_vertices_and_faces(
-            vec![
-                tri00t::Vertex::new(100.0, 100.0, 0.0),
-                tri00t::Vertex::new(110.0, 100.0, 0.0),
-                tri00t::Vertex::new(110.0, 110.0, 0.0),
-                tri00t::Vertex::new(100.0, 110.0, 0.0),
-            ],
-            vec![[0, 1, 2], [0, 2, 3]],
-        );
-        let topology_mesh = tri00t::Triangulation::from_vertices_and_faces(
-            vec![
-                tri00t::Vertex::new(0.0, 0.0, 5.0),
-                tri00t::Vertex::new(10.0, 0.0, 5.0),
-                tri00t::Vertex::new(0.0, 10.0, 5.0),
-            ],
-            vec![[0, 1, 2]],
-        );
-
-        let envelope = envelope_of(&pit_shell_mesh);
-        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &envelope);
-
-        assert_eq!(faces.len(), 1);
-        assert_eq!(verts.len(), 3);
-        assert_eq!(verts[0], tri00t::Vertex::new(0.0, 0.0, 5.0));
-        assert_eq!(verts[1], tri00t::Vertex::new(10.0, 0.0, 5.0));
-        assert_eq!(verts[2], tri00t::Vertex::new(0.0, 10.0, 5.0));
-    }
-
-    #[test]
-    fn clip_topology_to_pit_shell_follows_walls_down_to_the_floor() {
-        // Frustum pit shell: the walls determine how far in from the rim the topology must
-        // be removed as depth increases, so the lower envelope must include them.
-        let pit_shell_mesh = frustum_pit_shell();
-
-        // Topology: flat plane at z=-5, well above the floor (-10) but below the rim (0).
-        let topology_mesh = tri00t::Triangulation::from_vertices_and_faces(
-            vec![
-                tri00t::Vertex::new(-10.0, -10.0, -5.0),
-                tri00t::Vertex::new(20.0, -10.0, -5.0),
-                tri00t::Vertex::new(20.0, 20.0, -5.0),
-                tri00t::Vertex::new(-10.0, 20.0, -5.0),
-            ],
-            vec![[0, 1, 2], [0, 2, 3]],
-        );
-
-        let envelope = envelope_of(&pit_shell_mesh);
-        let (verts, faces) = clip_topology_to_pit_shell(&topology_mesh, &envelope);
-        assert!(!faces.is_empty());
-
-        // The cut follows the true contact line down the walls: only the inner part of the
-        // footprint, where the sloping wall/floor has dropped below the z=-5 topology, is
-        // excavated. The outer wall band (still above z=-5) and everything outside the crest
-        // is kept, so strictly more than 900 - 100 = 800 survives and strictly less than 900.
-        let kept = kept_area(&verts, &faces);
-        assert!(
-            kept > 800.0 + 1.0,
-            "expected partial retention within the pit footprint (outer wall band above the \
-             topology should survive), got kept_area={kept}"
-        );
-        assert!(
-            kept < 900.0 - 1.0,
-            "expected the excavated inner region removed, got kept_area={kept}"
-        );
-    }
-
-    #[test]
-    fn validate_reference_surface_reports_projected_overlap_details() {
-        let mesh = tri00t::Triangulation::from_vertices_and_faces(
-            vec![
-                tri00t::Vertex::new(0.0, 0.0, 0.0),
-                tri00t::Vertex::new(2.0, 0.0, 0.0),
-                tri00t::Vertex::new(0.0, 2.0, 0.0),
-                tri00t::Vertex::new(0.5, 0.5, 1.0),
-                tri00t::Vertex::new(2.5, 0.5, 1.0),
-                tri00t::Vertex::new(0.5, 2.5, 1.0),
-            ],
-            vec![[0, 1, 2], [3, 4, 5]],
-        );
-
-        let error = validate_reference_surface(&mesh).unwrap_err().to_string();
-
-        assert!(error.contains("triangles 0 and 1"));
-        assert!(error.contains("Z difference"));
-    }
-
-    #[test]
-    fn prepare_reference_surface_skips_zero_xy_faces() {
-        let mesh = tri00t::Triangulation::from_vertices_and_faces(
-            vec![
-                tri00t::Vertex::new(0.0, 0.0, 0.0),
-                tri00t::Vertex::new(2.0, 0.0, 0.0),
-                tri00t::Vertex::new(0.0, 2.0, 0.0),
-                tri00t::Vertex::new(3.0, 0.0, 0.0),
-                tri00t::Vertex::new(3.0, 1.0, 1.0),
-                tri00t::Vertex::new(3.0, 2.0, 2.0),
-            ],
-            vec![[0, 1, 2], [3, 4, 5]],
-        );
-
-        let prepared = prepare_reference_surface_relaxed(&mesh).unwrap();
-
-        assert_eq!(prepared.triangles.len(), 1);
-        assert_eq!(prepared.skipped_vertical_faces, 1);
     }
 }

@@ -22,6 +22,9 @@ impl<'a> App<'a> {
         let Some((SceneEntityId::Object(object_id), _)) = picked else {
             return;
         };
+        if !self.activate_project_for_object(object_id) {
+            return;
+        }
         self.editor.tool_highlight_id = None;
         self.explode_polygon(object_id);
     }
@@ -40,7 +43,12 @@ impl<'a> App<'a> {
         });
         let hovered = picked.and_then(|(h, _)| match h {
             SceneEntityId::Object(id)
-                if matches!(self.active_layer_object(id), Some(Object::Polyline { .. })) =>
+                if self
+                    .workspace
+                    .project_index_for_object(id)
+                    .and_then(|index| self.workspace.projects.get(index))
+                    .and_then(|project| project.pidb.document.get_object(id))
+                    .is_some_and(|object| matches!(object, Object::Polyline { .. })) =>
             {
                 Some(id)
             }
@@ -53,7 +61,10 @@ impl<'a> App<'a> {
     }
 
     pub(crate) fn explode_polygon(&mut self, object_id: ObjectId) {
-        let source = match self.active_layer_object(object_id) {
+        if !self.activate_project_for_object(object_id) {
+            return;
+        }
+        let source = match self.active_document().get_object(object_id) {
             Some(obj @ Object::Polyline { .. }) => obj.clone(),
             _ => {
                 return;
@@ -77,7 +88,7 @@ impl<'a> App<'a> {
 
         // Build edge segments.
         let edge_count = if closed { verts.len() } else { verts.len() - 1 };
-        let mut batch_cmds = vec![Command::DeleteObject(source)];
+        let mut batch_cmds = vec![Command::delete_object(source)];
 
         if let Some(project) = self.workspace.active_project_mut() {
             let doc = &mut project.pidb.document;
@@ -92,12 +103,10 @@ impl<'a> App<'a> {
                     closed: false,
                     color,
                     fill: crate::model::FillStyle::Clear,
-                    fill_color: None,
                     line_weight,
                 }));
             }
             self.history.execute(doc, Command::Batch(batch_cmds));
-            project.dirty = true;
         }
 
         self.editor

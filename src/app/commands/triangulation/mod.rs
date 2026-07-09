@@ -24,6 +24,7 @@ mod creation;
 mod cuts;
 mod geometry;
 mod include;
+mod point_cloud_tin;
 mod session;
 
 use geometry::*;

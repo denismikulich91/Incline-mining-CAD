@@ -1,15 +1,19 @@
 //! Triangulation creation and processing dialogs.
 
 use crate::{
-    model::{Document, Object, ObjectId, SceneEntityId, triangulation::TriangulationId},
+    model::{
+        Document, Object, ObjectId, SceneEntityId, point_cloud::PointCloudId,
+        triangulation::TriangulationId,
+    },
     rendering::color::{color32_to_rgba, rgba_to_color32},
     ui::{
         state::{
-            EditorState, TriCreatePhase, TriSurfaceCutSide, TriSurfaceType, UiCommand,
-            UiProjectView,
+            EditorState, TriCreatePhase, TriCreateSource, TriSurfaceCutSide, TriSurfaceType,
+            UiCommand, UiProjectView,
         },
         widgets::menu::{
-            DragableMenu, MenuField, MenuFieldColor32, MenuFieldCombo, MenuFieldF64, MenuFieldText,
+            DragableMenu, MenuField, MenuFieldBool, MenuFieldColor32, MenuFieldCombo, MenuFieldF64,
+            MenuFieldText, MenuFieldU32,
         },
     },
 };
@@ -18,6 +22,7 @@ use crate::{
 fn tri_reset_state(editor: &mut EditorState) {
     editor.tri_create_open = false;
     editor.tri_create_phase = TriCreatePhase::MainDialog;
+    editor.tri_create_source = TriCreateSource::Polygons;
     editor.tri_create_picker_px = None;
     editor.tri_hover_handles.clear();
     editor.tri_selected_object_ids.clear();
@@ -61,14 +66,22 @@ pub(crate) fn draw_tri_create_main_dialog(
     }
 
     let mut open = true;
-    DragableMenu::new("Create Triangulation")
+    let road_mode = editor.tri_create_source == TriCreateSource::Roads;
+    let title = if road_mode {
+        "Convert Roads to Triangulation"
+    } else {
+        "Create Triangulation"
+    };
+    DragableMenu::new(title)
         .open(&mut open)
         .min_width(300.0)
         .show(ui.ctx(), |ui| {
-            ui.colored_label(
-                egui::Color32::GRAY,
-                "Click objects in the viewport to select/deselect. Drag to box-select.",
-            );
+            let prompt = if road_mode {
+                "Click roads in the viewport to select/deselect. Drag to box-select."
+            } else {
+                "Click objects in the viewport to select/deselect. Drag to box-select."
+            };
+            ui.colored_label(egui::Color32::GRAY, prompt);
             ui.add_space(4.0);
 
             // --- Selection list ---
@@ -109,25 +122,32 @@ pub(crate) fn draw_tri_create_main_dialog(
 
             let has_selection = !editor.tri_selected_object_ids.is_empty();
             if !has_selection {
-                ui.colored_label(egui::Color32::GRAY, "No objects selected yet.");
+                let empty = if road_mode {
+                    "No roads selected yet."
+                } else {
+                    "No objects selected yet."
+                };
+                ui.colored_label(egui::Color32::GRAY, empty);
             }
 
             ui.add_space(4.0);
-            ui.separator();
+            if !road_mode {
+                ui.separator();
 
-            // --- Surface / solid type ---
-            let surface_type_label = tri_surface_type_label(editor.tri_surface_type);
-            MenuFieldCombo::new(
-                "tri_surface_type",
-                "Triangulation type",
-                &mut editor.tri_surface_type,
-                surface_type_label,
-                [TriSurfaceType::Surface, TriSurfaceType::SolidClosed].map(|surface_type| {
-                    (surface_type, tri_surface_type_label(surface_type).into())
-                }),
-            )
-            .width(210.0)
-            .show(ui);
+                // --- Surface / solid type ---
+                let surface_type_label = tri_surface_type_label(editor.tri_surface_type);
+                MenuFieldCombo::new(
+                    "tri_surface_type",
+                    "Triangulation type",
+                    &mut editor.tri_surface_type,
+                    surface_type_label,
+                    [TriSurfaceType::Surface, TriSurfaceType::SolidClosed].map(|surface_type| {
+                        (surface_type, tri_surface_type_label(surface_type).into())
+                    }),
+                )
+                .width(210.0)
+                .show(ui);
+            }
 
             ui.separator();
 
@@ -146,12 +166,17 @@ pub(crate) fn draw_tri_create_main_dialog(
                     let object_ids: Vec<ObjectId> = editor.tri_selected_object_ids.clone();
                     let name = editor.tri_name_input.trim().to_owned();
                     let surface_type = editor.tri_surface_type;
+                    let command = if road_mode {
+                        UiCommand::ExecuteConvertRoadsToTriangulation { name, object_ids }
+                    } else {
+                        UiCommand::ExecuteCreateTriangulation {
+                            name,
+                            object_ids,
+                            surface_type,
+                        }
+                    };
                     tri_reset_state(editor);
-                    commands.push(UiCommand::ExecuteCreateTriangulation {
-                        name,
-                        object_ids,
-                        surface_type,
-                    });
+                    commands.push(command);
                 }
                 if ui.button("Cancel").clicked() {
                     tri_reset_state(editor);
@@ -307,7 +332,7 @@ pub(crate) fn draw_cut_poly_dialog(
                 };
                 ui.horizontal(|ui| {
                     ui.add(egui::Label::new(poly_label).truncate());
-                    if ui.button("Pick …").clicked() {
+                    if ui.button("Pick...").clicked() {
                         commands.push(UiCommand::BeginCutPolyPick);
                     }
                 })
@@ -905,15 +930,35 @@ pub(crate) fn draw_contour_dialog(
 
             ui.add_space(4.0);
 
+            MenuFieldBool::new("Limit Z range", &mut editor.tri_contour_use_z_range).show(ui);
+            if editor.tri_contour_use_z_range {
+                MenuFieldF64::new(
+                    "Z from",
+                    &mut editor.tri_contour_z_min_input,
+                    f64::MIN..=f64::MAX,
+                )
+                .width(70.0)
+                .show(ui);
+                MenuFieldF64::new(
+                    "Z to",
+                    &mut editor.tri_contour_z_max_input,
+                    f64::MIN..=f64::MAX,
+                )
+                .width(70.0)
+                .show(ui);
+            }
+
+            ui.add_space(4.0);
+
             let mut minor_color = rgba_to_color32(editor.tri_contour_minor_color);
-            if MenuFieldColor32::new("Minor color", &mut minor_color)
+            if MenuFieldColor32::new("Minor colour", &mut minor_color)
                 .show(ui)
                 .changed()
             {
                 editor.tri_contour_minor_color = color32_to_rgba(minor_color);
             }
             let mut major_color = rgba_to_color32(editor.tri_contour_major_color);
-            if MenuFieldColor32::new("Major color", &mut major_color)
+            if MenuFieldColor32::new("Major colour", &mut major_color)
                 .show(ui)
                 .changed()
             {
@@ -950,8 +995,15 @@ pub(crate) fn draw_contour_dialog(
                 && minor_interval >= 1e-6
                 && major_interval >= 1e-6
                 && major_interval >= minor_interval;
+            let z_range = editor.tri_contour_use_z_range.then_some((
+                editor.tri_contour_z_min_input,
+                editor.tri_contour_z_max_input,
+            ));
+            let valid_z_range =
+                z_range.is_none_or(|(lo, hi)| lo.is_finite() && hi.is_finite() && lo < hi);
             let can_run = editor.tri_contour_tri_id.is_some()
                 && valid_intervals
+                && valid_z_range
                 && !project.projects.is_empty();
 
             ui.horizontal(|ui| {
@@ -967,6 +1019,7 @@ pub(crate) fn draw_contour_dialog(
                         major_color: editor.tri_contour_major_color,
                         minor_color: editor.tri_contour_minor_color,
                         project_index: editor.tri_contour_project_index,
+                        z_range,
                     });
                 }
                 if ui.button("Cancel").clicked() {
@@ -976,5 +1029,116 @@ pub(crate) fn draw_contour_dialog(
         });
     if !open {
         editor.tri_contour_open = false;
+    }
+}
+
+/// Survey point-cloud reconstruction: build an open terrain TIN from XY/Z
+/// samples.
+pub(crate) fn draw_point_cloud_tin_dialog(
+    ui: &mut egui::Ui,
+    editor: &mut EditorState,
+    project: &UiProjectView,
+    commands: &mut Vec<UiCommand>,
+) {
+    if !editor.point_cloud_tin_open {
+        return;
+    }
+    let mut open = true;
+    DragableMenu::new("Create Terrain TIN")
+        .open(&mut open)
+        .min_width(320.0)
+        .show(ui.ctx(), |ui| {
+            let loaded: Vec<(PointCloudId, &str, usize)> = project
+                .point_clouds
+                .iter()
+                .filter_map(|cloud| {
+                    cloud
+                        .id
+                        .map(|id| (id, cloud.name.as_str(), cloud.point_count))
+                })
+                .collect();
+            if loaded.is_empty() {
+                ui.colored_label(
+                    egui::Color32::GRAY,
+                    "No point clouds are loaded. Import one via File ▸ Import first.",
+                );
+            }
+            let selected = editor
+                .point_cloud_tin_cloud_id
+                .and_then(|id| loaded.iter().find(|(lid, ..)| *lid == id).copied());
+            let cloud_label = selected.map(|(_, name, _)| name).unwrap_or("— select —");
+            MenuFieldCombo::new(
+                "point_cloud_tin_cloud",
+                "Point cloud",
+                &mut editor.point_cloud_tin_cloud_id,
+                cloud_label,
+                loaded
+                    .iter()
+                    .map(|(id, name, _)| (Some(*id), (*name).into())),
+            )
+            .width(220.0)
+            .show(ui);
+
+            ui.add_space(4.0);
+
+            MenuFieldF64::new(
+                "Max edge length",
+                &mut editor.point_cloud_tin_max_edge,
+                0.0..=1_000_000.0,
+            )
+            .speed(1.0)
+            .suffix("m")
+            .show(ui);
+            MenuFieldU32::new(
+                "Max points",
+                &mut editor.point_cloud_tin_max_points,
+                1_000..=5_000_000,
+            )
+            .speed(1000.0)
+            .show(ui);
+            if let Some((.., point_count)) = selected
+                && point_count > editor.point_cloud_tin_max_points as usize
+            {
+                ui.colored_label(
+                    egui::Color32::GRAY,
+                    format!(
+                        "The cloud has {point_count} points; it will be subsampled to about {} \
+                         before reconstruction.",
+                        editor.point_cloud_tin_max_points
+                    ),
+                );
+            }
+
+            ui.add_space(4.0);
+            ui.separator();
+
+            MenuFieldText::new("Name", &mut editor.point_cloud_tin_name_input)
+                .width(180.0)
+                .hint_text("triangulation name")
+                .show(ui);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let can_run =
+                    selected.is_some() && !editor.point_cloud_tin_name_input.trim().is_empty();
+                if ui
+                    .add_enabled(can_run, egui::Button::new("Reconstruct"))
+                    .clicked()
+                    && let Some((cloud_id, ..)) = selected
+                {
+                    commands.push(UiCommand::ExecutePointCloudTin {
+                        cloud_id,
+                        name: editor.point_cloud_tin_name_input.trim().to_owned(),
+                        max_edge: editor.point_cloud_tin_max_edge,
+                        max_points: editor.point_cloud_tin_max_points,
+                    });
+                    editor.point_cloud_tin_open = false;
+                }
+                if ui.button("Cancel").clicked() {
+                    editor.point_cloud_tin_open = false;
+                }
+            });
+        });
+    if !open {
+        editor.point_cloud_tin_open = false;
     }
 }

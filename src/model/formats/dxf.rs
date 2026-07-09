@@ -60,6 +60,17 @@ pub(crate) fn from_dxf(drawing: &Drawing) -> Document {
     let scope = BlockScope::world();
     import_entities(drawing.entities(), &mut ctx, &transform, scope);
 
+    // The DXF spec mandates a default "0" layer and `Drawing::new()` always
+    // emits one, so an exported DXF carrying a single real layer still
+    // includes an empty "0". Drop it on import when it has no geometry,
+    // unless it is the only layer (the document must keep at least one).
+    if doc.layers().len() > 1
+        && let Some(zero_id) = doc.layer_id_by_name("0")
+        && !doc.objects().iter().any(|object| object.layer() == zero_id)
+    {
+        doc.delete_layer(zero_id);
+    }
+
     doc
 }
 
@@ -411,7 +422,6 @@ fn push_polyline(
         closed,
         color,
         fill: crate::model::FillStyle::Clear,
-        fill_color: None,
         line_weight: 1.0,
     });
 }

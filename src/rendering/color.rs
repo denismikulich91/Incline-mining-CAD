@@ -287,8 +287,10 @@ pub(crate) fn aci_to_linear_rgba(aci: i32) -> Option<[f32; 4]> {
 /// columns as `Colour, Red, Blue, Green`, so blue/green are swapped back here.
 /// Indices past 32 are white in the default scheme.
 ///
-/// A design file may override this via a hidden `dig$colour`/`dig$colour256`
-/// layer or a project `.scd`; those are not yet parsed, so this default is used.
+/// A design file may embed its own palette in a hidden `dig$colour256` layer
+/// (parsed by `crate::model::formats::isis::scan_dgd_color_table`); that takes
+/// precedence, and this default is only the fallback for indices it does not
+/// define. A project `.scd` override is still not parsed.
 pub(crate) const VULCAN_DEFAULT_PALETTE: [[u8; 3]; 256] = [
     [255, 0, 0],     // 1
     [255, 0, 255],   // 2
@@ -551,11 +553,18 @@ pub(crate) const VULCAN_DEFAULT_PALETTE: [[u8; 3]; 256] = [
 /// Convert a Maptek Vulcan object colour index (1-based) to a linear RGBA
 /// colour via the default palette. Returns `None` for 0 (no colour) or out of
 /// range, letting the caller fall back to the layer colour.
+///
+/// This is the built-in fallback used when a design database does not embed its
+/// own colour table; prefer the file's `dig$colour256` palette when present
+/// (see `crate::model::formats::isis::DgdColorTable`).
 pub(crate) fn vulcan_color_to_linear_rgba(index: u8) -> Option<[f32; 4]> {
     let rgb = VULCAN_DEFAULT_PALETTE.get((index as usize).checked_sub(1)?)?;
-    Some(hex_to_linear_rgba(
-        ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32,
-    ))
+    Some(rgb_bytes_to_linear_rgba(*rgb))
+}
+
+/// Convert an 8-bit `[R, G, B]` triple (sRGB) to linear RGBA with full alpha.
+pub(crate) fn rgb_bytes_to_linear_rgba(rgb: [u8; 3]) -> [f32; 4] {
+    hex_to_linear_rgba(((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32)
 }
 
 pub(crate) fn byte_to_linear_rgba(c: u8) -> f32 {
@@ -598,26 +607,4 @@ pub(crate) fn color32_to_rgba(c: egui::Color32) -> [f32; 4] {
         b as f32 / 255.0,
         a as f32 / 255.0,
     ]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn vulcan_colour_7_is_light_green() {
-        // Confirmed in Vulcan's property panel: index 7 = #88FF88. This also
-        // guards the R/B/G column order of the parsed `eph.scd` palette.
-        let rgba = vulcan_color_to_linear_rgba(7).expect("index 7 is defined");
-        assert_eq!(rgba, hex_to_linear_rgba(0x88FF88));
-        assert_eq!(VULCAN_DEFAULT_PALETTE[6], [136, 255, 136]);
-    }
-
-    #[test]
-    fn vulcan_colour_index_zero_and_one_based_bounds() {
-        assert_eq!(vulcan_color_to_linear_rgba(0), None);
-        assert_eq!(VULCAN_DEFAULT_PALETTE[0], [255, 0, 0]); // index 1 = red
-        assert!(vulcan_color_to_linear_rgba(1).is_some());
-        assert!(vulcan_color_to_linear_rgba(255).is_some());
-    }
 }

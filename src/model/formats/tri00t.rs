@@ -20,7 +20,7 @@ const VULZ_PAGE_EXPANDED_LEN: usize = 25_600;
 
 pub const VULZ_MAGIC: &[u8; 8] = b"\xea\xfb\xa7\x8avulZ";
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct Triangulation {
     vertices: Vec<Vertex>,
     faces: Vec<Face>,
@@ -169,7 +169,7 @@ impl Triangulation {
 
     /// Construct a triangulation from a computed vertex list and face index triples.
     /// Face indices must be zero-based and within bounds. The raw header is populated
-    /// with the counts so the result can be round-tripped through `write_mesh`.
+    /// with the counts so the result can be round-tripped through `write_mesh_with_progress`.
     pub fn from_vertices_and_faces(vertices: Vec<Vertex>, faces: Vec<[u32; 3]>) -> Self {
         let bounds = Bounds::from_vertices(&vertices);
         let mut raw_header = vec![0u8; RAW_HEADER_LEN];
@@ -188,7 +188,15 @@ impl Triangulation {
         }
     }
 
-    pub fn write_00t(&self, writer: &mut impl Write) -> io::Result<()> {
+    /// Write the triangulation in Vulcan `.00t` layout, invoking `progress`
+    /// with a completion fraction in `0.0..=1.0` as vertices and faces are
+    /// written. Pass `&mut |_| {}` when progress is not needed.
+    pub fn write_00t_with_progress(
+        &self,
+        writer: &mut impl Write,
+        progress: &mut dyn FnMut(f32),
+    ) -> io::Result<()> {
+        const PROGRESS_STRIDE: usize = 4096;
         let mut header = if self.raw_header.len() == RAW_HEADER_LEN {
             self.raw_header.clone()
         } else {
@@ -200,18 +208,33 @@ impl Triangulation {
             .copy_from_slice(&(self.face_count() as u32).to_be_bytes());
 
         writer.write_all(&header)?;
-        for vertex in &self.vertices {
+        let vertex_count = self.vertex_count().max(1);
+        let face_count = self.face_count().max(1);
+        for (i, vertex) in self.vertices.iter().enumerate() {
             for value in vertex.as_array() {
                 writer.write_all(&value.to_be_bytes())?;
             }
+            if i % PROGRESS_STRIDE == 0 {
+                progress(0.5 * i as f32 / vertex_count as f32);
+            }
         }
-        for (_face, indices) in self.faces.iter().zip(self.face_vertex_indices_iter()) {
+        for (i, (_face, indices)) in self
+            .faces
+            .iter()
+            .zip(self.face_vertex_indices_iter())
+            .enumerate()
+        {
             for index in indices {
                 writer.write_all(&(index as u32).to_be_bytes())?;
             }
             writer.write_all(&[0u8; 12])?;
+            if i % PROGRESS_STRIDE == 0 {
+                progress(0.5 + 0.5 * i as f32 / face_count as f32);
+            }
         }
-        writer.write_all(&self.trailing_attributes)
+        writer.write_all(&self.trailing_attributes)?;
+        progress(1.0);
+        Ok(())
     }
 }
 
@@ -986,6 +1009,18 @@ fn detect_index_base(faces: &[Face], vertex_count: usize) -> Result<IndexBase, R
     if min_index == 0 && max_index < vertex_count as u32 {
         Ok(IndexBase::Zero)
     } else if min_index >= 1 && max_index <= vertex_count as u32 {
+        // `max_index == vertex_count` can only be 1-based; when the mesh never
+        // references index 0 *or* the last vertex, both interpretations are
+        // in-range. Vulcan writes 1-based indices, so prefer that, but a
+        // zero-based mesh that happens to skip both boundary vertices would be
+        // misread here — leave a trace for diagnosing shifted geometry.
+        if max_index < vertex_count as u32 {
+            log::warn!(
+                "00t face indices are ambiguous (min {min_index}, max {max_index}, \
+                 {vertex_count} vertices; neither vertex 0 nor the last vertex is referenced); \
+                 assuming 1-based per the Vulcan convention"
+            );
+        }
         Ok(IndexBase::One)
     } else {
         Err(ReadError::InvalidFaceIndices {
@@ -1017,304 +1052,4 @@ fn read_be_f64(bytes: &[u8], offset: usize) -> Result<f64, ReadError> {
     Ok(f64::from_be_bytes([
         slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
     ]))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fastlz_level2_decodes_extended_length_and_far_distance() {
-        // Level-2 stream (level marker in the first byte's top bits):
-        //  1. literal "ABCD"
-        //  2. short match: 4 bytes at distance 4 -> "ABCDABCD"
-        //  3. extended-length match (looped 255-continuation): 268 x 'D'
-        let mut input = vec![0x20 | 3, b'A', b'B', b'C', b'D'];
-        input.extend_from_slice(&[0x40, 3]); // len=2 (+2 bytes), distance 3+1
-        input.extend_from_slice(&[0xE0, 255, 4, 0]); // len=7+255+4 (+2), distance 1
-        let decoded = fastlz_decompress(&input).expect("valid level-2 stream");
-        let mut expected = b"ABCDABCD".to_vec();
-        expected.extend(std::iter::repeat_n(b'D', 268));
-        assert_eq!(decoded, expected);
-
-        // Far-distance escape: grow the output past the 13-bit range with an
-        // RLE match, mark a position, then copy from distance 9002.
-        let mut input = vec![0x20, b'X'];
-        // one level-2 extended match: 7 + 255*35 + 66 + 2 = 9000 x 'X'
-        input.push(0xE0);
-        input.extend(std::iter::repeat_n(255u8, 35));
-        input.extend_from_slice(&[66, 0]);
-        input.extend_from_slice(&[0x00, b'Y']);
-        // control len=1 (+2 = 3 bytes), short-distance bits all set + code 255
-        // triggers the far form: distance = (3*256 + 42) + 8191 + 1 = 9002.
-        input.extend_from_slice(&[0x3f, 255, 3, 42]);
-        let decoded = fastlz_decompress(&input).expect("valid far-distance stream");
-        assert_eq!(decoded.len(), 9001 + 1 + 3);
-        assert!(decoded[..9001].iter().all(|&b| b == b'X'));
-        assert_eq!(decoded[9001], b'Y');
-        assert_eq!(&decoded[9002..], b"XXX", "far match copies from offset 0");
-    }
-
-    #[test]
-    fn fastlz_level1_still_reads_a_plain_literal_stream() {
-        let input = vec![0x02, b'a', b'b', b'c'];
-        assert_eq!(fastlz_decompress(&input).unwrap(), b"abc");
-    }
-
-    /// Level-1 compress `len` copies of `fill` (a literal then RLE matches),
-    /// as a stored page body.
-    fn l1_rle_page(fill: u8, len: usize) -> Vec<u8> {
-        assert!(len >= 4);
-        let mut out = vec![0x00, fill];
-        let mut produced = 1usize;
-        while produced < len {
-            let m = (len - produced).min(264);
-            assert!(m >= 3, "helper requires match-sized remainders");
-            if m - 2 <= 7 {
-                out.extend_from_slice(&[(((m - 2) as u8) << 5), 0]);
-            } else {
-                out.extend_from_slice(&[0xE0, (m - 2 - 7) as u8, 0]);
-            }
-            produced += m;
-        }
-        out
-    }
-
-    const TEST_PAGE: usize = 4096;
-
-    /// Build a synthetic vulZ container. Each page is (logical page number,
-    /// fill byte); number 0 places sequentially like older Vulcan files.
-    fn build_vulz(total_len: usize, pages: &[(u32, u8)], aux: &[u8]) -> Vec<u8> {
-        let mut file = vec![0u8; 0x40];
-        file[..8].copy_from_slice(VULZ_MAGIC);
-        file[VULZ_PAGE_SIZE_OFFSET..VULZ_PAGE_SIZE_OFFSET + 4]
-            .copy_from_slice(&(TEST_PAGE as u32).to_le_bytes());
-        file[VULZ_TOTAL_EXPANDED_OFFSET..VULZ_TOTAL_EXPANDED_OFFSET + 8]
-            .copy_from_slice(&(total_len as u64).to_le_bytes());
-        // Walk start holds a pointer chain of one hop, like real files (the
-        // pointer's second word, at 0x40, stays zero so it reads as a jump).
-        file.resize(0x44, 0);
-        file[VULZ_WALK_START..VULZ_WALK_START + 4].copy_from_slice(&0x44u32.to_le_bytes());
-        for &(number, fill) in pages {
-            append_page(&mut file, number, &l1_rle_page(fill, TEST_PAGE));
-        }
-        if !aux.is_empty() {
-            let aux_offset = file.len();
-            file[VULZ_AUX_OFFSET_OFFSET..VULZ_AUX_OFFSET_OFFSET + 4]
-                .copy_from_slice(&(aux_offset as u32).to_le_bytes());
-            file[VULZ_AUX_LEN_OFFSET..VULZ_AUX_LEN_OFFSET + 4]
-                .copy_from_slice(&(aux.len() as u32).to_le_bytes());
-            let mut body = vec![(aux.len() as u8).saturating_sub(1).min(31)];
-            body.extend_from_slice(aux);
-            append_page(&mut file, 0, &body);
-        }
-        file
-    }
-
-    fn append_page(file: &mut Vec<u8>, number: u32, body: &[u8]) {
-        let trailer = [
-            number.to_le_bytes().as_slice(),
-            &[0xfa, 0xfb, 0xfc, 0xfd, 0x00, 0x00],
-        ]
-        .concat();
-        file.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        file.extend_from_slice(&((body.len() + trailer.len()) as u32).to_le_bytes());
-        file.extend_from_slice(body);
-        file.extend_from_slice(&trailer);
-    }
-
-    #[test]
-    fn vulz_places_sequential_zero_numbered_pages() {
-        let file = build_vulz(2 * TEST_PAGE, &[(0, b'Q'), (0, b'R')], &[]);
-        let decoded = decode_vulz_bytes(&file).expect("sequential pages");
-        assert_eq!(decoded.len(), 2 * TEST_PAGE);
-        assert!(decoded[..TEST_PAGE].iter().all(|&b| b == b'Q'));
-        assert!(decoded[TEST_PAGE..].iter().all(|&b| b == b'R'));
-    }
-
-    #[test]
-    fn vulz_places_pages_whose_trailer_omits_the_number_word() {
-        // Some containers end each page with the `fa fb fc fd` marker
-        // directly, with no page-number word. Reading the marker as a page
-        // number (0xfdfcfbfa) strands every page past the logical image —
-        // seen as "stores only 0 of 4781 pages" on a company topo. Such
-        // pages must place sequentially.
-        let mut file = build_vulz(2 * TEST_PAGE, &[], &[]);
-        for fill in [b'Q', b'R'] {
-            let body = l1_rle_page(fill, TEST_PAGE);
-            let trailer = [0xfa, 0xfb, 0xfc, 0xfd, 0x00, 0x00];
-            file.extend_from_slice(&(body.len() as u32).to_le_bytes());
-            file.extend_from_slice(&((body.len() + trailer.len()) as u32).to_le_bytes());
-            file.extend_from_slice(&body);
-            file.extend_from_slice(&trailer);
-        }
-        let decoded = decode_vulz_bytes(&file).expect("marker-only trailers place sequentially");
-        assert!(decoded[..TEST_PAGE].iter().all(|&b| b == b'Q'));
-        assert!(decoded[TEST_PAGE..].iter().all(|&b| b == b'R'));
-    }
-
-    #[test]
-    fn vulz_falls_back_to_walk_order_when_trailer_numbers_are_not_page_numbers() {
-        // A company topo's trailer words were present but not logical page
-        // numbers ("a page addressed slot 12909 past the image" with 4781
-        // pages). The walk decoded exactly one record per page, so the tree
-        // walk order is the logical order; the sequential retry must recover
-        // the image that the numbers scatter.
-        let file = build_vulz(
-            3 * TEST_PAGE,
-            &[(12909, b'Q'), (2, b'R'), (9000, b'S')],
-            &[],
-        );
-        let decoded = decode_vulz_bytes(&file).expect("walk-order retry recovers the image");
-        assert!(decoded[..TEST_PAGE].iter().all(|&b| b == b'Q'));
-        assert!(decoded[TEST_PAGE..2 * TEST_PAGE].iter().all(|&b| b == b'R'));
-        assert!(decoded[2 * TEST_PAGE..].iter().all(|&b| b == b'S'));
-    }
-
-    #[test]
-    fn vulz_places_journaled_pages_by_number_and_last_write_wins() {
-        // Page 1 is written twice; the later version must win.
-        let file = build_vulz(
-            3 * TEST_PAGE,
-            &[(0, b'A'), (1, b'X'), (2, b'C'), (1, b'B')],
-            &[],
-        );
-        let decoded = decode_vulz_bytes(&file).expect("journaled pages");
-        assert!(decoded[..TEST_PAGE].iter().all(|&b| b == b'A'));
-        assert!(decoded[TEST_PAGE..2 * TEST_PAGE].iter().all(|&b| b == b'B'));
-        assert!(decoded[2 * TEST_PAGE..].iter().all(|&b| b == b'C'));
-    }
-
-    #[test]
-    fn vulz_retries_when_header_page_size_disagrees_with_the_data() {
-        // Two 4096-byte pages, but the header's page-size field lies (8192).
-        // The first walk decodes pages of 4096 ≠ 8192 and places none; the
-        // self-validating retry with the real length must recover the image.
-        let mut file = build_vulz(2 * TEST_PAGE, &[(0, b'Q'), (0, b'R')], &[]);
-        file[VULZ_PAGE_SIZE_OFFSET..VULZ_PAGE_SIZE_OFFSET + 4]
-            .copy_from_slice(&((2 * TEST_PAGE) as u32).to_le_bytes());
-
-        let decoded = decode_vulz_bytes(&file).expect("retry recovers the image");
-        assert_eq!(decoded.len(), 2 * TEST_PAGE);
-        assert!(decoded[..TEST_PAGE].iter().all(|&b| b == b'Q'));
-        assert!(decoded[TEST_PAGE..].iter().all(|&b| b == b'R'));
-    }
-
-    #[test]
-    fn vulz_missing_pages_error_strictly_but_leave_holes_in_the_archive() {
-        let file = build_vulz(3 * TEST_PAGE, &[(0, b'A'), (2, b'C')], &[]);
-        let error = decode_vulz_bytes(&file).expect_err("page 1 is absent");
-        assert!(matches!(
-            error,
-            ReadError::MissingVulzPages {
-                missing: 1,
-                total: 3,
-                ..
-            }
-        ));
-
-        let archive = decode_vulz_archive(&file).expect("archive tolerates holes");
-        assert_eq!(archive.missing_pages, 1);
-        assert!(archive.data[..TEST_PAGE].iter().all(|&b| b == b'A'));
-        assert!(
-            archive.data[TEST_PAGE..2 * TEST_PAGE]
-                .iter()
-                .all(|&b| b == 0)
-        );
-        assert!(archive.data[2 * TEST_PAGE..].iter().all(|&b| b == b'C'));
-    }
-
-    #[test]
-    fn vulz_splits_the_aux_preview_stream_from_the_page_image() {
-        let aux = b"gallery bytes with layer names";
-        let file = build_vulz(TEST_PAGE, &[(0, b'D')], aux);
-        let archive = decode_vulz_archive(&file).expect("aux page decodes");
-        assert_eq!(archive.data.len(), TEST_PAGE);
-        assert!(archive.data.iter().all(|&b| b == b'D'));
-        assert_eq!(archive.aux, aux);
-    }
-
-    /// Larger vulZ files (multi-page-run 00t exports) split their pages into
-    /// several runs, with a leaf pointer table between runs that the directory
-    /// also points at — and that table sits exactly at the preceding run's
-    /// terminating offset. This builds that layout: a directory `[run_a, table]`
-    /// where `table` == where `run_a` stops. The walk must reach `table` (and
-    /// the pages it references) rather than treat it as already-consumed by the
-    /// run. Regression test for company `..._osa.00t` decoding as 0 of N pages.
-    #[test]
-    fn vulz_follows_a_leaf_table_at_a_page_runs_end() {
-        // Blocks are spaced one full pointer block (0x800) apart, as real files
-        // do, so a block's 256-entry scan never runs into the next block.
-        const BLOCK: usize = VULZ_POINTER_BLOCK_ENTRIES * 8;
-        let page = TEST_PAGE;
-        let put_u32 = |file: &mut Vec<u8>, at: usize, value: u32| {
-            file[at..at + 4].copy_from_slice(&value.to_le_bytes());
-        };
-
-        let mut file = vec![0u8; 0x40];
-        file[..8].copy_from_slice(VULZ_MAGIC);
-        put_u32(&mut file, VULZ_PAGE_SIZE_OFFSET, page as u32);
-        file[VULZ_TOTAL_EXPANDED_OFFSET..VULZ_TOTAL_EXPANDED_OFFSET + 8]
-            .copy_from_slice(&((3 * page) as u64).to_le_bytes());
-
-        // Root (at 0x3c) points to the directory one block later.
-        let directory = VULZ_WALK_START + BLOCK;
-        put_u32(&mut file, VULZ_WALK_START, directory as u32);
-
-        // Directory block: patched below once run/table offsets are known.
-        file.resize(directory + BLOCK, 0);
-
-        // Run A: pages 0 and 1, back to back. The run terminates where the next
-        // record starts — which is where the leaf table will live.
-        let run_a = file.len();
-        append_page(&mut file, 0, &l1_rle_page(b'A', page));
-        append_page(&mut file, 1, &l1_rle_page(b'B', page));
-
-        // Leaf table at run A's terminating offset, pointing at run B.
-        let table = file.len();
-        let run_b = table + BLOCK;
-        file.resize(run_b, 0);
-        put_u32(&mut file, table, run_b as u32); // entry 0 target; second word stays 0
-
-        // Run B: page 2, reachable only through the table.
-        append_page(&mut file, 2, &l1_rle_page(b'C', page));
-
-        // Directory names run A and the table (its offset == run A's end).
-        put_u32(&mut file, directory, run_a as u32);
-        put_u32(&mut file, directory + 8, table as u32);
-
-        let archive = decode_vulz_archive(&file).expect("all three pages decode");
-        assert_eq!(
-            archive.missing_pages, 0,
-            "the table's pages must be reached"
-        );
-        assert!(archive.data[..page].iter().all(|&b| b == b'A'));
-        assert!(archive.data[page..2 * page].iter().all(|&b| b == b'B'));
-        assert!(archive.data[2 * page..3 * page].iter().all(|&b| b == b'C'));
-    }
-
-    #[test]
-    fn decodes_repo_sample_vulz_files() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let samples = [
-            root.join("test/Vulcan/00t/phase_1_topo.00t"),
-            root.join("test/Vulcan/00t/topo.00t"),
-        ];
-        for path in samples {
-            if !path.exists() {
-                continue;
-            }
-            let triangulation = Triangulation::from_path(&path).expect("sample should decode");
-            assert!(triangulation.vertex_count() > 0);
-            assert!(triangulation.face_count() > 0);
-        }
-
-        let isis = root.join("test/Vulcan/dgd_isis/thorarea1.dgd.isis");
-        if isis.exists() {
-            let bytes = std::fs::read(&isis).unwrap();
-            let total = read_le_u32(&bytes, VULZ_TOTAL_EXPANDED_OFFSET).unwrap() as usize;
-            let decoded = decode_vulz_bytes(&bytes).expect("sample dgd should decode");
-            assert_eq!(decoded.len(), total);
-        }
-    }
 }

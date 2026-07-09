@@ -5,12 +5,14 @@ pub(crate) mod formats;
 pub(crate) mod geometry;
 pub(crate) mod kernel;
 pub(crate) mod pidb;
+pub(crate) mod point_cloud;
 pub(crate) mod road_network;
 pub(crate) mod spatial;
 pub(crate) mod triangulation;
 
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct LayerId(pub(crate) u64);
@@ -116,8 +118,6 @@ pub(crate) enum Object {
         color: ObjectColor,
         #[serde(default)]
         fill: FillStyle,
-        #[serde(default)]
-        fill_color: Option<ObjectColor>,
         #[serde(default = "default_poly_line_weight")]
         line_weight: f32,
     },
@@ -221,7 +221,6 @@ impl Object {
                 closed,
                 color,
                 fill,
-                fill_color,
                 line_weight,
                 ..
             } => Object::Polyline {
@@ -231,7 +230,6 @@ impl Object {
                 closed: *closed,
                 color: *color,
                 fill: *fill,
-                fill_color: *fill_color,
                 line_weight: *line_weight,
             },
             Object::Text {
@@ -274,10 +272,17 @@ impl Object {
 pub(crate) struct Document {
     layers: Vec<Layer>,
     objects: Vec<Object>,
+    #[serde(skip)]
+    object_index: HashMap<ObjectId, usize>,
     next_layer_id: u64,
     next_object_id: u64,
     #[serde(skip)]
     revision: u64,
+    /// Document revision at which each object was last mutated. Lets the
+    /// renderer's static stroke cache re-tessellate only the objects an edit
+    /// actually touched instead of the whole document.
+    #[serde(skip)]
+    object_revisions: HashMap<ObjectId, u64>,
 }
 
 impl Document {
@@ -291,6 +296,27 @@ impl Document {
 
     pub(crate) fn objects(&self) -> &[Object] {
         &self.objects
+    }
+
+    pub(crate) fn rebuild_object_index(&mut self) {
+        self.object_index = self
+            .objects
+            .iter()
+            .enumerate()
+            .map(|(index, object)| (object.id(), index))
+            .collect();
+    }
+
+    fn object_position(&self, id: ObjectId) -> Option<usize> {
+        self.object_index
+            .get(&id)
+            .copied()
+            .filter(|&index| {
+                self.objects
+                    .get(index)
+                    .is_some_and(|object| object.id() == id)
+            })
+            .or_else(|| self.objects.iter().position(|object| object.id() == id))
     }
 
     pub(crate) fn add_layer(
@@ -325,8 +351,9 @@ impl Document {
     pub(crate) fn add_object(&mut self, make: impl FnOnce(ObjectId) -> Object) -> ObjectId {
         let id = ObjectId(self.next_object_id);
         self.next_object_id += 1;
+        self.object_index.insert(id, self.objects.len());
         self.objects.push(make(id));
-        self.touch();
+        self.touch_object(id);
         id
     }
 
@@ -339,21 +366,94 @@ impl Document {
 
     /// Insert an object that already carries its id (used by commands/redo).
     pub(crate) fn insert_object(&mut self, object: Object) {
-        self.next_object_id = self.next_object_id.max(object.id().0 + 1);
-        self.objects.push(object);
-        self.touch();
+        let id = object.id();
+        self.bump_next_object_id(id);
+        if let Some(index) = self.object_position(id)
+            && let Some(existing) = self.objects.get_mut(index)
+        {
+            self.object_index.insert(id, index);
+            *existing = object;
+        } else {
+            self.object_index.insert(id, self.objects.len());
+            self.objects.push(object);
+        }
+        self.touch_object(id);
+    }
+
+    /// Insert an object at a specific draw-order index (used when undoing a
+    /// delete, so the object returns below whatever it was drawn under).
+    pub(crate) fn insert_object_at(&mut self, index: usize, object: Object) {
+        let id = object.id();
+        if self.object_position(id).is_some() {
+            self.replace_object(object);
+            return;
+        }
+        self.bump_next_object_id(id);
+        let index = index.min(self.objects.len());
+        self.objects.insert(index, object);
+        for shifted_index in index..self.objects.len() {
+            self.object_index
+                .insert(self.objects[shifted_index].id(), shifted_index);
+        }
+        self.touch_object(id);
+    }
+
+    /// Advance the id counter past `id`. Runtime ids are
+    /// `namespace << 32 | local`; the increment must never carry out of the
+    /// local half into another project's namespace.
+    fn bump_next_object_id(&mut self, id: ObjectId) {
+        const LOCAL_MASK: u64 = u32::MAX as u64;
+        let next = if id.0 & LOCAL_MASK == LOCAL_MASK {
+            id.0
+        } else {
+            id.0 + 1
+        };
+        self.next_object_id = self.next_object_id.max(next);
+    }
+
+    /// Replace an object in place, preserving draw order.
+    pub(crate) fn replace_object(&mut self, object: Object) -> bool {
+        let Some(index) = self.object_position(object.id()) else {
+            return false;
+        };
+        let Some(existing) = self.objects.get_mut(index) else {
+            self.rebuild_object_index();
+            return false;
+        };
+        let id = object.id();
+        self.object_index.insert(id, index);
+        *existing = object;
+        self.touch_object(id);
+        true
     }
 
     /// Remove the object with `id`, returning it if present.
     pub(crate) fn remove_object(&mut self, id: ObjectId) -> Option<Object> {
-        let index = self.objects.iter().position(|object| object.id() == id)?;
+        let index = self.object_position(id)?;
+        self.object_index.remove(&id);
+        self.object_revisions.remove(&id);
         let object = self.objects.remove(index);
+        for shifted_index in index..self.objects.len() {
+            self.object_index
+                .insert(self.objects[shifted_index].id(), shifted_index);
+        }
         self.touch();
         Some(object)
     }
 
     pub(crate) fn layer(&self, id: LayerId) -> Option<&Layer> {
         self.layers.iter().find(|layer| layer.id == id)
+    }
+
+    /// Replace a layer's record in place (preserving its list position), or
+    /// append it if absent.
+    pub(crate) fn upsert_layer(&mut self, layer: &Layer) {
+        self.next_layer_id = self.next_layer_id.max(layer.id.0.saturating_add(1));
+        match self.layers.iter_mut().find(|l| l.id == layer.id) {
+            Some(existing) => *existing = layer.clone(),
+            None => self.layers.push(layer.clone()),
+        }
+        self.touch();
     }
 
     /// Remove a layer by id. Returns false if the layer did not exist.
@@ -378,8 +478,7 @@ impl Document {
         }
     }
 
-    /// Resolved fill RGBA for an object. For polylines with an explicit fill
-    /// color, that color is used; otherwise falls back to `object_rgba`.
+    /// Resolved fill RGBA for an object. Filled polylines use their object color.
     pub(crate) fn object_fill_rgba(&self, object: &Object) -> [f32; 4] {
         self.object_rgba(object)
     }
@@ -438,6 +537,14 @@ impl Document {
                 )
             })
             .collect();
+        self.rebuild_object_index();
+        // Ids changed identity: restamp everything at the current revision so
+        // stale pre-namespace entries cannot alias new ids.
+        self.object_revisions = self
+            .objects
+            .iter()
+            .map(|object| (object.id(), self.revision))
+            .collect();
         self.next_layer_id = runtime_id(self.next_layer_id);
         self.next_object_id = runtime_id(self.next_object_id);
     }
@@ -459,15 +566,32 @@ impl Document {
     }
 
     pub(crate) fn get_object(&self, id: ObjectId) -> Option<&Object> {
-        self.objects.iter().find(|object| object.id() == id)
+        let fast = self
+            .object_index
+            .get(&id)
+            .and_then(|&index| self.objects.get(index))
+            .filter(|object| object.id() == id);
+        if fast.is_some() {
+            return fast;
+        }
+        let slow = self.objects.iter().find(|object| object.id() == id);
+        // The linear scan finding an object the index missed means the index
+        // is corrupt; surface that in debug builds instead of hiding it
+        // behind O(N) lookups.
+        debug_assert!(slow.is_none(), "object_index out of sync for {id:?}");
+        slow
     }
 
     /// Translate the object with `id` by `delta`. Returns `true` if found.
     pub(crate) fn translate_object(&mut self, id: ObjectId, delta: DVec3) -> bool {
-        match self.objects.iter_mut().find(|object| object.id() == id) {
+        let Some(index) = self.object_position(id) else {
+            return false;
+        };
+        match self.objects.get_mut(index) {
             Some(object) => {
+                self.object_index.insert(id, index);
                 object.translate(delta);
-                self.touch();
+                self.touch_object(id);
                 true
             }
             None => false,
@@ -478,8 +602,19 @@ impl Document {
         self.revision
     }
 
+    /// Revision at which `id` was last mutated (0 for objects untouched since
+    /// load — a fresh cache treats those uniformly).
+    pub(crate) fn object_revision(&self, id: ObjectId) -> u64 {
+        self.object_revisions.get(&id).copied().unwrap_or(0)
+    }
+
     fn touch(&mut self) {
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    fn touch_object(&mut self, id: ObjectId) {
+        self.touch();
+        self.object_revisions.insert(id, self.revision);
     }
 }
 
@@ -487,7 +622,12 @@ impl Document {
 #[derive(Clone, Debug)]
 pub(crate) enum Command {
     AddObject(Object),
-    DeleteObject(Object),
+    DeleteObject {
+        object: Object,
+        /// Draw-order position captured when the delete is applied, so undo
+        /// re-inserts the object where it was rather than on top.
+        index: Option<usize>,
+    },
     /// Replace an object's state (e.g. after a move). `before`/`after` share an id.
     Replace {
         before: Object,
@@ -514,15 +654,22 @@ pub(crate) enum Command {
 }
 
 impl Command {
-    fn apply(&self, doc: &mut Document) {
+    pub(crate) fn delete_object(object: Object) -> Self {
+        Command::DeleteObject {
+            object,
+            index: None,
+        }
+    }
+
+    fn apply(&mut self, doc: &mut Document) {
         match self {
             Command::AddObject(object) => doc.insert_object(object.clone()),
-            Command::DeleteObject(object) => {
+            Command::DeleteObject { object, index } => {
+                *index = doc.object_position(object.id());
                 doc.remove_object(object.id());
             }
             Command::Replace { after, .. } => {
-                doc.remove_object(after.id());
-                doc.insert_object(after.clone());
+                doc.replace_object(after.clone());
             }
             Command::Batch(cmds) => {
                 for cmd in cmds {
@@ -547,10 +694,12 @@ impl Command {
             Command::AddObject(object) => {
                 doc.remove_object(object.id());
             }
-            Command::DeleteObject(object) => doc.insert_object(object.clone()),
+            Command::DeleteObject { object, index } => match index {
+                Some(index) => doc.insert_object_at(*index, object.clone()),
+                None => doc.insert_object(object.clone()),
+            },
             Command::Replace { before, .. } => {
-                doc.remove_object(before.id());
-                doc.insert_object(before.clone());
+                doc.replace_object(before.clone());
             }
             Command::Batch(cmds) => {
                 for cmd in cmds.iter().rev() {
@@ -588,7 +737,7 @@ impl History {
         self.redo.clear();
     }
 
-    pub(crate) fn execute(&mut self, doc: &mut Document, command: Command) {
+    pub(crate) fn execute(&mut self, doc: &mut Document, mut command: Command) {
         command.apply(doc);
         self.undo.push(command);
         self.redo.clear();
@@ -624,7 +773,7 @@ impl History {
     /// Re-apply the most recently undone command. Returns `true` on success.
     pub(crate) fn redo(&mut self, doc: &mut Document) -> bool {
         match self.redo.pop() {
-            Some(command) => {
+            Some(mut command) => {
                 command.apply(doc);
                 self.undo.push(command);
                 true

@@ -13,6 +13,20 @@ struct DeleteVertexHit {
 }
 
 impl<'a> App<'a> {
+    pub(crate) fn select_all_active_objects(&mut self) {
+        self.editor.selected_handles.clear();
+        let handles = self
+            .active_document()
+            .objects()
+            .iter()
+            .map(|object| SceneEntityId::Object(object.id()))
+            .collect::<Vec<_>>();
+        let count = handles.len();
+        self.editor.selected_handles.extend(handles);
+        userspace_log!("Selected {count} object(s)");
+        self.invalidate_overlay();
+    }
+
     pub(crate) fn delete_at_cursor(&mut self) {
         if !self.editing_ready() {
             return;
@@ -92,7 +106,6 @@ impl<'a> App<'a> {
             &mut project.pidb.document,
             Command::Replace { before, after },
         );
-        project.dirty = true;
         self.editor.delete_hover_vertex_px = None;
         self.editor.selected_handles.clear();
         self.editor
@@ -171,7 +184,7 @@ impl<'a> App<'a> {
                     self.active_document()
                         .get_object(id)
                         .cloned()
-                        .map(Command::DeleteObject)
+                        .map(Command::delete_object)
                 } else {
                     None
                 }
@@ -183,7 +196,6 @@ impl<'a> App<'a> {
         {
             self.history
                 .execute(&mut project.pidb.document, Command::Batch(batch));
-            project.dirty = true;
         }
         if deleted > 0 {
             self.editor.selected_handles.clear();
@@ -237,7 +249,6 @@ impl<'a> App<'a> {
         let count = copies.len();
         let batch = Command::Batch(copies.into_iter().map(Command::AddObject).collect());
         self.history.execute(&mut project.pidb.document, batch);
-        project.dirty = true;
         self.editor.selected_handles.clear();
         for id in new_ids {
             self.editor.selected_handles.insert(id);

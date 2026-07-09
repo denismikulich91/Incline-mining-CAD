@@ -179,11 +179,43 @@ struct WorkEdge {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn resolve(document: &Document, ghost: Option<&GhostRoad>) -> ResolvedNetwork {
+    resolve_prepared(prepare(document, ghost))
+}
+
+/// A built network topology (stages 0–4), reusable across validation and
+/// resolution so per-cursor-move callers pay for `build_topology` once.
+pub(crate) struct PreparedNetwork {
+    topology: Option<Topology>,
+}
+
+pub(crate) fn prepare(document: &Document, ghost: Option<&GhostRoad>) -> PreparedNetwork {
+    PreparedNetwork {
+        topology: build_topology(document, ghost),
+    }
+}
+
+impl PreparedNetwork {
+    /// Keys of edges that violate clearance/approach rules in this topology.
+    /// The ghost-free set grandfathers legacy violations during validation.
+    pub(crate) fn compromised_keys(&self) -> std::collections::HashSet<RoadKey> {
+        let Some(topology) = &self.topology else {
+            return Default::default();
+        };
+        topology
+            .edges
+            .iter()
+            .filter(|edge| edge.compromised.is_some() || edge.bend_compromised.is_some())
+            .map(|edge| topology.sources[edge.road].key)
+            .collect()
+    }
+}
+
+pub(crate) fn resolve_prepared(prepared: PreparedNetwork) -> ResolvedNetwork {
     let Some(Topology {
         sources,
         nodes,
         mut edges,
-    }) = build_topology(document, ghost)
+    }) = prepared.topology
     else {
         return ResolvedNetwork::default();
     };
@@ -373,10 +405,30 @@ pub(crate) fn validate_ghost(
     ghost: &GhostRoad,
     max_grade_degrees: f64,
 ) -> Result<(), RoadRuleViolation> {
+    // Fast-fail on the stroke-local rules before paying for topology builds.
+    validate_centerline_grades(&ghost.centerline, max_grade_degrees)?;
+    validate_centerline_turns(&ghost.centerline)?;
+    let preexisting = prepare(document, None).compromised_keys();
+    validate_ghost_prepared(
+        &prepare(document, Some(ghost)),
+        ghost,
+        max_grade_degrees,
+        &preexisting,
+    )
+}
+
+/// [`validate_ghost`] against an already-built ghost-inclusive topology and a
+/// (cacheable) ghost-free `preexisting` compromised set.
+pub(crate) fn validate_ghost_prepared(
+    prepared: &PreparedNetwork,
+    ghost: &GhostRoad,
+    max_grade_degrees: f64,
+    preexisting: &std::collections::HashSet<RoadKey>,
+) -> Result<(), RoadRuleViolation> {
     validate_centerline_grades(&ghost.centerline, max_grade_degrees)?;
     validate_centerline_turns(&ghost.centerline)?;
 
-    let Some(topology) = build_topology(document, Some(ghost)) else {
+    let Some(topology) = &prepared.topology else {
         return Ok(());
     };
     let is_ghost = |edge: usize| topology.sources[topology.edges[edge].road].key == RoadKey::Ghost;
@@ -406,15 +458,6 @@ pub(crate) fn validate_ghost(
         }
     }
 
-    let preexisting: std::collections::HashSet<RoadKey> = build_topology(document, None)
-        .map(|t| {
-            t.edges
-                .iter()
-                .filter(|edge| edge.compromised.is_some() || edge.bend_compromised.is_some())
-                .map(|edge| t.sources[edge.road].key)
-                .collect()
-        })
-        .unwrap_or_default();
     for edge in &topology.edges {
         if preexisting.contains(&topology.sources[edge.road].key) {
             continue;
@@ -557,6 +600,14 @@ fn dedup_centerline(points: impl Iterator<Item = DVec3>) -> Vec<DVec3> {
 fn build_nodes(sources: &[SourceRoad], document: &Document) -> Vec<Node> {
     let mut nodes: Vec<Node> = Vec::new();
 
+    // Broad-phase XY bounds per source: most pairs in a large network never
+    // come near each other, so the O(sources²) scans below reject on
+    // rectangle overlap before touching any segment math.
+    let source_bounds: Vec<(DVec2, DVec2)> = sources
+        .iter()
+        .map(|source| points_bounds_xy(source.centerline.iter().copied()))
+        .collect();
+
     let find_or_create = |nodes: &mut Vec<Node>, pos: DVec3| -> usize {
         for (index, node) in nodes.iter_mut().enumerate() {
             if (node.pos.truncate() - pos.truncate()).length() < NODE_XY_EPS
@@ -585,7 +636,8 @@ fn build_nodes(sources: &[SourceRoad], document: &Document) -> Vec<Node> {
         let first = source.centerline[0];
         let last = *source.centerline.last().expect("len >= 2");
         for endpoint in [first, last] {
-            let Some((pos, dist, other)) = attach_endpoint_target(sources, road_index, endpoint)
+            let Some((pos, dist, other)) =
+                attach_endpoint_target(sources, &source_bounds, road_index, endpoint)
             else {
                 find_or_create(&mut nodes, endpoint);
                 continue;
@@ -615,8 +667,19 @@ fn build_nodes(sources: &[SourceRoad], document: &Document) -> Vec<Node> {
     let mut crossing_positions: Vec<(DVec3, Option<(usize, f64)>)> = Vec::new();
     for (ai, a) in sources.iter().enumerate() {
         for (bi, b) in sources.iter().enumerate().skip(ai + 1) {
+            if !bounds_overlap_xy(source_bounds[ai], source_bounds[bi], NODE_XY_EPS) {
+                continue;
+            }
             for seg_a in a.centerline.windows(2) {
+                let seg_a_bounds = points_bounds_xy(seg_a.iter().copied());
+                if !bounds_overlap_xy(seg_a_bounds, source_bounds[bi], NODE_XY_EPS) {
+                    continue;
+                }
                 for seg_b in b.centerline.windows(2) {
+                    let seg_b_bounds = points_bounds_xy(seg_b.iter().copied());
+                    if !bounds_overlap_xy(seg_a_bounds, seg_b_bounds, NODE_XY_EPS) {
+                        continue;
+                    }
                     let Some((xy, ta, tb)) = segment_intersection_xy(
                         seg_a[0].truncate(),
                         seg_a[1].truncate(),
@@ -692,7 +755,7 @@ fn build_nodes(sources: &[SourceRoad], document: &Document) -> Vec<Node> {
                 continue;
             }
             let touches_other_road = sources.iter().enumerate().any(|(bi, b)| {
-                if ai == bi {
+                if ai == bi || !bounds_contain_xy(source_bounds[bi], v.truncate(), NODE_XY_EPS) {
                     return false;
                 }
                 b.centerline.iter().any(|w| {
@@ -714,40 +777,52 @@ fn build_nodes(sources: &[SourceRoad], document: &Document) -> Vec<Node> {
 
     // Polyline attachments: nodes sitting on (or at a vertex of) a polyline
     // pick up the nearby polyline segments as their termination boundary.
+    // Polyline bounds are computed once up front — documents with dense
+    // contour strings make nodes × polyline-vertices a hot product.
+    let polylines: Vec<(&Object, (DVec2, DVec2))> = document
+        .objects()
+        .iter()
+        .filter(|object| matches!(object, Object::Polyline { verts, .. } if verts.len() >= 2))
+        .map(|object| {
+            let Object::Polyline { verts, .. } = object else {
+                unreachable!("filtered to polylines");
+            };
+            (object, points_bounds_xy(verts.iter().map(|v| v.pos)))
+        })
+        .collect();
     for node in &mut nodes {
         let junction = node.pos;
         let mut attached = Vec::new();
-        for object in document.objects() {
+        for &(object, bounds) in &polylines {
             let Object::Polyline { verts, closed, .. } = object else {
                 continue;
             };
-            if verts.len() < 2 {
+            if !bounds_contain_xy(bounds, junction.truncate(), NODE_XY_EPS) {
                 continue;
             }
-            let mut segments: Vec<[DVec3; 2]> =
-                verts.windows(2).map(|w| [w[0].pos, w[1].pos]).collect();
-            if *closed && verts.len() >= 3 {
-                segments.push([verts.last().expect("non-empty").pos, verts[0].pos]);
-            }
-            let touching: Vec<usize> = (0..segments.len())
-                .filter(|&i| {
-                    let [a, b] = segments[i];
-                    point_on_segment_xy(junction, a, b)
-                        || points_coincident_3d(junction, a)
-                        || points_coincident_3d(junction, b)
-                })
-                .collect();
-            if touching.is_empty() {
-                continue;
-            }
+            let segment_count = if *closed && verts.len() >= 3 {
+                verts.len()
+            } else {
+                verts.len() - 1
+            };
+            let segment_at = |index: usize| -> [DVec3; 2] {
+                [verts[index].pos, verts[(index + 1) % verts.len()].pos]
+            };
             // Include immediate neighbours so side rays landing just past a
             // kink at the attachment point still find a boundary.
             let mut wanted: Vec<usize> = Vec::new();
-            for &i in &touching {
+            for i in 0..segment_count {
+                let [a, b] = segment_at(i);
+                if !point_on_segment_xy(junction, a, b)
+                    && !points_coincident_3d(junction, a)
+                    && !points_coincident_3d(junction, b)
+                {
+                    continue;
+                }
                 for candidate in [i.wrapping_sub(1), i, i + 1] {
                     let index = if *closed {
-                        candidate % segments.len()
-                    } else if candidate < segments.len() {
+                        candidate % segment_count
+                    } else if candidate < segment_count {
                         candidate
                     } else {
                         continue;
@@ -757,7 +832,7 @@ fn build_nodes(sources: &[SourceRoad], document: &Document) -> Vec<Node> {
                     }
                 }
             }
-            attached.extend(wanted.into_iter().map(|i| segments[i]));
+            attached.extend(wanted.into_iter().map(segment_at));
         }
         node.attachment_segments = attached;
     }
@@ -771,6 +846,7 @@ fn build_nodes(sources: &[SourceRoad], document: &Document) -> Vec<Node> {
 /// (which the strict node/split tolerances handle as before).
 fn attach_endpoint_target(
     sources: &[SourceRoad],
+    source_bounds: &[(DVec2, DVec2)],
     road_index: usize,
     endpoint: DVec3,
 ) -> Option<(DVec3, f64, usize)> {
@@ -781,6 +857,9 @@ fn attach_endpoint_target(
             continue;
         }
         let tol = own_hw.max(other.width * 0.5);
+        if !bounds_contain_xy(source_bounds[other_index], endpoint.truncate(), tol) {
+            continue;
+        }
         for seg in other.centerline.windows(2) {
             let (proj, t) = crate::model::kernel::project_onto_segment(
                 endpoint.truncate(),
@@ -1819,977 +1898,34 @@ fn segment_intersection_xy(a: DVec2, b: DVec2, c: DVec2, d: DVec2) -> Option<(DV
     }
 }
 
+fn points_bounds_xy(points: impl Iterator<Item = DVec3>) -> (DVec2, DVec2) {
+    let mut min = DVec2::splat(f64::INFINITY);
+    let mut max = DVec2::splat(f64::NEG_INFINITY);
+    for point in points {
+        min = min.min(point.truncate());
+        max = max.max(point.truncate());
+    }
+    (min, max)
+}
+
+fn bounds_overlap_xy(a: (DVec2, DVec2), b: (DVec2, DVec2), margin: f64) -> bool {
+    a.0.x <= b.1.x + margin
+        && a.1.x >= b.0.x - margin
+        && a.0.y <= b.1.y + margin
+        && a.1.y >= b.0.y - margin
+}
+
+fn bounds_contain_xy(bounds: (DVec2, DVec2), point: DVec2, margin: f64) -> bool {
+    point.x >= bounds.0.x - margin
+        && point.x <= bounds.1.x + margin
+        && point.y >= bounds.0.y - margin
+        && point.y <= bounds.1.y + margin
+}
+
 fn point_on_segment_xy(point: DVec3, a: DVec3, b: DVec3) -> bool {
     crate::model::kernel::point_on_segment_interior_3d(point, a, b)
 }
 
 fn points_coincident_3d(a: DVec3, b: DVec3) -> bool {
     crate::model::kernel::points_coincident_3d(a, b)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::{ObjectColor, PolyVertex};
-
-    type RoadSpec<'a> = (&'a [(f64, f64, f64)], f64, f64, RoadShape);
-
-    fn road_doc(roads: &[RoadSpec<'_>]) -> Document {
-        let mut doc = Document::new();
-        let layer = doc.add_layer("test".into(), None, [1.0; 4], true, 0.0);
-        for (points, width, camber, shape) in roads {
-            let centerline: Vec<PolyVertex> = points
-                .iter()
-                .map(|&(x, y, z)| PolyVertex::straight(DVec3::new(x, y, z)))
-                .collect();
-            let (width, camber, shape) = (*width, *camber, *shape);
-            doc.add_object(move |id| Object::Road {
-                id,
-                layer,
-                color: ObjectColor::ByLayer,
-                centerline,
-                width,
-                camber_degrees: camber,
-                shape,
-            });
-        }
-        doc
-    }
-
-    fn key(document: &Document, index: usize) -> RoadKey {
-        RoadKey::Object(document.objects()[index].id())
-    }
-
-    fn add_polyline(doc: &mut Document, points: &[(f64, f64, f64)], closed: bool) {
-        let layer = doc.layers()[0].id;
-        let verts: Vec<PolyVertex> = points
-            .iter()
-            .map(|&(x, y, z)| PolyVertex::straight(DVec3::new(x, y, z)))
-            .collect();
-        doc.add_object(move |id| Object::Polyline {
-            id,
-            layer,
-            verts,
-            closed,
-            color: ObjectColor::ByLayer,
-            fill: Default::default(),
-            fill_color: None,
-            line_weight: 1.0,
-        });
-    }
-
-    /// Network invariants: all side-line points finite, and no two side-line
-    /// segments properly cross in plan (touching at shared endpoints is the
-    /// expected corner sharing and is allowed).
-    fn assert_network_valid(network: &ResolvedNetwork) {
-        let mut segments: Vec<[DVec2; 2]> = Vec::new();
-        for edge in &network.edges {
-            for side in [&edge.left, &edge.right] {
-                for point in side.iter() {
-                    assert!(
-                        point.x.is_finite() && point.y.is_finite() && point.z.is_finite(),
-                        "non-finite side-line point {point:?}"
-                    );
-                }
-                for pair in side.windows(2) {
-                    segments.push([pair[0].truncate(), pair[1].truncate()]);
-                }
-            }
-        }
-        for (i, a) in segments.iter().enumerate() {
-            for b in segments.iter().skip(i + 1) {
-                if let Some((point, t, u)) = segment_intersection_xy(a[0], a[1], b[0], b[1]) {
-                    let strict = t > 1e-4 && t < 1.0 - 1e-4 && u > 1e-4 && u < 1.0 - 1e-4;
-                    assert!(
-                        !strict,
-                        "side lines properly cross at {point:?} (t={t}, u={u})"
-                    );
-                }
-            }
-        }
-    }
-
-    fn assert_same_point(a: DVec3, b: DVec3) {
-        assert!(
-            (a - b).length() < 1e-9,
-            "expected shared corner, got {a:?} vs {b:?}"
-        );
-    }
-
-    #[test]
-    fn ghost_affected_propagates_through_shared_nodes_but_not_to_isolated_roads() {
-        // Roads 0-1-2 form a chain of seams; road 3 is isolated. A ghost
-        // crossing road 0 must mark the whole chain (its reshaped edges feed
-        // the pad/seam solves down the line) and leave road 3 alone.
-        let spec = 20.0;
-        let doc = road_doc(&[
-            (
-                &[(0.0, 0.0, 0.0), (100.0, 0.0, 0.0)],
-                spec,
-                2.0,
-                RoadShape::Crown,
-            ),
-            (
-                &[(100.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
-                spec,
-                2.0,
-                RoadShape::Crown,
-            ),
-            (
-                &[(200.0, 0.0, 0.0), (300.0, 0.0, 0.0)],
-                spec,
-                2.0,
-                RoadShape::Crown,
-            ),
-            (
-                &[(0.0, 100.0, 0.0), (100.0, 100.0, 0.0)],
-                spec,
-                2.0,
-                RoadShape::Crown,
-            ),
-        ]);
-        let ghost = GhostRoad {
-            centerline: vec![DVec3::new(50.0, -50.0, 0.0), DVec3::new(50.0, 50.0, 0.0)],
-            width: spec,
-            camber_degrees: 2.0,
-            shape: RoadShape::Crown,
-        };
-
-        assert!(resolve(&doc, None).ghost_affected.is_empty());
-
-        let network = resolve(&doc, Some(&ghost));
-        let ids = |index: usize| match key(&doc, index) {
-            RoadKey::Object(id) => id,
-            RoadKey::Ghost => unreachable!(),
-        };
-        assert_eq!(
-            network.ghost_affected,
-            vec![ids(0), ids(1), ids(2)],
-            "chain reachable from the ghost, isolated road excluded"
-        );
-    }
-
-    #[test]
-    fn e1_straight_seam_shares_exact_corners() {
-        let camber = 2.0_f64;
-        let doc = road_doc(&[
-            (
-                &[(0.0, 0.0, 0.0), (100.0, 0.0, 0.0)],
-                20.0,
-                camber,
-                RoadShape::Crown,
-            ),
-            (
-                &[(100.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
-                20.0,
-                camber,
-                RoadShape::Crown,
-            ),
-        ]);
-        let network = resolve(&doc, None);
-        assert_network_valid(&network);
-
-        let a: Vec<&EdgeGeom> = network.edges_for(key(&doc, 0)).collect();
-        let b: Vec<&EdgeGeom> = network.edges_for(key(&doc, 1)).collect();
-        assert_eq!(a.len(), 1);
-        assert_eq!(b.len(), 1);
-
-        // Left side of travel is +Y for both; they must share one exact point.
-        let expected_z = -(20.0 / 2.0) * camber.to_radians().tan();
-        let a_end = *a[0].left.last().unwrap();
-        let b_start = b[0].left[0];
-        assert_same_point(a_end, b_start);
-        assert_same_point(a_end, DVec3::new(100.0, 10.0, expected_z));
-        let a_end_r = *a[0].right.last().unwrap();
-        let b_start_r = b[0].right[0];
-        assert_same_point(a_end_r, b_start_r);
-        assert_same_point(a_end_r, DVec3::new(100.0, -10.0, expected_z));
-    }
-
-    #[test]
-    fn e2_elbow_junction_shares_inner_and_outer_corners() {
-        let doc = road_doc(&[
-            (
-                &[(0.0, 0.0, 0.0), (100.0, 0.0, 0.0)],
-                20.0,
-                2.0,
-                RoadShape::Crown,
-            ),
-            (
-                &[(100.0, 0.0, 0.0), (100.0, 100.0, 0.0)],
-                20.0,
-                2.0,
-                RoadShape::Crown,
-            ),
-        ]);
-        let network = resolve(&doc, None);
-        assert_network_valid(&network);
-
-        let a: Vec<&EdgeGeom> = network.edges_for(key(&doc, 0)).collect();
-        let b: Vec<&EdgeGeom> = network.edges_for(key(&doc, 1)).collect();
-        // Inner corner (between the arms), camber runs off to the pad plane.
-        let a_left_end = *a[0].left.last().unwrap();
-        assert_same_point(a_left_end, b[0].left[0]);
-        assert_same_point(a_left_end, DVec3::new(90.0, 10.0, 0.0));
-        // Outer mitred corner.
-        let a_right_end = *a[0].right.last().unwrap();
-        assert_same_point(a_right_end, b[0].right[0]);
-        assert_same_point(a_right_end, DVec3::new(110.0, -10.0, 0.0));
-    }
-
-    #[test]
-    fn e3_t_junction_interrupts_near_side_and_keeps_far_side_continuous() {
-        let doc = road_doc(&[
-            (
-                &[(0.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
-                20.0,
-                2.0,
-                RoadShape::Crown,
-            ),
-            (
-                &[(100.0, 0.0, 0.0), (100.0, 100.0, 0.0)],
-                20.0,
-                2.0,
-                RoadShape::Crown,
-            ),
-        ]);
-        let network = resolve(&doc, None);
-        assert_network_valid(&network);
-
-        let through: Vec<&EdgeGeom> = network.edges_for(key(&doc, 0)).collect();
-        let joining: Vec<&EdgeGeom> = network.edges_for(key(&doc, 1)).collect();
-        assert_eq!(through.len(), 2, "through road splits at the junction");
-        assert_eq!(joining.len(), 1);
-
-        // Identify the two halves by x extent.
-        let (first, second) = if through[0].center[0].x < through[1].center[0].x {
-            (through[0], through[1])
-        } else {
-            (through[1], through[0])
-        };
-
-        // Near side (+Y): interrupted exactly between the two shared corners.
-        let mouth_left = *first.left.last().unwrap();
-        let mouth_right = second.left[0];
-        assert_same_point(mouth_left, DVec3::new(90.0, 10.0, 0.0));
-        assert_same_point(mouth_right, DVec3::new(110.0, 10.0, 0.0));
-        assert_same_point(
-            mouth_left,
-            *joining[0].left.last().map(|_| &joining[0].left[0]).unwrap(),
-        );
-        assert_same_point(mouth_right, joining[0].right[0]);
-
-        // Far side (−Y): both halves share one point — visually continuous.
-        let far_a = *first.right.last().unwrap();
-        let far_b = second.right[0];
-        assert_same_point(far_a, far_b);
-        assert_same_point(far_a, DVec3::new(100.0, -10.0, 0.0));
-    }
-
-    #[test]
-    fn e17_camber_mismatch_blends_across_seam_without_step() {
-        let doc = road_doc(&[
-            (
-                &[(0.0, 0.0, 0.0), (100.0, 0.0, 0.0)],
-                20.0,
-                2.0,
-                RoadShape::Crown,
-            ),
-            (
-                &[(100.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
-                20.0,
-                4.0,
-                RoadShape::CrossFallLeft,
-            ),
-        ]);
-        let network = resolve(&doc, None);
-        assert_network_valid(&network);
-        let a: Vec<&EdgeGeom> = network.edges_for(key(&doc, 0)).collect();
-        let b: Vec<&EdgeGeom> = network.edges_for(key(&doc, 1)).collect();
-        // Shared corners despite different shapes/cambers.
-        assert_same_point(*a[0].left.last().unwrap(), b[0].left[0]);
-        assert_same_point(*a[0].right.last().unwrap(), b[0].right[0]);
-        // Far from the seam each road is at its own full camber.
-        let drop_a = -(10.0) * 2.0_f64.to_radians().tan();
-        assert!((a[0].left[0].z - drop_a).abs() < 1e-9);
-        // CrossFallLeft drops the left edge and raises the right.
-        let drop_b = -(10.0) * 4.0_f64.to_radians().tan();
-        assert!((b[0].left.last().unwrap().z - drop_b).abs() < 1e-9);
-        assert!((b[0].right.last().unwrap().z + drop_b).abs() < 1e-9);
-    }
-
-    #[test]
-    fn x1_camber_runs_off_to_zero_at_junction_pad() {
-        let doc = road_doc(&[
-            (
-                &[(0.0, 0.0, 0.0), (100.0, 0.0, 0.0)],
-                20.0,
-                4.0,
-                RoadShape::Crown,
-            ),
-            (
-                &[(100.0, 0.0, 0.0), (100.0, 100.0, 0.0)],
-                20.0,
-                4.0,
-                RoadShape::Crown,
-            ),
-        ]);
-        let network = resolve(&doc, None);
-        assert_network_valid(&network);
-        let a: Vec<&EdgeGeom> = network.edges_for(key(&doc, 0)).collect();
-        // Free end carries full camber...
-        let drop = -(10.0) * 4.0_f64.to_radians().tan();
-        assert!((a[0].left[0].z - drop).abs() < 1e-9);
-        // ...and the junction corner sits exactly on the flat pad plane.
-        assert!((a[0].left.last().unwrap().z - 0.0).abs() < 1e-12);
-        assert!((a[0].right.last().unwrap().z - 0.0).abs() < 1e-12);
-    }
-
-    #[test]
-    fn grade_breaks_get_flat_approaches_idempotently() {
-        let doc = road_doc(&[(
-            &[(0.0, 0.0, 0.0), (100.0, 0.0, 10.0)],
-            20.0,
-            0.0,
-            RoadShape::Crown,
-        )]);
-        let clearance = ROAD_INTERSECTION_FLAT_CLEARANCE_M;
-        let network = resolve(&doc, None);
-        let edge = &network.edges[0];
-        assert_eq!(edge.center.len(), 4, "flats inserted at both grade breaks");
-        assert!((edge.center[1].z - 0.0).abs() < 1e-9);
-        assert!((edge.center[1].x - clearance).abs() < 1e-9);
-        assert!((edge.center[2].z - 10.0).abs() < 1e-9);
-        assert!((edge.center[2].x - (100.0 - clearance)).abs() < 1e-9);
-
-        // Re-resolving a document that stored the flattened line must not
-        // insert further flats (legacy documents stay stable).
-        let flat_pts: Vec<(f64, f64, f64)> = edge.center.iter().map(|p| (p.x, p.y, p.z)).collect();
-        let doc2 = road_doc(&[(&flat_pts, 20.0, 0.0, RoadShape::Crown)]);
-        let network2 = resolve(&doc2, None);
-        assert_eq!(network2.edges[0].center.len(), 4);
-    }
-
-    #[test]
-    fn e5_e12_crossing_at_grade_joins_and_overpass_does_not() {
-        // Same elevation: a real 4-way junction; both roads split.
-        let doc = road_doc(&[
-            (
-                &[(0.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
-                20.0,
-                2.0,
-                RoadShape::Crown,
-            ),
-            (
-                &[(100.0, -100.0, 0.0), (100.0, 100.0, 0.0)],
-                20.0,
-                2.0,
-                RoadShape::Crown,
-            ),
-        ]);
-        let network = resolve(&doc, None);
-        assert_network_valid(&network);
-        assert_eq!(network.edges.len(), 4);
-
-        // 10 m above: an overpass; nothing joins, nothing is clipped.
-        let doc = road_doc(&[
-            (
-                &[(0.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
-                20.0,
-                2.0,
-                RoadShape::Crown,
-            ),
-            (
-                &[(100.0, -100.0, 10.0), (100.0, 100.0, 10.0)],
-                20.0,
-                2.0,
-                RoadShape::Crown,
-            ),
-        ]);
-        let network = resolve(&doc, None);
-        assert_eq!(network.edges.len(), 2);
-        for edge in &network.edges {
-            assert_eq!(edge.center.len(), 2, "no junction vertices inserted");
-        }
-    }
-
-    #[test]
-    fn e19_width_mismatch_tapers_across_seam() {
-        let doc = road_doc(&[
-            (
-                &[(0.0, 0.0, 0.0), (100.0, 0.0, 0.0)],
-                40.0,
-                0.0,
-                RoadShape::Crown,
-            ),
-            (
-                &[(100.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
-                20.0,
-                0.0,
-                RoadShape::Crown,
-            ),
-        ]);
-        let network = resolve(&doc, None);
-        assert_network_valid(&network);
-        let a: Vec<&EdgeGeom> = network.edges_for(key(&doc, 0)).collect();
-        let b: Vec<&EdgeGeom> = network.edges_for(key(&doc, 1)).collect();
-        // Both arrive at the seam at the averaged half-width (15).
-        let a_end = *a[0].left.last().unwrap();
-        assert_same_point(a_end, b[0].left[0]);
-        assert!((a_end.y - 15.0).abs() < 1e-9);
-        // And regain their own widths beyond the taper.
-        assert!((a[0].left[0].y - 20.0).abs() < 1e-9);
-        assert!((b[0].left.last().unwrap().y - 10.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn ramp_into_turn_gets_a_flat_pocket_so_the_corner_is_level() {
-        // A road climbs 10 m then turns hard right on the flat. The turn
-        // vertex must not coincide with the grade break: the corner has to
-        // sit in a flat pocket, otherwise the mitered side lines skew.
-        let doc = road_doc(&[(
-            &[(0.0, 0.0, 0.0), (100.0, 0.0, 10.0), (100.0, 100.0, 10.0)],
-            20.0,
-            0.0,
-            RoadShape::Crown,
-        )]);
-        let clearance = ROAD_INTERSECTION_FLAT_CLEARANCE_M;
-        let network = resolve(&doc, None);
-        assert_network_valid(&network);
-        let edge = &network.edges[0];
-
-        // The flat approach is carved out of the ramp even though the
-        // following segment is already level: a vertex `clearance` before
-        // the turn.
-        let pocket_x = 100.0 - clearance;
-        assert!(
-            edge.center.iter().any(|p| (p.x - pocket_x).abs() < 1e-6
-                && p.y.abs() < 1e-6
-                && (p.z - 10.0).abs() < 1e-9),
-            "expected flat-pocket vertex {clearance} m before the turn, got {:?}",
-            edge.center
-        );
-
-        // Every sample in the pocket — including both mitered corner points —
-        // is level at the turn elevation, so the corner cannot skew.
-        for side in [&edge.left, &edge.right] {
-            for point in side.iter().filter(|p| p.x > pocket_x - 1e-6 && p.y < 50.0) {
-                assert!(
-                    (point.z - 10.0).abs() < 1e-9,
-                    "side-line point in the turn pocket is off the flat: {point:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn e23_attachment_side_lines_end_exactly_on_the_polyline() {
-        let mut doc = road_doc(&[(
-            &[(50.0, 0.0, 5.0), (150.0, 0.0, 5.0)],
-            20.0,
-            4.0,
-            RoadShape::Crown,
-        )]);
-        // A level crest string running north–south through the road's start.
-        add_polyline(&mut doc, &[(50.0, -50.0, 5.0), (50.0, 50.0, 5.0)], false);
-        let network = resolve(&doc, None);
-        assert_network_valid(&network);
-        let edge = &network.edges[0];
-
-        // Both side lines terminate ON the polyline, at its z, camber run off.
-        assert_same_point(edge.left[0], DVec3::new(50.0, 10.0, 5.0));
-        assert_same_point(edge.right[0], DVec3::new(50.0, -10.0, 5.0));
-        // The free end carries full camber.
-        let drop = -10.0 * 4.0_f64.to_radians().tan();
-        assert!((edge.left.last().unwrap().z - (5.0 + drop)).abs() < 1e-9);
-    }
-
-    #[test]
-    fn e24_attachment_at_a_polyline_kink_hits_the_correct_segments() {
-        let mut doc = road_doc(&[(
-            &[(50.0, 0.0, 5.0), (150.0, 0.0, 5.0)],
-            20.0,
-            2.0,
-            RoadShape::Crown,
-        )]);
-        // The boundary kinks exactly at the attachment point: the left side
-        // ray must land on the slanted segment, the right on the straight one.
-        add_polyline(
-            &mut doc,
-            &[(50.0, -50.0, 5.0), (50.0, 0.0, 5.0), (30.0, 50.0, 5.0)],
-            false,
-        );
-        let network = resolve(&doc, None);
-        assert_network_valid(&network);
-        let edge = &network.edges[0];
-        assert_same_point(edge.left[0], DVec3::new(46.0, 10.0, 5.0));
-        assert_same_point(edge.right[0], DVec3::new(50.0, -10.0, 5.0));
-    }
-
-    #[test]
-    fn e25_attachment_to_a_closed_ring_polyline() {
-        let mut doc = road_doc(&[(
-            &[(100.0, 50.0, 5.0), (200.0, 50.0, 5.0)],
-            20.0,
-            2.0,
-            RoadShape::Crown,
-        )]);
-        add_polyline(
-            &mut doc,
-            &[
-                (0.0, 0.0, 5.0),
-                (100.0, 0.0, 5.0),
-                (100.0, 100.0, 5.0),
-                (0.0, 100.0, 5.0),
-            ],
-            true,
-        );
-        let network = resolve(&doc, None);
-        assert_network_valid(&network);
-        let edge = &network.edges[0];
-        assert_same_point(edge.left[0], DVec3::new(100.0, 60.0, 5.0));
-        assert_same_point(edge.right[0], DVec3::new(100.0, 40.0, 5.0));
-    }
-
-    #[test]
-    fn e4_y_junction_every_corner_is_shared_by_exactly_two_roads() {
-        let dir120 = DVec2::new(
-            (2.0 * std::f64::consts::PI / 3.0).cos(),
-            (2.0 * std::f64::consts::PI / 3.0).sin(),
-        );
-        let dir240 = DVec2::new(
-            (4.0 * std::f64::consts::PI / 3.0).cos(),
-            (4.0 * std::f64::consts::PI / 3.0).sin(),
-        );
-        let b_end = dir120 * 100.0;
-        let c_end = dir240 * 100.0;
-        let doc = road_doc(&[
-            (
-                &[(100.0, 0.0, 0.0), (0.0, 0.0, 0.0)],
-                20.0,
-                2.0,
-                RoadShape::Crown,
-            ),
-            (
-                &[(0.0, 0.0, 0.0), (b_end.x, b_end.y, 0.0)],
-                20.0,
-                2.0,
-                RoadShape::Crown,
-            ),
-            (
-                &[(0.0, 0.0, 0.0), (c_end.x, c_end.y, 0.0)],
-                20.0,
-                2.0,
-                RoadShape::Crown,
-            ),
-        ]);
-        let network = resolve(&doc, None);
-        assert_network_valid(&network);
-        let a: Vec<&EdgeGeom> = network.edges_for(key(&doc, 0)).collect();
-        let b: Vec<&EdgeGeom> = network.edges_for(key(&doc, 1)).collect();
-        let c: Vec<&EdgeGeom> = network.edges_for(key(&doc, 2)).collect();
-
-        // Three corners, each shared by exactly two roads, all on the pad
-        // plane (z = 0).
-        let corner_ab = *a[0].right.last().unwrap();
-        assert_same_point(corner_ab, b[0].right[0]);
-        let corner_bc = b[0].left[0];
-        assert_same_point(corner_bc, c[0].right[0]);
-        let corner_ca = c[0].left[0];
-        assert_same_point(corner_ca, *a[0].left.last().unwrap());
-        for corner in [corner_ab, corner_bc, corner_ca] {
-            assert!(
-                corner.z.abs() < 1e-12,
-                "corner off the pad plane: {corner:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn e9_closed_loop_road_side_lines_close_on_shared_corners() {
-        let doc = road_doc(&[(
-            &[
-                (0.0, 0.0, 0.0),
-                (100.0, 0.0, 0.0),
-                (100.0, 100.0, 0.0),
-                (0.0, 100.0, 0.0),
-                (0.0, 0.0, 0.0),
-            ],
-            20.0,
-            2.0,
-            RoadShape::Crown,
-        )]);
-        let network = resolve(&doc, None);
-        assert_network_valid(&network);
-        assert_eq!(network.edges.len(), 1);
-        let edge = &network.edges[0];
-
-        // Both side rings close exactly: first == last, at the mitred corner.
-        assert_same_point(edge.left[0], *edge.left.last().unwrap());
-        assert_same_point(edge.left[0], DVec3::new(10.0, 10.0, 0.0));
-        assert_same_point(edge.right[0], *edge.right.last().unwrap());
-        assert_same_point(edge.right[0], DVec3::new(-10.0, -10.0, 0.0));
-        assert!(!edge.start_cap && !edge.end_cap);
-    }
-
-    #[test]
-    fn e27_switchback_on_a_grade_stays_simple() {
-        // Tight (but rule-legal, > 30° interior) climbing switchback.
-        let leg = 80.0;
-        let turn = 145.0_f64.to_radians();
-        let p1 = (100.0, 0.0, 10.0);
-        let p2 = (p1.0 + leg * turn.cos(), p1.1 + leg * turn.sin(), 18.0);
-        let doc = road_doc(&[(&[(0.0, 0.0, 0.0), p1, p2], 20.0, 2.0, RoadShape::Crown)]);
-        let network = resolve(&doc, None);
-        assert_network_valid(&network);
-    }
-
-    #[test]
-    fn e6_junction_too_close_to_a_road_end_is_refused() {
-        let doc = road_doc(&[(
-            &[(0.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
-            20.0,
-            2.0,
-            RoadShape::Crown,
-        )]);
-
-        // A ghost crossing 5 m from the road's end leaves the endpoint inside
-        // the ghost's body (half-width 10): the stub is absorbed into the
-        // junction rather than refused — it would be buried under the
-        // crossing road's pavement anyway.
-        let ghost = GhostRoad {
-            centerline: vec![DVec3::new(5.0, -100.0, 0.0), DVec3::new(5.0, 100.0, 0.0)],
-            width: 20.0,
-            camber_degrees: 2.0,
-            shape: RoadShape::Crown,
-        };
-        assert_eq!(validate_ghost(&doc, &ghost, 15.0), Ok(()));
-        let network = resolve(&doc, Some(&ghost));
-        assert_network_valid(&network);
-        assert_eq!(
-            network.edges_for(key(&doc, 0)).count(),
-            1,
-            "the 5 m stub is absorbed, leaving only the far span"
-        );
-
-        // Crossing 15 m from the end is outside the absorb range but the
-        // stub still cannot fit its junction flat clearance: refused.
-        let ghost = GhostRoad {
-            centerline: vec![DVec3::new(15.0, -100.0, 0.0), DVec3::new(15.0, 100.0, 0.0)],
-            width: 20.0,
-            camber_degrees: 2.0,
-            shape: RoadShape::Crown,
-        };
-        assert!(
-            matches!(
-                validate_ghost(&doc, &ghost, 15.0),
-                Err(RoadRuleViolation::ClearanceTooTight { .. })
-            ),
-            "expected the 15 m stub edge to be refused"
-        );
-
-        // The same crossing mid-road is fine.
-        let ghost = GhostRoad {
-            centerline: vec![
-                DVec3::new(100.0, -100.0, 0.0),
-                DVec3::new(100.0, 100.0, 0.0),
-            ],
-            width: 20.0,
-            camber_degrees: 2.0,
-            shape: RoadShape::Crown,
-        };
-        assert_eq!(validate_ghost(&doc, &ghost, 15.0), Ok(()));
-    }
-
-    #[test]
-    fn validate_ghost_reports_each_rule_violation() {
-        let doc = road_doc(&[(
-            &[(0.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
-            20.0,
-            2.0,
-            RoadShape::Crown,
-        )]);
-        let ghost = |centerline: Vec<DVec3>| GhostRoad {
-            centerline,
-            width: 20.0,
-            camber_degrees: 2.0,
-            shape: RoadShape::Crown,
-        };
-
-        // Grade above the maximum.
-        let steep = ghost(vec![
-            DVec3::new(0.0, 50.0, 0.0),
-            DVec3::new(50.0, 50.0, 25.0),
-        ]);
-        assert!(matches!(
-            validate_ghost(&doc, &steep, 15.0),
-            Err(RoadRuleViolation::SegmentTooSteep { .. })
-        ));
-
-        // 20° interior angle at the ghost's own vertex.
-        let bend = 20f64.to_radians();
-        let sharp = ghost(vec![
-            DVec3::new(0.0, 50.0, 0.0),
-            DVec3::new(50.0, 50.0, 0.0),
-            DVec3::new(50.0 - 50.0 * bend.cos(), 50.0 - 50.0 * bend.sin(), 0.0),
-        ]);
-        assert!(matches!(
-            validate_ghost(&doc, &sharp, 15.0),
-            Err(RoadRuleViolation::TurnTooSharp { .. })
-        ));
-
-        // Crossing the existing road at 20° in plan: the branch angle at the
-        // junction node is below the minimum (the old validator never saw
-        // mid-segment crossings).
-        let dir = glam::DVec2::new(bend.cos(), bend.sin()) * 100.0;
-        let skew_cross = ghost(vec![
-            DVec3::new(100.0 - dir.x, -dir.y, 0.0),
-            DVec3::new(100.0 + dir.x, dir.y, 0.0),
-        ]);
-        assert!(matches!(
-            validate_ghost(&doc, &skew_cross, 15.0),
-            Err(RoadRuleViolation::TurnTooSharp { .. })
-        ));
-
-        // A 30 m ramp cannot fit its two grade-break flat pockets.
-        let short_ramp = ghost(vec![
-            DVec3::new(0.0, 50.0, 0.0),
-            DVec3::new(30.0, 50.0, 3.0),
-        ]);
-        assert!(matches!(
-            validate_ghost(&doc, &short_ramp, 15.0),
-            Err(RoadRuleViolation::ClearanceTooTight { .. })
-        ));
-
-        // A gentle, long-enough ramp clear of the network passes.
-        let legal = ghost(vec![
-            DVec3::new(0.0, 50.0, 0.0),
-            DVec3::new(100.0, 50.0, 5.0),
-        ]);
-        assert_eq!(validate_ghost(&doc, &legal, 15.0), Ok(()));
-    }
-
-    #[test]
-    fn attach_and_continue_forms_a_junction_at_the_interior_vertex() {
-        // A stroke snapped onto an existing road and continued past it: the
-        // contact is an interior vertex of the new road, not an endpoint and
-        // not a strict segment crossing. It must still form a junction.
-        let doc = road_doc(&[
-            (
-                &[(0.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
-                20.0,
-                2.0,
-                RoadShape::Crown,
-            ),
-            (
-                &[(100.0, -100.0, 0.0), (100.0, 0.0, 0.0), (180.0, 100.0, 0.0)],
-                20.0,
-                2.0,
-                RoadShape::Crown,
-            ),
-        ]);
-        let network = resolve(&doc, None);
-        assert_network_valid(&network);
-        // Both roads split at the shared vertex: a 4-port junction.
-        assert_eq!(network.edges_for(key(&doc, 0)).count(), 2);
-        assert_eq!(network.edges_for(key(&doc, 1)).count(), 2);
-    }
-
-    #[test]
-    fn crossing_near_a_corner_snaps_to_the_corner_vertex() {
-        // A stroke drawn "through" a corner never hits the vertex exactly.
-        // Crossing 1 m before the bend must snap onto the corner and resolve
-        // as a clean shared-vertex junction, not leave the bend inside the
-        // pad.
-        let doc = road_doc(&[(
-            &[(-200.0, 0.0, 0.0), (0.0, 0.0, 0.0), (120.0, 90.0, 0.0)],
-            20.0,
-            2.0,
-            RoadShape::Crown,
-        )]);
-        let dir = DVec2::new(75f64.to_radians().cos(), 75f64.to_radians().sin());
-        let through = DVec2::new(-1.0, 0.0);
-        let ghost = GhostRoad {
-            centerline: vec![
-                DVec3::new(through.x - dir.x * 100.0, through.y - dir.y * 100.0, 0.0),
-                DVec3::new(through.x + dir.x * 100.0, through.y + dir.y * 100.0, 0.0),
-            ],
-            width: 20.0,
-            camber_degrees: 2.0,
-            shape: RoadShape::Crown,
-        };
-        assert_eq!(validate_ghost(&doc, &ghost, 15.0), Ok(()));
-
-        let network = resolve(&doc, Some(&ghost));
-        assert_network_valid(&network);
-        // Both roads split exactly at the corner: a 4-port junction.
-        assert_eq!(network.edges_for(key(&doc, 0)).count(), 2);
-        assert_eq!(network.edges_for(RoadKey::Ghost).count(), 2);
-        for edge in network.edges_for(key(&doc, 0)) {
-            let at_corner = edge.center[0].truncate().length() < 1e-9
-                || edge.center.last().unwrap().truncate().length() < 1e-9;
-            assert!(at_corner, "edge does not terminate at the corner vertex");
-        }
-    }
-
-    #[test]
-    fn crossing_a_bend_inside_the_junction_zone_is_refused() {
-        // Crossing 15 m before the corner is outside the vertex-snap range
-        // (half-width = 10 m) but leaves the bend inside the junction's
-        // straight-approach zone: refused rather than resolved into
-        // self-crossing side lines.
-        let doc = road_doc(&[(
-            &[(-200.0, 0.0, 0.0), (0.0, 0.0, 0.0), (120.0, 90.0, 0.0)],
-            20.0,
-            2.0,
-            RoadShape::Crown,
-        )]);
-        let dir = DVec2::new(75f64.to_radians().cos(), 75f64.to_radians().sin());
-        let through = DVec2::new(-15.0, 0.0);
-        let ghost = GhostRoad {
-            centerline: vec![
-                DVec3::new(through.x - dir.x * 100.0, through.y - dir.y * 100.0, 0.0),
-                DVec3::new(through.x + dir.x * 100.0, through.y + dir.y * 100.0, 0.0),
-            ],
-            width: 20.0,
-            camber_degrees: 2.0,
-            shape: RoadShape::Crown,
-        };
-        assert!(matches!(
-            validate_ghost(&doc, &ghost, 15.0),
-            Err(RoadRuleViolation::TurnTooCloseToJunction { .. })
-        ));
-    }
-
-    #[test]
-    fn endpoint_inside_a_road_body_attaches_to_it() {
-        // Snapping to the drawn line can leave a new road's endpoint slightly
-        // off the stored centerline (derived centerlines reroute through
-        // junction corners). An endpoint inside the road's body must still
-        // form a T junction, not a dangling overlap.
-        let doc = road_doc(&[
-            (
-                &[(0.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
-                20.0,
-                2.0,
-                RoadShape::Crown,
-            ),
-            (
-                &[(100.0, 3.0, 0.0), (100.0, 150.0, 0.0)],
-                20.0,
-                2.0,
-                RoadShape::Crown,
-            ),
-        ]);
-        let network = resolve(&doc, None);
-        assert_network_valid(&network);
-        // The through road splits at the attachment: a 3-port junction.
-        assert_eq!(network.edges_for(key(&doc, 0)).count(), 2);
-        let joining: Vec<&EdgeGeom> = network.edges_for(key(&doc, 1)).collect();
-        assert_eq!(joining.len(), 1);
-        // The joining edge starts on the through road's centerline, and its
-        // junction end is not capped.
-        let start = joining[0].center[0];
-        assert!(
-            start.truncate().distance(DVec2::new(100.0, 0.0)) < 1e-9,
-            "expected the joining road to start on the centerline, got {start:?}"
-        );
-        assert!(!joining[0].start_cap);
-    }
-
-    #[test]
-    fn endpoint_just_past_the_centerline_attaches_without_a_sliver() {
-        // Snapping can land the stroke's start a hair past the target
-        // centerline. That must resolve as one attachment node, not an
-        // attachment PLUS a crossing sliver next to it (whose near-parallel
-        // ports read as a 0-degree branch and refuse the stroke).
-        let doc = road_doc(&[(
-            &[(0.0, 0.0, 0.0), (200.0, 0.0, 0.0)],
-            20.0,
-            2.0,
-            RoadShape::Crown,
-        )]);
-        for start_y in [0.0, 0.5, -0.5, 3.0, -3.0] {
-            let ghost = GhostRoad {
-                centerline: vec![
-                    DVec3::new(100.0, start_y, 0.0),
-                    DVec3::new(140.0, 100.0, 0.0),
-                ],
-                width: 20.0,
-                camber_degrees: 2.0,
-                shape: RoadShape::Crown,
-            };
-            assert_eq!(
-                validate_ghost(&doc, &ghost, 15.0),
-                Ok(()),
-                "start offset {start_y} refused"
-            );
-            let network = resolve(&doc, Some(&ghost));
-            assert_network_valid(&network);
-            assert_eq!(network.edges_for(key(&doc, 0)).count(), 2);
-            assert_eq!(network.edges_for(RoadKey::Ghost).count(), 1);
-        }
-    }
-
-    #[test]
-    fn attach_reroute_is_confined_to_the_junction_approach() {
-        // Attaching an endpoint inside a road's body pulls the derived end
-        // onto the junction node. That correction must not pivot the whole
-        // edge (drawn roads would visibly shift): away from the node the
-        // derived centerline has to lie exactly on the stored line.
-        for d in [0.0_f64, 3.0, 8.0] {
-            let doc = road_doc(&[(
-                &[(0.0, -200.0, 0.0), (0.0, 200.0, 0.0)],
-                20.0,
-                2.0,
-                RoadShape::Crown,
-            )]);
-            let stored_a = DVec2::new(-150.0, -60.0);
-            let stored_b = DVec2::new(-d, 0.0);
-            let ghost = GhostRoad {
-                centerline: vec![
-                    DVec3::new(stored_a.x, stored_a.y, 0.0),
-                    DVec3::new(stored_b.x, stored_b.y, 0.0),
-                ],
-                width: 20.0,
-                camber_degrees: 2.0,
-                shape: RoadShape::Crown,
-            };
-            assert_eq!(validate_ghost(&doc, &ghost, 15.0), Ok(()));
-            let network = resolve(&doc, Some(&ghost));
-            assert_network_valid(&network);
-            let dir = (stored_b - stored_a).normalize();
-            // Generous bound: reroute run for hw 10 plus slack.
-            let confine = 75.0;
-            for edge in network.edges_for(RoadKey::Ghost) {
-                let node = edge.center.last().unwrap().truncate();
-                for p in &edge.center {
-                    if (p.truncate() - node).length() <= confine {
-                        continue;
-                    }
-                    let rel = p.truncate() - stored_a;
-                    let off_line = (rel - dir * rel.dot(dir)).length();
-                    assert!(
-                        off_line < 1e-6,
-                        "derived center strays {off_line:.3} m off the drawn \
-                         line {:.0} m from the node (offset {d})",
-                        (p.truncate() - node).length()
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn dead_ends_are_capped() {
-        let doc = road_doc(&[(
-            &[(0.0, 0.0, 0.0), (100.0, 0.0, 0.0)],
-            20.0,
-            2.0,
-            RoadShape::Crown,
-        )]);
-        let network = resolve(&doc, None);
-        assert!(network.edges[0].start_cap);
-        assert!(network.edges[0].end_cap);
-    }
 }

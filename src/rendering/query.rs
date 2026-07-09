@@ -46,6 +46,7 @@ impl SceneQuery {
     pub(crate) fn snap(
         document: &Document,
         snap_index: &ObjectSnapIndex,
+        road_network: Option<&crate::model::road_network::ResolvedNetwork>,
         triangulations: &[OpenTriangulation],
         hidden: &HashSet<SceneEntityId>,
         frozen: &HashSet<SceneEntityId>,
@@ -59,6 +60,7 @@ impl SceneQuery {
         let candidate = snap::snap_cursor(
             document,
             snap_index,
+            road_network,
             triangulations,
             hidden,
             frozen,
@@ -69,6 +71,12 @@ impl SceneQuery {
             threshold,
         )?;
         if xray_enabled {
+            return Some(candidate.world);
+        }
+        // Surface snapping is already a nearest-hit ray cast along the cursor
+        // ray, so the candidate is the front-most surface by construction —
+        // re-ray-casting every triangulation here would only repeat the work.
+        if matches!(mode, CursorMode::SnapToSurface) {
             return Some(candidate.world);
         }
         // Test visibility along the candidate's own screen-space ray. Using the

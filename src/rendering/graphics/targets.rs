@@ -47,13 +47,13 @@ impl<'a> Graphics<'a> {
         (texture, view)
     }
 
-    pub(super) fn create_block_model_peel_targets(
+    pub(super) fn create_block_model_transparency_targets(
         device: &wgpu::Device,
         config: &wgpu::SurfaceConfiguration,
         scene_depth_view: &wgpu::TextureView,
-        peel_layout: &wgpu::BindGroupLayout,
+        transparency_fallback_layout: &wgpu::BindGroupLayout,
         composite_layout: &wgpu::BindGroupLayout,
-    ) -> BlockModelPeelTargets {
+    ) -> BlockModelTransparencyTargets {
         let size = wgpu::Extent3d {
             width: config.width.max(1),
             height: config.height.max(1),
@@ -73,14 +73,15 @@ impl<'a> Graphics<'a> {
             .iter()
             .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()))
             .collect::<Vec<_>>();
-        let peel_bind_groups = vec![device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: peel_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(scene_depth_view),
-            }],
-            label: Some("Block Model Transparency Bind Group"),
-        })];
+        let transparency_fallback_bind_groups =
+            vec![device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: transparency_fallback_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(scene_depth_view),
+                }],
+                label: Some("Block Model Transparency Bind Group"),
+            })];
         let composite_bind_groups = vec![device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: composite_layout,
             entries: &[wgpu::BindGroupEntry {
@@ -89,10 +90,10 @@ impl<'a> Graphics<'a> {
             }],
             label: Some("Block Model Transparency Composite Bind Group"),
         })];
-        BlockModelPeelTargets {
+        BlockModelTransparencyTargets {
             _accum_textures: accum_textures,
             accum_views,
-            peel_bind_groups,
+            transparency_fallback_bind_groups,
             composite_bind_groups,
         }
     }

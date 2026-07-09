@@ -41,7 +41,7 @@ pub(crate) fn init() {
             std::env::var_os("WAYLAND_DISPLAY"),
             std::env::var_os("DISPLAY")
         );
-        if let Err(error) = crate::startup::linux::install_wayland_desktop_entry() {
+        if let Err(error) = crate::os::linux::install_wayland_desktop_entry() {
             log::warn!("Failed to install Wayland desktop integration: {error}");
         }
     }

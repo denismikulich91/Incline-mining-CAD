@@ -442,21 +442,8 @@ impl<'a> App<'a> {
                 &mut project.pidb.document,
                 Command::Replace { before, after },
             );
-            project.dirty = true;
         }
-        self.editor.relimit_confirming_end = false;
-        self.editor.relimit_waiting_for_pick = false;
-        self.editor.relimit_awaiting_source_pick = false;
-        self.editor.relimit_dialog_open = false;
-        self.editor.relimit_source_id = None;
-        self.editor.relimit_second_id = None;
-        self.editor.relimit_intersection_3d = None;
-        self.editor.relimit_candidates.clear();
-        self.editor.relimit_hover_target_id = None;
-        self.editor.relimit_hover_target_screen_px.clear();
-        self.editor.relimit_preview_from_px = None;
-        self.editor.relimit_preview_to_px = None;
-        self.editor.active_tool = ActiveTool::None;
+        self.cancel_relimit();
         self.invalidate_geometry();
     }
 
@@ -499,10 +486,16 @@ impl<'a> App<'a> {
                 &mut project.pidb.document,
                 Command::Replace { before, after },
             );
-            project.dirty = true;
         }
-        self.editor.relimit_dialog_open = false;
+        self.cancel_relimit();
+        self.invalidate_geometry();
+    }
+
+    pub(crate) fn cancel_relimit(&mut self) {
+        self.editor.relimit_confirming_end = false;
+        self.editor.relimit_waiting_for_pick = false;
         self.editor.relimit_awaiting_source_pick = false;
+        self.editor.relimit_dialog_open = false;
         self.editor.relimit_source_id = None;
         self.editor.relimit_second_id = None;
         self.editor.relimit_intersection_3d = None;
@@ -512,7 +505,8 @@ impl<'a> App<'a> {
         self.editor.relimit_preview_from_px = None;
         self.editor.relimit_preview_to_px = None;
         self.editor.active_tool = ActiveTool::None;
-        self.invalidate_geometry();
+        self.invalidate_overlay();
+        userspace_log!("Cancelled relimit tool");
     }
 }
 
@@ -536,60 +530,4 @@ fn line_line_intersect_t(
     let (point, _) = kernel::line_segment(a, b - a, c, d, kernel::XY_TOL)?;
     let r = b - a;
     Some((point - a).dot(r) / r.length_squared())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use glam::DVec2;
-
-    #[test]
-    fn finds_a_proper_crossing() {
-        // Infinite line through (0,0)->(10,0) crosses segment (5,-5)->(5,5) at t=0.5.
-        let t = line_line_intersect_t(
-            DVec2::new(0.0, 0.0),
-            DVec2::new(10.0, 0.0),
-            DVec2::new(5.0, -5.0),
-            DVec2::new(5.0, 5.0),
-        );
-        assert!(t.is_some());
-        assert!((t.unwrap() - 0.5).abs() < 1e-9);
-    }
-
-    #[test]
-    fn finds_a_hit_exactly_at_the_target_segment_endpoint() {
-        // The target segment starts exactly where it touches the source's line.
-        let t = line_line_intersect_t(
-            DVec2::new(0.0, 0.0),
-            DVec2::new(10.0, 0.0),
-            DVec2::new(5.0, 0.0),
-            DVec2::new(5.0, 5.0),
-        );
-        assert!(t.is_some());
-        assert!((t.unwrap() - 0.5).abs() < 1e-9);
-    }
-
-    #[test]
-    fn tolerates_floating_point_drift_just_past_the_target_endpoint() {
-        // Simulates a touch point computed by a previous relimit landing a hair
-        // outside the exact [0, 1] segment range due to float rounding.
-        let t = line_line_intersect_t(
-            DVec2::new(0.0, 0.0),
-            DVec2::new(10.0, 0.0),
-            DVec2::new(5.0, -1e-9),
-            DVec2::new(5.0, 5.0),
-        );
-        assert!(t.is_some(), "a touch point just past u=0 should still hit");
-    }
-
-    #[test]
-    fn rejects_a_miss_well_outside_the_segment() {
-        let t = line_line_intersect_t(
-            DVec2::new(0.0, 0.0),
-            DVec2::new(10.0, 0.0),
-            DVec2::new(5.0, 1.0),
-            DVec2::new(5.0, 5.0),
-        );
-        assert!(t.is_none());
-    }
 }

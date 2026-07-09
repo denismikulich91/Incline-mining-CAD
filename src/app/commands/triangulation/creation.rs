@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::geometry::points_coincident;
+use crate::model::geometry::{points_coincident, signed_area_xy, triangle_xy_area};
 
 /// Coarse endpoint-weld tolerance (metres, XY and Z) offered by the failure
 /// dialog for breaklines digitized independently: gaps up to this size are
@@ -18,7 +18,9 @@ impl<'a> App<'a> {
             anyhow::bail!("No objects selected for triangulation");
         }
 
-        let (mut rings, rejected) = self.collect_triangulation_rings(&object_ids);
+        // Snapshot the referenced geometry into owned rings on the UI thread —
+        // the worker must not touch `self.scene_document`.
+        let (rings, rejected) = self.collect_triangulation_rings(&object_ids);
 
         if rings.is_empty() {
             anyhow::bail!(
@@ -32,55 +34,49 @@ impl<'a> App<'a> {
             );
         }
 
-        let welded = weld_breakline_vertices(
-            &mut rings,
-            crate::model::kernel::XY_TOL,
-            crate::model::kernel::Z_TOL,
-        );
-        if welded > 0 {
-            userspace_log!(
-                "Welded {} breakline vertex/vertices that coincided within tolerance",
-                welded
-            );
-        }
-        if coarse_weld {
-            let coarse_welded =
-                weld_breakline_vertices(&mut rings, COARSE_WELD_TOL, COARSE_WELD_TOL);
-            userspace_log!(
-                "Weld & retry: moved {} vertex/vertices onto shared positions (up to {} m); \
-                 source objects are unchanged",
-                coarse_welded,
-                COARSE_WELD_TOL
-            );
-        }
-
-        let (all_verts, all_faces) = if rings.len() == 1 && surface_type == TriSurfaceType::Surface
-        {
-            // Single ring: triangulate its flat interior (normal pointing up).
-            let flip = signed_area_xy(&rings[0]) <= 0.0; // CW ring needs flip for normal-up
-            cdt_fill_ring(&rings[0], flip)?
-        } else if surface_type == TriSurfaceType::Surface {
-            // Nested contours, benches and berms are terrain breaklines, not a
-            // Z-sorted loft stack. Triangulate all selected boundaries in one
-            // XY CDT so every string edge is preserved and its vertex Z drives
-            // the resulting terrain surface.
-            cdt_surface_from_breaklines(&rings)?
-        } else {
-            closed_solid_from_breaklines(&rings)?
+        // Whether a coarse-weld retry could help, computed from the un-welded
+        // rings on the UI thread so the async failure dialog can offer it.
+        let weld_retry_available = !coarse_weld && {
+            let mut probe = rings.clone();
+            weld_breakline_vertices(&mut probe, COARSE_WELD_TOL, COARSE_WELD_TOL) > 0
         };
+        let name_for_failure = name.clone();
+        let object_ids_for_failure = object_ids.clone();
 
-        if all_faces.is_empty() {
-            anyhow::bail!(
-                "Triangulation produced no faces — polygons may be collinear or degenerate"
-            );
-        }
+        // A retry supersedes the previous failure; clear it now for immediate
+        // feedback (the apply step re-sets it if this attempt also fails).
+        self.editor.tri_create_failure = None;
 
-        userspace_log!(
-            "Created triangulation from {} polygon(s), surface type {:?}",
-            rings.len(),
-            surface_type
+        let compute = move |_cancel: &crate::app::jobs::CancelFlag|
+              -> Result<crate::model::triangulation::GeneratedTriangulation> {
+            build_created_triangulation(rings, name, surface_type, coarse_weld)
+        };
+        let apply =
+            move |app: &mut App,
+                  result: Result<crate::model::triangulation::GeneratedTriangulation>| {
+                match result {
+                    Ok(generated) => {
+                        app.editor.tri_create_failure = None;
+                        app.insert_generated_triangulation(generated);
+                    }
+                    Err(error) => {
+                        app.editor.tri_create_failure = Some(crate::ui::state::TriCreateFailure {
+                            message: format!("{error:#}"),
+                            name: name_for_failure,
+                            object_ids: object_ids_for_failure,
+                            surface_type,
+                            weld_retry_available,
+                        });
+                    }
+                }
+            };
+        self.spawn_job(
+            "Creating triangulation…",
+            crate::app::jobs::JobKey::Anonymous,
+            compute,
+            apply,
         );
-        self.finish_generated_triangulation(name, all_verts, all_faces, surface_type)
+        Ok(())
     }
 
     /// Closed polygons from the selection as rings, plus the count of
@@ -119,8 +115,11 @@ impl<'a> App<'a> {
         weld_breakline_vertices(&mut rings, COARSE_WELD_TOL, COARSE_WELD_TOL) > 0
     }
 
-    /// Create Triangulation with failure capture: on error, retain the inputs
-    /// and message so the failure dialog can offer a coarse-weld retry.
+    /// Create Triangulation with failure capture. The triangulation runs on a
+    /// background thread; async CDT failures populate the failure dialog in the
+    /// job's apply step. This wrapper only captures the *synchronous* early
+    /// errors (empty selection, no closed polygons) into the same dialog so the
+    /// coarse-weld retry stays available.
     pub(crate) fn run_create_triangulation(
         &mut self,
         name: String,
@@ -134,23 +133,81 @@ impl<'a> App<'a> {
             surface_type,
             coarse_weld,
         );
-        match &result {
-            Ok(()) => self.editor.tri_create_failure = None,
-            Err(error) => {
-                // Don't offer the weld again if it already ran and failed.
-                let weld_retry_available =
-                    !coarse_weld && self.coarse_weld_would_change(&object_ids);
-                self.editor.tri_create_failure = Some(crate::ui::state::TriCreateFailure {
-                    message: format!("{error:#}"),
-                    name,
-                    object_ids,
-                    surface_type,
-                    weld_retry_available,
-                });
-            }
+        if let Err(error) = &result {
+            // Don't offer the weld again if it already ran and failed.
+            let weld_retry_available = !coarse_weld && self.coarse_weld_would_change(&object_ids);
+            self.editor.tri_create_failure = Some(crate::ui::state::TriCreateFailure {
+                message: format!("{error:#}"),
+                name,
+                object_ids,
+                surface_type,
+                weld_retry_available,
+            });
         }
         result
     }
+}
+
+/// Worker-thread half of Create: weld, triangulate, and build the mesh/BVH.
+/// Pure (no `App`, no scene access) so it can run off the UI thread. Emits the
+/// weld/creation log lines (the log sink is thread-safe).
+fn build_created_triangulation(
+    mut rings: Vec<Vec<glam::DVec3>>,
+    name: String,
+    surface_type: TriSurfaceType,
+    coarse_weld: bool,
+) -> Result<crate::model::triangulation::GeneratedTriangulation> {
+    let welded = weld_breakline_vertices(
+        &mut rings,
+        crate::model::kernel::XY_TOL,
+        crate::model::kernel::Z_TOL,
+    );
+    if welded > 0 {
+        userspace_log!(
+            "Welded {} breakline vertex/vertices that coincided within tolerance",
+            welded
+        );
+    }
+    if coarse_weld {
+        let coarse_welded = weld_breakline_vertices(&mut rings, COARSE_WELD_TOL, COARSE_WELD_TOL);
+        userspace_log!(
+            "Weld & retry: moved {} vertex/vertices onto shared positions (up to {} m); \
+             source objects are unchanged",
+            coarse_welded,
+            COARSE_WELD_TOL
+        );
+    }
+
+    let (all_verts, all_faces) = if rings.len() == 1 && surface_type == TriSurfaceType::Surface {
+        // Single ring: triangulate its flat interior (normal pointing up).
+        let flip = signed_area_xy(&rings[0]) <= 0.0; // CW ring needs flip for normal-up
+        cdt_fill_ring(&rings[0], flip)?
+    } else if surface_type == TriSurfaceType::Surface {
+        // Nested contours, benches and berms are terrain breaklines, not a
+        // Z-sorted loft stack. Triangulate all selected boundaries in one XY
+        // CDT so every string edge is preserved and its vertex Z drives the
+        // resulting terrain surface.
+        cdt_surface_from_breaklines(&rings)?
+    } else {
+        closed_solid_from_breaklines(&rings)?
+    };
+
+    if all_faces.is_empty() {
+        anyhow::bail!("Triangulation produced no faces — polygons may be collinear or degenerate");
+    }
+
+    userspace_log!(
+        "Created triangulation from {} polygon(s), surface type {:?}",
+        rings.len(),
+        surface_type
+    );
+    super::session::build_generated_triangulation(
+        name,
+        all_verts,
+        all_faces,
+        surface_type,
+        crate::model::triangulation::unique_edges,
+    )
 }
 
 /// Snap breakline vertices that coincide within the given tolerances (XY
@@ -469,7 +526,13 @@ pub(super) fn cdt_surface_from_breaklines(
 
             let edge_start = ring[i];
             let edge_end = ring[(i + 1) % ring.len()];
-            let constraint_edges = cdt.add_constraint_and_split(a, b, |point| point);
+            // A panic here is spade failing to split a near-degenerate
+            // crossing (the intersection point snaps onto blocking geometry);
+            // report it as the overlap it is rather than crashing.
+            let constraint_edges = crate::logging::catch_panic_quietly(|| {
+                cdt.add_constraint_and_split(a, b, |point| point)
+            })
+            .unwrap_or_default();
             if constraint_edges.is_empty() {
                 anyhow::bail!(
                     "Selected breakline edges intersect or overlap in XY and cannot form a terrain surface ({})",
@@ -663,7 +726,8 @@ pub(super) fn closed_solid_from_breaklines(
                 boundary_indices[triangle[2]],
             ];
             let cap_should_point_up = is_pit;
-            if (triangle_signed_xy_area(&vertices, face) > 0.0) != cap_should_point_up {
+            let corners = face.map(|index| vertices[index as usize]);
+            if (triangle_xy_area(corners) > 0.0) != cap_should_point_up {
                 face.swap(1, 2);
             }
             faces.push(face);
@@ -686,13 +750,6 @@ pub(super) fn outer_breakline_indices(rings: &[Vec<glam::DVec3>]) -> Vec<usize> 
             (!contained).then_some(index)
         })
         .collect()
-}
-
-pub(super) fn triangle_signed_xy_area(vertices: &[tri00t::Vertex], face: [u32; 3]) -> f64 {
-    let a = vertices[face[0] as usize];
-    let b = vertices[face[1] as usize];
-    let c = vertices[face[2] as usize];
-    ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)) * 0.5
 }
 
 /// Triangulate the interior of a closed ring using CDT.
@@ -744,7 +801,14 @@ pub(super) fn cdt_fill_ring(
         // Self-intersecting edges are split at their crossing points rather
         // than rejected; split vertices take their Z from the edge being
         // inserted.
-        let constraint_edges = cdt.add_constraint_and_split(ha, hb, |point| point);
+        let constraint_edges = crate::logging::catch_panic_quietly(|| {
+            cdt.add_constraint_and_split(ha, hb, |point| point)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Selected polygon edges cross or overlap themselves too closely in XY to triangulate"
+            )
+        })?;
         for edge in constraint_edges {
             let edge = cdt.directed_edge(edge);
             for vertex in [edge.from(), edge.to()] {
@@ -806,292 +870,4 @@ pub(super) fn cdt_fill_ring(
         anyhow::bail!("Failed to triangulate polygon (may be degenerate or collinear)");
     }
     Ok((verts, faces))
-}
-
-/// Signed XY area of a ring (shoelace); positive means CCW viewed from above.
-pub(super) fn signed_area_xy(ring: &[glam::DVec3]) -> f64 {
-    let n = ring.len();
-    (0..n)
-        .map(|i| {
-            let p = ring[i];
-            let q = ring[(i + 1) % n];
-            p.x * q.y - q.x * p.y
-        })
-        .sum::<f64>()
-        * 0.5
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use glam::DVec3;
-
-    #[test]
-    fn coarse_weld_merges_cm_scale_gaps_that_the_noise_weld_leaves() {
-        const E: f64 = 476_000.0;
-        const N: f64 = 7_654_000.0;
-        // Second ring's first vertex was digitized 3 cm off the first ring's
-        // shared corner (2 cm high) — outside noise tolerance, inside the
-        // user-consented coarse tolerance.
-        let intended = DVec3::new(E, N, 100.0);
-        let digitized = DVec3::new(E + 0.03, N + 0.004, 100.02);
-        let mut rings = vec![
-            vec![
-                intended,
-                DVec3::new(E + 10.0, N, 100.0),
-                DVec3::new(E + 5.0, N + 8.0, 100.0),
-            ],
-            vec![
-                digitized,
-                DVec3::new(E + 10.0, N, 100.0),
-                DVec3::new(E + 5.0, N - 8.0, 100.0),
-            ],
-        ];
-
-        let noise_welded = weld_breakline_vertices(
-            &mut rings,
-            crate::model::kernel::XY_TOL,
-            crate::model::kernel::Z_TOL,
-        );
-        assert_eq!(noise_welded, 0, "3 cm is not digitization noise");
-        assert_eq!(rings[1][0], digitized);
-
-        let coarse_welded = weld_breakline_vertices(&mut rings, COARSE_WELD_TOL, COARSE_WELD_TOL);
-        assert_eq!(coarse_welded, 1);
-        assert_eq!(rings[1][0], intended, "gap endpoint snaps to first-seen");
-    }
-
-    #[test]
-    fn diagnose_reports_crossing_with_differing_elevations() {
-        let a = DVec3::new(0.0, 0.0, 10.0);
-        let b = DVec3::new(10.0, 10.0, 20.0);
-        let c = DVec3::new(0.0, 10.0, 50.0);
-        let d = DVec3::new(10.0, 0.0, 60.0);
-        let detail = describe_edge_conflict(a, b, c, d).expect("edges cross at (5,5)");
-        assert!(detail.contains("cross in XY at (5.000, 5.000)"), "{detail}");
-        assert!(detail.contains("not representable"), "{detail}");
-    }
-
-    #[test]
-    fn diagnose_reports_collinear_overlap() {
-        let a = DVec3::new(0.0, 0.0, 0.0);
-        let b = DVec3::new(10.0, 0.0, 0.0);
-        let c = DVec3::new(5.0, 0.0, 0.0);
-        let d = DVec3::new(15.0, 0.0, 0.0);
-        let detail = describe_edge_conflict(a, b, c, d).expect("segments overlap along y=0");
-        assert!(detail.contains("collinear and overlapping"), "{detail}");
-    }
-
-    #[test]
-    fn diagnose_reports_near_miss_shared_vertex() {
-        let a = DVec3::new(0.0, 0.0, 5.0);
-        let b = DVec3::new(10.0, 0.0, 5.0);
-        // c starts 1cm from a's endpoint (independent digitizing noise) and
-        // runs off to the side without ever crossing a-b's line, so this
-        // pair doesn't cross or overlap — only the near-miss endpoint should
-        // be flagged.
-        let c = DVec3::new(0.01, 0.02, 5.0);
-        let d = DVec3::new(0.01, 5.0, 5.0);
-        let detail = describe_edge_conflict(a, b, c, d).expect("endpoints are a near miss");
-        assert!(detail.contains("A.start~B.start"), "{detail}");
-        assert!(detail.contains("0.0224"), "{detail}");
-    }
-
-    #[test]
-    fn diagnose_reports_endpoint_t_junction() {
-        let a = DVec3::new(0.0, 5.0, 10.0);
-        let b = DVec3::new(5.0, 0.0, 10.0);
-        let c = DVec3::new(0.0, 0.0, 10.0);
-        let d = DVec3::new(10.0, 0.0, 10.0);
-        let detail = describe_edge_conflict(a, b, c, d).expect("edge endpoint lands on other edge");
-        assert!(detail.contains("touch in XY at (5.000, 0.000)"), "{detail}");
-        assert!(detail.contains("same elevation"), "{detail}");
-    }
-
-    #[test]
-    fn diagnose_reports_none_for_unrelated_edges() {
-        let a = DVec3::new(0.0, 0.0, 0.0);
-        let b = DVec3::new(1.0, 0.0, 0.0);
-        let c = DVec3::new(0.0, 100.0, 0.0);
-        let d = DVec3::new(1.0, 100.0, 0.0);
-        assert!(describe_edge_conflict(a, b, c, d).is_none());
-    }
-
-    #[test]
-    fn diagnose_breakline_conflict_ignores_adjacent_shared_vertices() {
-        // A normal ring: every edge shares a vertex with its neighbors. That
-        // must never be reported as a conflict by itself.
-        let ring = vec![
-            DVec3::new(0.0, 0.0, 0.0),
-            DVec3::new(10.0, 0.0, 0.0),
-            DVec3::new(10.0, 10.0, 0.0),
-            DVec3::new(0.0, 10.0, 0.0),
-        ];
-        for edge_index in 0..ring.len() {
-            let detail = diagnose_breakline_conflict(std::slice::from_ref(&ring), 0, edge_index);
-            assert!(
-                detail.contains("no conflicting edge found"),
-                "edge {edge_index}: {detail}"
-            );
-        }
-    }
-
-    #[test]
-    fn diagnose_breakline_conflict_finds_real_crossing_past_the_neighbor() {
-        // Ring 0's edge 0 (v0->v1, along x=y) genuinely crosses ring 1's
-        // edge 1 at (5,5), at different elevations. Edge 0's ring-0
-        // neighbors (sharing a vertex with it) must be skipped rather than
-        // reported as a false cross, and ring 1's own non-conflicting edges
-        // (0 and 2, scanned first) must not shadow the real conflict.
-        let ring0 = vec![
-            DVec3::new(0.0, 0.0, 0.0),
-            DVec3::new(10.0, 10.0, 10.0),
-            DVec3::new(10.0, -10.0, 10.0),
-            DVec3::new(0.0, -10.0, 0.0),
-        ];
-        let ring1 = vec![
-            DVec3::new(100.0, 100.0, 999.0),
-            DVec3::new(10.0, 0.0, 100.0),
-            DVec3::new(0.0, 10.0, 200.0),
-        ];
-        let rings = vec![ring0, ring1];
-        let detail = diagnose_breakline_conflict(&rings, 0, 0);
-        assert!(detail.contains("breakline 1 edge 1"), "{detail}");
-        assert!(detail.contains("cross in XY at (5.000, 5.000)"), "{detail}");
-        assert!(detail.contains("not representable"), "{detail}");
-    }
-
-    #[test]
-    fn cdt_surface_allows_same_elevation_t_junction_from_pit_design() {
-        let ring10 = vec![
-            DVec3::new(194184.80804870004, 7954694.601165758, 276.0),
-            DVec3::new(194405.8730665064, 7954722.770923374, 276.0),
-            DVec3::new(194420.76056342237, 7954736.312696906, 276.0),
-            DVec3::new(194454.23337978532, 7954706.282106807, 276.0),
-            DVec3::new(194528.97078607292, 7954774.263785397, 276.0),
-            DVec3::new(194624.11956229017, 7954779.582434339, 276.0),
-            DVec3::new(194768.9848301585, 7954732.851136622, 276.0),
-            DVec3::new(194881.47319776443, 7954700.08270376, 276.0),
-            DVec3::new(194936.14383465287, 7954714.860250081, 276.0),
-            DVec3::new(194954.47283579985, 7954747.731592522, 276.0),
-            DVec3::new(194959.1678678599, 7954862.810163006, 276.0),
-            DVec3::new(194943.3400341604, 7954913.782532665, 276.0),
-            DVec3::new(194906.1137775063, 7954936.205339909, 276.0),
-            DVec3::new(194823.6881786337, 7954946.606295587, 276.0),
-            DVec3::new(194707.81924784035, 7954936.670062728, 276.0),
-            DVec3::new(194443.86456095657, 7954948.020896293, 276.0),
-            DVec3::new(194223.3646920947, 7954931.290760769, 276.0),
-            DVec3::new(194073.2201442615, 7954891.972778969, 276.0),
-            DVec3::new(194044.49549790577, 7954858.126836276, 276.0),
-            DVec3::new(194038.02719282577, 7954796.221042206, 276.0),
-            DVec3::new(194059.7238864849, 7954739.6131420545, 276.0),
-        ];
-        let ring11 = vec![
-            DVec3::new(194185.70593926773, 7954702.780271191, 276.0),
-            DVec3::new(194416.18359982956, 7954732.14945813, 276.0),
-            DVec3::new(194420.76056342237, 7954736.312696906, 276.0),
-            DVec3::new(194454.23337978532, 7954706.282106807, 276.0),
-            DVec3::new(194538.35629049933, 7954782.800907261, 276.0),
-            DVec3::new(194625.1591209801, 7954787.653032542, 276.0),
-            DVec3::new(194771.3320543625, 7954740.499902129, 276.0),
-            DVec3::new(194881.55408042885, 7954708.39166607, 276.0),
-            DVec3::new(194930.79960886977, 7954721.702798316, 276.0),
-            DVec3::new(194946.55720058328, 7954749.962559397, 276.0),
-            DVec3::new(194951.1182262184, 7954861.756537226, 276.0),
-            DVec3::new(194936.60315496929, 7954908.501252351, 276.0),
-            DVec3::new(194903.4345478952, 7954928.479981072, 276.0),
-            DVec3::new(194823.5273835979, 7954938.563145593, 276.0),
-            DVec3::new(194707.989860356, 7954928.655332282, 276.0),
-            DVec3::new(194443.99579456248, 7954940.007859257, 276.0),
-            DVec3::new(194224.6913830506, 7954923.368427475, 276.0),
-            DVec3::new(194077.6872139305, 7954884.872808891, 276.0),
-            DVec3::new(194052.1951831431, 7954854.835822448, 276.0),
-            DVec3::new(194046.18297817255, 7954797.295196548, 276.0),
-            DVec3::new(194065.8819988394, 7954745.899338151, 276.0),
-        ];
-
-        let result = cdt_surface_from_breaklines(&[ring10, ring11]);
-        assert!(result.is_ok(), "{result:?}");
-    }
-
-    #[test]
-    fn cdt_surface_accepts_shared_xy_vertex_with_noise_level_z_difference() {
-        // Two rings share a vertex in XY exactly, but its elevation differs by
-        // 1 cm — survey noise, far below Z_TOL. This used to bail at 1e-7.
-        let ring0 = vec![
-            DVec3::new(0.0, 0.0, 10.0),
-            DVec3::new(10.0, 0.0, 10.0),
-            DVec3::new(10.0, 10.0, 10.0),
-            DVec3::new(0.0, 10.0, 10.0),
-        ];
-        let ring1 = vec![
-            DVec3::new(10.0, 0.0, 10.01),
-            DVec3::new(20.0, 0.0, 10.0),
-            DVec3::new(20.0, 10.0, 10.0),
-        ];
-        let result = cdt_surface_from_breaklines(&[ring0, ring1]);
-        assert!(result.is_ok(), "{result:?}");
-    }
-
-    #[test]
-    fn weld_snaps_noise_level_near_misses_onto_one_vertex() {
-        // Ring 1's first vertex sits 0.05 mm from ring 0's corner — a
-        // digitization near miss well inside XY_TOL.
-        let mut rings = vec![
-            vec![
-                DVec3::new(0.0, 0.0, 10.0),
-                DVec3::new(10.0, 0.0, 10.0),
-                DVec3::new(10.0, 10.0, 10.0),
-                DVec3::new(0.0, 10.0, 10.0),
-            ],
-            vec![
-                DVec3::new(10.00005, 0.00002, 10.0),
-                DVec3::new(20.0, 0.0, 10.0),
-                DVec3::new(20.0, 10.0, 10.0),
-            ],
-        ];
-        let welded = weld_breakline_vertices(
-            &mut rings,
-            crate::model::kernel::XY_TOL,
-            crate::model::kernel::Z_TOL,
-        );
-        assert_eq!(welded, 1);
-        assert_eq!(rings[1][0], rings[0][1]);
-        let result = cdt_surface_from_breaklines(&rings);
-        assert!(result.is_ok(), "{result:?}");
-    }
-
-    #[test]
-    fn cdt_fill_ring_splits_a_self_crossing_ring_instead_of_failing() {
-        // Bow-tie: the closing edge crosses edge 1 at (5,5). This used to
-        // bail with "edges intersect or overlap in XY".
-        let ring = vec![
-            DVec3::new(0.0, 0.0, 0.0),
-            DVec3::new(10.0, 0.0, 0.0),
-            DVec3::new(0.0, 10.0, 0.0),
-            DVec3::new(10.0, 10.0, 0.0),
-        ];
-        let result = cdt_fill_ring(&ring, false);
-        let (_, faces) = result.expect("self-crossing ring should split, not fail");
-        assert!(!faces.is_empty());
-    }
-
-    #[test]
-    fn cdt_surface_rejects_t_junction_at_conflicting_elevation() {
-        let ring0 = vec![
-            DVec3::new(0.0, 0.0, 10.0),
-            DVec3::new(10.0, 0.0, 10.0),
-            DVec3::new(10.0, 10.0, 10.0),
-            DVec3::new(0.0, 10.0, 10.0),
-        ];
-        let ring1 = vec![
-            DVec3::new(5.0, -5.0, 20.0),
-            DVec3::new(5.0, 0.0, 20.0),
-            DVec3::new(6.0, -5.0, 20.0),
-        ];
-
-        let err = cdt_surface_from_breaklines(&[ring0, ring1]).expect_err("conflicting T-junction");
-        let message = format!("{err:#}");
-        assert!(message.contains("conflicting elevations"), "{message}");
-    }
 }

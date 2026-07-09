@@ -1,7 +1,7 @@
 use crate::{
     app::{App, PICK_THRESHOLD_PX},
     model::{Command, Object, SceneEntityId},
-    ui::state::SelectionMode,
+    ui::state::{SelectionMode, TriCreateSource},
 };
 
 impl<'a> App<'a> {
@@ -33,7 +33,14 @@ impl<'a> App<'a> {
                 })
             {
                 let is_closed_poly = self.scene_document.get_object(oid).is_some_and(|o| {
-                    matches!(o, crate::model::Object::Polyline { closed: true, .. })
+                    matches!(
+                        o,
+                        crate::model::Object::Polyline {
+                            closed: true,
+                            verts,
+                            ..
+                        } if verts.len() >= 3
+                    )
                 });
                 if is_closed_poly {
                     let name = self
@@ -57,7 +64,6 @@ impl<'a> App<'a> {
         }
 
         if !self.workspace.has_active_project() && self.triangulations.is_empty() {
-            self.editing_ready();
             return;
         }
         if self.editor.active_tool == crate::ui::state::ActiveTool::Move {
@@ -218,7 +224,7 @@ impl<'a> App<'a> {
             return;
         }
 
-        // In triangulation creation mode, drag-select adds closed polygons to the tri pick list.
+        // In triangulation creation mode, drag-select adds eligible source objects to the tri pick list.
         if self.editor.tri_create_open {
             if dragged {
                 // Same left/right direction convention as regular selection.
@@ -238,10 +244,9 @@ impl<'a> App<'a> {
                 for handle in enclosed {
                     if let SceneEntityId::Object(oid) = handle
                         && !self.editor.tri_selected_object_ids.contains(&oid)
-                        && self
-                            .scene_document
-                            .get_object(oid)
-                            .is_some_and(is_closed_polygon)
+                        && self.scene_document.get_object(oid).is_some_and(|object| {
+                            is_triangulation_source_object(object, self.editor.tri_create_source)
+                        })
                     {
                         self.editor.tri_selected_object_ids.push(oid);
                         self.editor
@@ -360,11 +365,9 @@ impl<'a> App<'a> {
             self.editor
                 .selected_handles
                 .remove(&SceneEntityId::Object(oid));
-        } else if self
-            .scene_document
-            .get_object(oid)
-            .is_some_and(is_closed_polygon)
-        {
+        } else if self.scene_document.get_object(oid).is_some_and(|object| {
+            is_triangulation_source_object(object, self.editor.tri_create_source)
+        }) {
             self.editor.tri_selected_object_ids.push(oid);
             self.editor
                 .selected_handles
@@ -392,7 +395,6 @@ impl<'a> App<'a> {
             drag.last_world = world;
             drag.moved = true;
         }
-        self.workspace.mark_dirty();
         self.invalidate_geometry();
     }
 
@@ -407,7 +409,6 @@ impl<'a> App<'a> {
                 before: drag.before,
                 after,
             });
-            self.workspace.mark_dirty();
         }
     }
 
@@ -429,4 +430,13 @@ impl<'a> App<'a> {
 
 fn is_closed_polygon(obj: &Object) -> bool {
     matches!(obj, Object::Polyline { verts, closed: true, .. } if verts.len() >= 3)
+}
+
+fn is_triangulation_source_object(obj: &Object, source: TriCreateSource) -> bool {
+    match source {
+        TriCreateSource::Polygons => is_closed_polygon(obj),
+        TriCreateSource::Roads => {
+            matches!(obj, Object::Road { centerline, .. } if centerline.len() >= 2)
+        }
+    }
 }

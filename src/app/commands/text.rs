@@ -75,7 +75,6 @@ impl<'a> App<'a> {
         let Some(project) = self.workspace.active_project_mut() else {
             return;
         };
-        let was_dirty = project.dirty;
         let doc = &mut project.pidb.document;
         let id = doc.allocate_object_id();
         doc.insert_object(Object::Text {
@@ -87,8 +86,6 @@ impl<'a> App<'a> {
             rotation: 0.0,
             color,
         });
-        project.dirty = true;
-        self.editor.text_edit_was_dirty = was_dirty;
         self.invalidate_geometry();
         self.begin_text_edit(id, true);
         // Placement is one-shot, but the text editor remains open for the
@@ -192,11 +189,9 @@ impl<'a> App<'a> {
             document.remove_object(object_id);
             document.insert_object(after.clone());
             self.history.push_applied(Command::AddObject(after));
-            project.dirty = true;
         } else if changed {
             self.history
                 .execute(document, Command::Replace { before, after });
-            project.dirty = true;
         }
         self.finish_text_edit_state();
         if created || changed {
@@ -208,7 +203,6 @@ impl<'a> App<'a> {
 
     pub(crate) fn cancel_text_edit(&mut self) {
         let created = self.editor.text_edit_created;
-        let was_dirty = self.editor.text_edit_was_dirty;
         let object_id = self.editor.editing_labels_id;
         if created
             && let Some(object_id) = object_id
@@ -217,7 +211,7 @@ impl<'a> App<'a> {
             self.workspace.set_active_index(project_index);
             let project = &mut self.workspace.projects[project_index];
             project.pidb.document.remove_object(object_id);
-            project.dirty = was_dirty;
+            project.invalidate_dirty_layers();
             self.editor
                 .selected_handles
                 .remove(&SceneEntityId::Object(object_id));
@@ -241,6 +235,5 @@ impl<'a> App<'a> {
         self.editor.text_edit_position_frames = 0;
         self.editor.text_edit_focus_requested = false;
         self.editor.text_edit_created = false;
-        self.editor.text_edit_was_dirty = false;
     }
 }

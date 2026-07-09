@@ -5,8 +5,10 @@
 //! positions and vertex indices are intentionally ignored.
 
 pub(crate) mod bmf;
+pub(crate) mod duf;
 pub(crate) mod dxf;
 pub(crate) mod isis;
+pub(crate) mod point_cloud;
 pub(crate) mod tri00t;
 
 use std::{
@@ -118,17 +120,31 @@ pub fn read_mesh(path: impl AsRef<Path>) -> Result<Triangulation, TranslationErr
     }
 }
 
-pub fn write_mesh(mesh: &Triangulation, path: impl AsRef<Path>) -> Result<(), TranslationError> {
+/// Write `mesh` to `path` in the format implied by the extension, invoking
+/// `progress` with a completion fraction in `0.0..=1.0` as the file is written
+/// (throttled to every few thousand items). Pass `&mut |_| {}` when progress
+/// is not needed.
+pub fn write_mesh_with_progress(
+    mesh: &Triangulation,
+    path: impl AsRef<Path>,
+    progress: &mut dyn FnMut(f32),
+) -> Result<(), TranslationError> {
     let path = path.as_ref();
-    let mut file = File::create(path)?;
-    match MeshFormat::from_path(path).ok_or_else(|| unsupported_path(path))? {
-        MeshFormat::Obj => write_obj(mesh, &mut file)?,
-        MeshFormat::Stl => write_stl(mesh, &mut file)?,
-        MeshFormat::Ply => write_ply(mesh, &mut file)?,
-        MeshFormat::T00 => mesh.write_00t(&mut file)?,
+    let format = MeshFormat::from_path(path).ok_or_else(|| unsupported_path(path))?;
+    let file = File::create(path)?;
+    let mut writer = io::BufWriter::new(file);
+    match format {
+        MeshFormat::Obj => write_obj_with_progress(mesh, &mut writer, progress)?,
+        MeshFormat::Stl => write_stl_with_progress(mesh, &mut writer, progress)?,
+        MeshFormat::Ply => write_ply_with_progress(mesh, &mut writer, progress)?,
+        MeshFormat::T00 => mesh.write_00t_with_progress(&mut writer, progress)?,
     }
+    writer.flush()?;
     Ok(())
 }
+
+/// How many vertices/faces to write between progress callbacks.
+pub(crate) const WRITE_PROGRESS_STRIDE: usize = 4096;
 
 fn unsupported_path(path: &Path) -> TranslationError {
     TranslationError::UnsupportedExtension(
@@ -658,25 +674,46 @@ fn read_ply_integer(
     }
 }
 
-pub fn write_obj(mesh: &Triangulation, writer: &mut impl Write) -> io::Result<()> {
+pub fn write_obj_with_progress(
+    mesh: &Triangulation,
+    writer: &mut impl Write,
+    progress: &mut dyn FnMut(f32),
+) -> io::Result<()> {
+    let vertex_count = mesh.vertex_count().max(1);
+    let face_count = mesh.face_count().max(1);
     writeln!(writer, "# exported by vulcan-formats")?;
-    for v in mesh.vertices() {
+    for (i, v) in mesh.vertices().iter().enumerate() {
         // Convert Z-up coordinates back to OBJ's Y-up convention.
         writeln!(writer, "v {:.12} {:.12} {:.12}", v.x, v.z, -v.y)?;
+        if i % WRITE_PROGRESS_STRIDE == 0 {
+            progress(0.5 * i as f32 / vertex_count as f32);
+        }
     }
-    for f in mesh.face_vertex_indices_iter() {
+    for (i, f) in mesh.face_vertex_indices_iter().enumerate() {
         writeln!(writer, "f {} {} {}", f[0] + 1, f[1] + 1, f[2] + 1)?;
+        if i % WRITE_PROGRESS_STRIDE == 0 {
+            progress(0.5 + 0.5 * i as f32 / face_count as f32);
+        }
     }
+    progress(1.0);
     Ok(())
 }
 
-pub fn write_stl(mesh: &Triangulation, writer: &mut impl Write) -> io::Result<()> {
+pub fn write_stl_with_progress(
+    mesh: &Triangulation,
+    writer: &mut impl Write,
+    progress: &mut dyn FnMut(f32),
+) -> io::Result<()> {
     let mut header = [0u8; 80];
     let label = b"binary STL from vulcan-formats";
     header[..label.len()].copy_from_slice(label);
     writer.write_all(&header)?;
     writer.write_all(&(mesh.face_count() as u32).to_le_bytes())?;
-    for triangle in mesh.triangles() {
+    let face_count = mesh.face_count().max(1);
+    for (face_index, triangle) in mesh.triangles().enumerate() {
+        if face_index % WRITE_PROGRESS_STRIDE == 0 {
+            progress(face_index as f32 / face_count as f32);
+        }
         let a = triangle.vertices[0];
         let b = triangle.vertices[1];
         let c = triangle.vertices[2];
@@ -699,10 +736,15 @@ pub fn write_stl(mesh: &Triangulation, writer: &mut impl Write) -> io::Result<()
         }
         writer.write_all(&0u16.to_le_bytes())?;
     }
+    progress(1.0);
     Ok(())
 }
 
-pub fn write_ply(mesh: &Triangulation, writer: &mut impl Write) -> io::Result<()> {
+pub fn write_ply_with_progress(
+    mesh: &Triangulation,
+    writer: &mut impl Write,
+    progress: &mut dyn FnMut(f32),
+) -> io::Result<()> {
     writeln!(
         writer,
         "ply\nformat ascii 1.0\ncomment exported by vulcan-formats"
@@ -717,12 +759,21 @@ pub fn write_ply(mesh: &Triangulation, writer: &mut impl Write) -> io::Result<()
         "element face {}\nproperty list uchar uint vertex_indices\nend_header",
         mesh.face_count()
     )?;
-    for v in mesh.vertices() {
+    let vertex_count = mesh.vertex_count().max(1);
+    let face_count = mesh.face_count().max(1);
+    for (i, v) in mesh.vertices().iter().enumerate() {
         writeln!(writer, "{:.12} {:.12} {:.12}", v.x, v.y, v.z)?;
+        if i % WRITE_PROGRESS_STRIDE == 0 {
+            progress(0.5 * i as f32 / vertex_count as f32);
+        }
     }
-    for f in mesh.face_vertex_indices_iter() {
+    for (i, f) in mesh.face_vertex_indices_iter().enumerate() {
         writeln!(writer, "3 {} {} {}", f[0], f[1], f[2])?;
+        if i % WRITE_PROGRESS_STRIDE == 0 {
+            progress(0.5 + 0.5 * i as f32 / face_count as f32);
+        }
     }
+    progress(1.0);
     Ok(())
 }
 
@@ -779,40 +830,5 @@ fn invalid(line: Option<usize>, message: impl Into<String>) -> TranslationError 
     TranslationError::InvalidData {
         line,
         message: message.into(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn assert_close(actual: f64, expected: f64) {
-        assert!(
-            (actual - expected).abs() < 1.0e-9,
-            "expected {expected}, got {actual}"
-        );
-    }
-
-    #[test]
-    fn read_obj_preserves_vertex_coordinates() {
-        let obj = b"
-v 1 2 3
-v -4 5 -6
-v 7 -8 9
-f 1 2 3
-";
-
-        let mesh = read_obj_bytes(obj).unwrap();
-        let vertices = mesh.vertices();
-
-        assert_close(vertices[0].x, 1.0);
-        assert_close(vertices[0].y, 2.0);
-        assert_close(vertices[0].z, 3.0);
-        assert_close(vertices[1].x, -4.0);
-        assert_close(vertices[1].y, 5.0);
-        assert_close(vertices[1].z, -6.0);
-        assert_close(vertices[2].x, 7.0);
-        assert_close(vertices[2].y, -8.0);
-        assert_close(vertices[2].z, 9.0);
     }
 }

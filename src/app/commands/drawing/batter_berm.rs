@@ -1,28 +1,35 @@
 use crate::{
     app::{App, PICK_THRESHOLD_PX},
     model::{Command, Object, PolyVertex, SceneEntityId},
-    ui::state::{ActiveTool, BatterBermMode},
+    ui::state::{ActiveTool, BatterBermMode, BatterBermPreviewKey},
     userspace_log,
 };
 
 impl<'a> App<'a> {
     pub(crate) fn open_batter_berm_dialog(&mut self) {
         let object_id = self.editor.selected_handles.iter().find_map(|h| match h {
-            SceneEntityId::Object(id) => {
-                if matches!(self.active_layer_object(*id), Some(Object::Polyline { .. })) {
-                    Some(*id)
-                } else {
-                    None
-                }
+            SceneEntityId::Object(id)
+                if self
+                    .workspace
+                    .project_index_for_object(*id)
+                    .and_then(|index| self.workspace.projects.get(index))
+                    .and_then(|project| project.pidb.document.get_object(*id))
+                    .is_some_and(|object| matches!(object, Object::Polyline { .. })) =>
+            {
+                Some(*id)
             }
             _ => None,
         });
         if let Some(id) = object_id {
+            if !self.activate_project_for_object(id) {
+                return;
+            }
             self.editor.batter_berm_target_id = Some(id);
             self.editor.batter_berm_dialog_open = true;
+            self.editor.batter_berm_preview_key = None;
             self.editor.tool_highlight_id = Some(id);
             let closed = matches!(
-                self.active_layer_object(id),
+                self.active_document().get_object(id),
                 Some(Object::Polyline { closed: true, .. })
             );
             self.editor.batter_berm_preview_closed = closed;
@@ -43,13 +50,18 @@ impl<'a> App<'a> {
             )
         });
         if let Some((SceneEntityId::Object(id), _)) = picked
-            && matches!(self.active_layer_object(id), Some(Object::Polyline { .. }))
+            && self.activate_project_for_object(id)
+            && matches!(
+                self.active_document().get_object(id),
+                Some(Object::Polyline { .. })
+            )
         {
             self.editor.batter_berm_target_id = Some(id);
             self.editor.batter_berm_dialog_open = true;
+            self.editor.batter_berm_preview_key = None;
             self.editor.tool_highlight_id = Some(id);
             let closed = matches!(
-                self.active_layer_object(id),
+                self.active_document().get_object(id),
                 Some(Object::Polyline { closed: true, .. })
             );
             self.editor.batter_berm_preview_closed = closed;
@@ -65,19 +77,35 @@ impl<'a> App<'a> {
         let Some(object_id) = self.editor.batter_berm_target_id else {
             return;
         };
+        if !self.activate_project_for_object(object_id) {
+            return;
+        }
 
-        let (src_verts, closed) = match self.active_layer_object(object_id) {
-            Some(Object::Polyline { verts, closed, .. }) => {
-                (verts.iter().map(|v| v.pos).collect::<Vec<_>>(), *closed)
-            }
-            _ => return,
-        };
-
+        let document_revision = self.active_document().revision();
         let berm_width = self.editor.batter_berm_width;
         let angle_deg = self.editor.batter_berm_angle;
         let bench_height = self.editor.batter_berm_bench_height;
         let benches = self.editor.batter_berm_benches;
         let mode = self.editor.batter_berm_mode;
+        let preview_key = BatterBermPreviewKey {
+            target_id: object_id,
+            document_revision,
+            width: berm_width,
+            angle: angle_deg,
+            bench_height,
+            benches,
+            mode,
+        };
+        if self.editor.batter_berm_preview_key == Some(preview_key) {
+            return;
+        }
+
+        let (src_verts, closed) = match self.active_document().get_object(object_id) {
+            Some(Object::Polyline { verts, closed, .. }) => {
+                (verts.iter().map(|v| v.pos).collect::<Vec<_>>(), *closed)
+            }
+            _ => return,
+        };
 
         if berm_width <= 0.0
             || angle_deg <= 0.0
@@ -88,6 +116,7 @@ impl<'a> App<'a> {
             self.editor.batter_berm_max_benches = 1;
             self.editor.batter_berm_rings_world.clear();
             self.editor.batter_berm_guides_world.clear();
+            self.editor.batter_berm_preview_key = Some(preview_key);
             return;
         }
 
@@ -124,6 +153,10 @@ impl<'a> App<'a> {
         self.editor.batter_berm_rings_world = rings;
         self.editor.batter_berm_guides_world = guides;
         self.editor.batter_berm_preview_closed = closed;
+        self.editor.batter_berm_preview_key = Some(BatterBermPreviewKey {
+            benches: self.editor.batter_berm_benches,
+            ..preview_key
+        });
     }
 
     /// Commit all rings from the current preview as new polylines.
@@ -131,22 +164,24 @@ impl<'a> App<'a> {
         let Some(object_id) = self.editor.batter_berm_target_id else {
             return;
         };
+        if !self.activate_project_for_object(object_id) {
+            return;
+        }
 
         if self.editor.batter_berm_rings_world.is_empty() {
             return;
         }
 
-        let (layer, color, fill, fill_color, line_weight, closed) =
+        let (layer, color, fill, line_weight, closed) =
             match self.active_document().get_object(object_id) {
                 Some(Object::Polyline {
                     layer,
                     color,
                     fill,
-                    fill_color,
                     line_weight,
                     closed,
                     ..
-                }) => (*layer, *color, *fill, *fill_color, *line_weight, *closed),
+                }) => (*layer, *color, *fill, *line_weight, *closed),
                 _ => return,
             };
 
@@ -154,12 +189,12 @@ impl<'a> App<'a> {
 
         if let Some(project) = self.workspace.active_project_mut() {
             let doc = &mut project.pidb.document;
-            for ring_verts in rings {
-                let new_verts: Vec<PolyVertex> =
-                    ring_verts.into_iter().map(PolyVertex::straight).collect();
-                let id = doc.allocate_object_id();
-                self.history.execute(
-                    doc,
+            let commands = rings
+                .into_iter()
+                .map(|ring_verts| {
+                    let new_verts: Vec<PolyVertex> =
+                        ring_verts.into_iter().map(PolyVertex::straight).collect();
+                    let id = doc.allocate_object_id();
                     Command::AddObject(Object::Polyline {
                         id,
                         layer,
@@ -167,12 +202,13 @@ impl<'a> App<'a> {
                         closed,
                         color,
                         fill,
-                        fill_color,
                         line_weight,
-                    }),
-                );
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !commands.is_empty() {
+                self.history.execute(doc, Command::Batch(commands));
             }
-            project.dirty = true;
         }
 
         self.cancel_batter_berm();
@@ -190,6 +226,7 @@ impl<'a> App<'a> {
         self.editor.batter_berm_source_screen_px.clear();
         self.editor.batter_berm_guides_screen_px.clear();
         self.editor.tool_highlight_id = None;
+        self.editor.batter_berm_preview_key = None;
         self.editor.active_tool = ActiveTool::None;
         self.invalidate_geometry();
         userspace_log!("Cancelled batter berm tool");

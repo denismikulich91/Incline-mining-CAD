@@ -2,6 +2,7 @@ pub(crate) mod block_model;
 pub(crate) mod drawing; // Handles finishing polygons, creating points, etc commands
 pub(crate) mod file; // Handles importing, exportings, etc. commands
 pub(crate) mod layer; // Handles creating layers, deleting layers, etc. commands
+pub(crate) mod point_cloud; // Handles importing/loading point clouds, etc. commands
 pub(crate) mod property; // Handles changing colors, fills, etc. commands
 pub(crate) mod text; // Handles text editing commands
 pub(crate) mod triangulation; // Handles loading meshes, deleting meshes, etc. commands
@@ -9,7 +10,7 @@ pub(crate) mod view; /* Handles resetting camera view, , etc. commands */
 
 use anyhow::Result;
 
-use crate::ui::state::{FileOperationKind, MoveLayerDialog, TriCreatePhase, UiCommand}; // TriSurfaceType comes through UiCommand destructuring
+use crate::ui::state::{MoveLayerDialog, TriCreatePhase, TriSurfaceType, UiCommand};
 use crate::{app::App, userspace_warn};
 
 impl<'a> App<'a> {
@@ -58,6 +59,14 @@ impl<'a> App<'a> {
     /// per-domain `impl` blocks.
     pub(crate) fn handle_ui_command(&mut self, command: UiCommand) -> Result<()> {
         match command {
+            UiCommand::SetActiveTool(tool) => {
+                self.set_active_tool_from_toolbar(tool);
+                Ok(())
+            }
+            UiCommand::SetFlyModeEnabled(enabled) => {
+                self.set_fly_mode_enabled(enabled);
+                Ok(())
+            }
             UiCommand::NewPidb => {
                 self.choose_new_pidb();
                 Ok(())
@@ -66,21 +75,44 @@ impl<'a> App<'a> {
                 self.choose_open_pidb();
                 Ok(())
             }
+            UiCommand::OpenPidbPaths(paths) => self.execute_file_dialog_action(
+                crate::app::commands::file::FileDialogAction::OpenPidb(paths),
+            ),
             UiCommand::CloseStartupDialog => {
                 self.startup_dialog_dismissed = true;
                 Ok(())
             }
             UiCommand::SaveAllPidbs => self.save_all_dirty_projects().map(|_| ()),
-            UiCommand::ImportDxfInto(index) => {
-                self.choose_import_dxf_into(index);
+            UiCommand::ImportAsPidbPaths(kind, paths) => {
+                self.choose_import_as_pidb_paths(kind, paths);
                 Ok(())
             }
-            UiCommand::ImportTriangulation => {
-                self.choose_import_triangulation();
+            UiCommand::ImportDxfPathsInto(index, paths) => self.import_dxf_paths_into(index, paths),
+            UiCommand::ImportTriangulationPaths(paths) => self.execute_file_dialog_action(
+                crate::app::commands::file::FileDialogAction::ImportTriangulation(paths),
+            ),
+            UiCommand::ImportPointCloudPaths(paths) => self.execute_file_dialog_action(
+                crate::app::commands::file::FileDialogAction::ImportPointCloud(paths),
+            ),
+            UiCommand::LoadPointCloud(path) => {
+                self.open_point_cloud_path(path);
                 Ok(())
             }
-            UiCommand::OpenImportBlockModel => {
-                self.open_file_operation_dialog(FileOperationKind::ImportBlockModel);
+            UiCommand::ClosePointCloud(id) => {
+                self.close_point_cloud(id);
+                Ok(())
+            }
+            UiCommand::TogglePointCloudVisible(id) => {
+                self.toggle_point_cloud_visible(id);
+                Ok(())
+            }
+            UiCommand::RemovePointCloud(path) => {
+                self.remove_point_cloud(&path);
+                Ok(())
+            }
+            UiCommand::RevealPointCloud(id) => self.reveal_point_cloud(id),
+            UiCommand::ChooseImportSourceFiles(kind) => {
+                self.choose_import_source_files(kind);
                 Ok(())
             }
             UiCommand::ChooseBlockModelBmf => {
@@ -104,12 +136,16 @@ impl<'a> App<'a> {
                 self.choose_export_pidb_dxf(index);
                 Ok(())
             }
+            UiCommand::ExportPidbCopy(index) => {
+                self.choose_export_pidb_copy(index);
+                Ok(())
+            }
             UiCommand::ExportLayerDxf(index, layer) => {
                 self.choose_export_layer_dxf(index, layer);
                 Ok(())
             }
-            UiCommand::ExportTriangulation(id) => {
-                self.choose_export_triangulation(id);
+            UiCommand::ExportTriangulationAs(id, format) => {
+                self.choose_export_triangulation_as(id, format);
                 Ok(())
             }
             UiCommand::SaveTriangulationAs(id) => {
@@ -130,36 +166,14 @@ impl<'a> App<'a> {
                 self.invalidate_geometry();
                 Ok(())
             }
-            UiCommand::OpenFileOperation(kind) => match kind {
-                FileOperationKind::ImportPidb => {
-                    self.choose_import_as_pidb();
-                    Ok(())
-                }
-                FileOperationKind::ImportTriangulation => {
-                    self.choose_import_triangulation();
-                    Ok(())
-                }
-                _ => {
-                    self.open_file_operation_dialog(kind);
-                    Ok(())
-                }
-            },
-            UiCommand::CloseFileOperation => {
-                self.editor.file_operation_dialog = None;
-                Ok(())
-            }
-            UiCommand::ChooseDgdIsisSource => {
-                self.choose_dgd_isis_source();
-                Ok(())
-            }
-            UiCommand::ConfirmImportDgdIsis => {
-                self.confirm_import_dgd_isis();
-                Ok(())
-            }
             UiCommand::RequestExit => self.request_exit(),
             UiCommand::SaveAndExit => self.save_and_exit(),
             UiCommand::ExitWithoutSaving => {
                 self.exit_without_saving();
+                Ok(())
+            }
+            UiCommand::CancelExit => {
+                self.cancel_exit_request();
                 Ok(())
             }
             UiCommand::CreateLayer {
@@ -257,7 +271,6 @@ impl<'a> App<'a> {
                                     after: new_name,
                                 },
                             );
-                            project.dirty = true;
                         }
                     } else {
                         self.history.clear();
@@ -266,7 +279,6 @@ impl<'a> App<'a> {
                         }
                         if let Some(project) = self.workspace.projects.get_mut(project_index) {
                             project.pidb.document.rename_layer(layer_id, new_name);
-                            project.dirty = true;
                             project.invalidate_dirty_layers();
                             save_unloaded_rename = project.path.is_some();
                         }
@@ -407,8 +419,16 @@ impl<'a> App<'a> {
                 self.finish_poly_closed();
                 Ok(())
             }
-            UiCommand::FinishPolyOpen => {
-                self.cancel_stroke();
+            UiCommand::CommitStrokeOpen => {
+                self.commit_stroke_open();
+                Ok(())
+            }
+            UiCommand::CancelOffset => {
+                self.cancel_offset();
+                Ok(())
+            }
+            UiCommand::CancelRelimit => {
+                self.cancel_relimit();
                 Ok(())
             }
             UiCommand::ResetView => {
@@ -419,6 +439,7 @@ impl<'a> App<'a> {
             UiCommand::SetDarkMode(enabled) => self.set_dark_mode(enabled),
             UiCommand::SetShowConsole(enabled) => self.set_show_console(enabled),
             UiCommand::SetShowWorldAxisGizmo(enabled) => self.set_show_world_axis_gizmo(enabled),
+            UiCommand::SetDebugChunkColoring(enabled) => self.set_debug_chunk_coloring(enabled),
             UiCommand::SetStandardView(view) => {
                 if let Some(graphics) = self.graphics.as_mut() {
                     graphics.set_standard_view(view);
@@ -513,12 +534,19 @@ impl<'a> App<'a> {
                 Ok(())
             }
             UiCommand::BeginOffsetPick {
-                object_id,
+                object_ids,
                 horiz_dist,
                 z_delta,
                 project_to_rl,
+                collide_with_triangulation,
             } => {
-                self.begin_offset_pick(object_id, horiz_dist, z_delta, project_to_rl);
+                self.begin_offset_pick(
+                    object_ids,
+                    horiz_dist,
+                    z_delta,
+                    project_to_rl,
+                    collide_with_triangulation,
+                );
                 Ok(())
             }
             UiCommand::RelimitLineResize {
@@ -581,9 +609,25 @@ impl<'a> App<'a> {
                 self.cancel_road();
                 Ok(())
             }
+            UiCommand::ConvertSelectedRoadsToPolylines => {
+                self.convert_selected_roads_to_polylines()
+            }
             UiCommand::OpenCreateTriangulation => {
                 self.editor.tri_create_open = true;
                 self.editor.tri_create_phase = TriCreatePhase::MainDialog;
+                self.editor.tri_create_source = crate::ui::state::TriCreateSource::Polygons;
+                self.editor.selected_handles.clear();
+                self.editor.tri_selected_object_ids.clear();
+                self.editor.tri_selected_layer_ids.clear();
+                self.editor.tri_name_input.clear();
+                self.editor.tri_hover_handles.clear();
+                Ok(())
+            }
+            UiCommand::OpenConvertRoadsToTriangulation => {
+                self.editor.tri_create_open = true;
+                self.editor.tri_create_phase = TriCreatePhase::MainDialog;
+                self.editor.tri_create_source = crate::ui::state::TriCreateSource::Roads;
+                self.editor.tri_surface_type = TriSurfaceType::Surface;
                 self.editor.selected_handles.clear();
                 self.editor.tri_selected_object_ids.clear();
                 self.editor.tri_selected_layer_ids.clear();
@@ -596,11 +640,34 @@ impl<'a> App<'a> {
                 object_ids,
                 surface_type,
             } => self.run_create_triangulation(name, object_ids, surface_type, false),
+            UiCommand::ExecuteConvertRoadsToTriangulation { name, object_ids } => {
+                self.create_triangulation_from_roads(name, object_ids)
+            }
             UiCommand::ExecuteCreateTriangulationWithWeld {
                 name,
                 object_ids,
                 surface_type,
             } => self.run_create_triangulation(name, object_ids, surface_type, true),
+            UiCommand::OpenPointCloudTin => {
+                self.editor.point_cloud_tin_open = true;
+                // Default to the only loaded cloud, or keep a still-valid pick.
+                let still_loaded = self
+                    .editor
+                    .point_cloud_tin_cloud_id
+                    .is_some_and(|id| self.point_clouds.iter().any(|cloud| cloud.id == id));
+                if !still_loaded {
+                    self.editor.point_cloud_tin_cloud_id =
+                        self.point_clouds.first().map(|cloud| cloud.id);
+                }
+                self.editor.point_cloud_tin_name_input.clear();
+                Ok(())
+            }
+            UiCommand::ExecutePointCloudTin {
+                cloud_id,
+                name,
+                max_edge,
+                max_points,
+            } => self.run_point_cloud_tin(cloud_id, name, max_edge, max_points),
             UiCommand::ConfirmLoadAllTriangulationsInFolder(path) => {
                 self.editor.confirm_load_all_folder = Some(path);
                 Ok(())
@@ -792,6 +859,7 @@ impl<'a> App<'a> {
                 major_color,
                 minor_color,
                 project_index,
+                z_range,
             } => {
                 let result = self.generate_contour_triangulation(
                     tri_id,
@@ -800,6 +868,7 @@ impl<'a> App<'a> {
                     major_color,
                     minor_color,
                     project_index,
+                    z_range,
                 );
                 if result.is_ok() {
                     self.editor.tri_contour_open = false;

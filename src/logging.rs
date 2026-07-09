@@ -103,11 +103,30 @@ pub(crate) fn init() {
 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
+        if PANIC_HOOK_SUPPRESSED.get() {
+            return;
+        }
         if let Err(error) = save_crash_log(panic_info) {
             eprintln!("Failed to save crash log: {error}");
         }
         default_hook(panic_info);
     }));
+}
+
+thread_local! {
+    static PANIC_HOOK_SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `operation`, converting a panic into `None`. While it runs, the
+/// process panic hook (crash-log write + stderr report) is suppressed on this
+/// thread, so a recovered panic in third-party code doesn't leave a spurious
+/// crash log behind. The caller is responsible for judging that the panicking
+/// code leaves its data structures in a usable state.
+pub(crate) fn catch_panic_quietly<T>(operation: impl FnOnce() -> T) -> Option<T> {
+    PANIC_HOOK_SUPPRESSED.set(true);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
+    PANIC_HOOK_SUPPRESSED.set(false);
+    result.ok()
 }
 
 /// Log levels for the in-app console.
@@ -194,7 +213,7 @@ fn save_log(kind: &str) -> io::Result<PathBuf> {
 }
 
 fn write_log(kind: &str, started_at: DateTime<Local>, contents: &str) -> io::Result<PathBuf> {
-    let logs_dir = crate::app::io::local_to_global_path("data/logs")?;
+    let logs_dir = crate::app::io::data_path("logs")?;
     fs::create_dir_all(&logs_dir)?;
     let filename = format!("{}.{}.log", started_at.format("%Y-%m-%d_%H-%M-%S"), kind);
     let path = logs_dir.join(filename);

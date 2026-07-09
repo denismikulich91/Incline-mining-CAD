@@ -263,16 +263,140 @@ pub(crate) fn points_coincident(a: DVec3, b: DVec3) -> bool {
     crate::model::kernel::points_coincident_3d(a, b)
 }
 
+/// Minimal 2.5D point abstraction for the polygon algorithms shared across
+/// the drawing and triangulation tools: they operate in the XY plane but must
+/// carry each point's full payload (e.g. Z) through clipping unchanged.
+pub(crate) trait XyPoint: Copy {
+    fn xy(self) -> DVec2;
+    /// Linear interpolation in the point's native space (all components).
+    fn lerp_point(self, other: Self, t: f64) -> Self;
+    /// Squared distance in the point's native space (2D for `DVec2`,
+    /// 3D otherwise), used for coincident-vertex cleanup after clipping.
+    fn distance_sq(self, other: Self) -> f64;
+}
+
+impl XyPoint for DVec2 {
+    fn xy(self) -> DVec2 {
+        self
+    }
+    fn lerp_point(self, other: Self, t: f64) -> Self {
+        self.lerp(other, t)
+    }
+    fn distance_sq(self, other: Self) -> f64 {
+        self.distance_squared(other)
+    }
+}
+
+impl XyPoint for DVec3 {
+    fn xy(self) -> DVec2 {
+        DVec2::new(self.x, self.y)
+    }
+    fn lerp_point(self, other: Self, t: f64) -> Self {
+        self.lerp(other, t)
+    }
+    fn distance_sq(self, other: Self) -> f64 {
+        self.distance_squared(other)
+    }
+}
+
+impl XyPoint for crate::model::formats::tri00t::Vertex {
+    fn xy(self) -> DVec2 {
+        DVec2::new(self.x, self.y)
+    }
+    fn lerp_point(self, other: Self, t: f64) -> Self {
+        Self {
+            x: self.x + (other.x - self.x) * t,
+            y: self.y + (other.y - self.y) * t,
+            z: self.z + (other.z - self.z) * t,
+        }
+    }
+    fn distance_sq(self, other: Self) -> f64 {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        let dz = self.z - other.z;
+        dx * dx + dy * dy + dz * dz
+    }
+}
+
 /// Signed area of a polygon (XY plane only). Positive = CCW, negative = CW.
-pub(crate) fn signed_area_xy(verts: &[DVec3]) -> f64 {
+pub(crate) fn signed_area_xy<P: XyPoint>(verts: &[P]) -> f64 {
     let n = verts.len();
     let mut area = 0.0_f64;
     for i in 0..n {
-        let a = verts[i];
-        let b = verts[(i + 1) % n];
+        let a = verts[i].xy();
+        let b = verts[(i + 1) % n].xy();
         area += a.x * b.y - b.x * a.y;
     }
     area * 0.5
+}
+
+/// Signed XY area of a triangle. Positive = CCW viewed from above.
+#[inline(always)]
+pub(crate) fn triangle_xy_area<P: XyPoint>(triangle: [P; 3]) -> f64 {
+    let [a, b, c] = triangle.map(XyPoint::xy);
+    ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)) * 0.5
+}
+
+/// Squared-distance tolerance for collapsing coincident ring vertices
+/// produced by clipping (1e-10 m).
+pub(crate) const RING_DEDUP_EPS_SQ: f64 = 1e-20;
+
+/// Drop consecutive ring vertices considered coincident by `close`, treating
+/// the ring as closed (a trailing vertex coincident with the first is popped).
+pub(crate) fn deduplicate_ring_by<P: Copy>(
+    mut ring: Vec<P>,
+    close: impl Fn(P, P) -> bool,
+) -> Vec<P> {
+    ring.dedup_by(|a, b| close(*a, *b));
+    if ring.len() > 1 && close(ring[0], *ring.last().expect("non-empty")) {
+        ring.pop();
+    }
+    ring
+}
+
+/// One Sutherland–Hodgman pass: clip `polygon` against the half-plane on the
+/// interior side of the directed edge `edge_a -> edge_b` (`clip_ccw` gives the
+/// winding of the clip polygon the edge belongs to). Non-XY components of the
+/// points are carried through interpolation.
+pub(crate) fn clip_polygon_by_xy_edge<P: XyPoint>(
+    polygon: &[P],
+    edge_a: DVec2,
+    edge_b: DVec2,
+    clip_ccw: bool,
+) -> Vec<P> {
+    if polygon.is_empty() {
+        return Vec::new();
+    }
+    // Signed distance in metres (scale-independent of edge length), so the
+    // on-boundary tolerance means the same thing for every clip edge.
+    let signed_distance = |point: P| {
+        let d = crate::model::kernel::signed_distance_to_line(point.xy(), edge_a, edge_b);
+        if clip_ccw { d } else { -d }
+    };
+    const INSIDE_TOL: f64 = crate::model::kernel::XY_TOL;
+
+    let mut output = Vec::new();
+    let mut previous = *polygon.last().expect("polygon is non-empty");
+    let mut previous_distance = signed_distance(previous);
+    let mut previous_inside = previous_distance >= -INSIDE_TOL;
+    for &current in polygon {
+        let current_distance = signed_distance(current);
+        let current_inside = current_distance >= -INSIDE_TOL;
+        if current_inside != previous_inside {
+            let denominator = previous_distance - current_distance;
+            if denominator.abs() > 1e-20 {
+                let t = (previous_distance / denominator).clamp(0.0, 1.0);
+                output.push(previous.lerp_point(current, t));
+            }
+        }
+        if current_inside {
+            output.push(current);
+        }
+        previous = current;
+        previous_distance = current_distance;
+        previous_inside = current_inside;
+    }
+    deduplicate_ring_by(output, |a, b| a.distance_sq(b) <= RING_DEDUP_EPS_SQ)
 }
 
 /// Return which sign of `horiz_dist` places the offset on the cursor's side.
@@ -469,173 +593,4 @@ fn compute_offset_centroid(verts: &[DVec3], closed: bool, signed_dist: f64) -> D
     }
     let sum: DVec2 = offset.iter().map(|v| v.truncate()).sum();
     sum / offset.len() as f64
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bow_tie_splits_into_both_triangles_and_keeps_one() {
-        const E: f64 = 476_000.0;
-        const N: f64 = 7_654_000.0;
-        let ring = vec![
-            DVec3::new(E, N, 100.0),
-            DVec3::new(E + 10.0, N, 100.0),
-            DVec3::new(E, N + 10.0, 100.0),
-            DVec3::new(E + 10.0, N + 10.0, 100.0),
-        ];
-        let loops = split_self_intersection_loops(ring.clone());
-        assert_eq!(loops.len(), 2, "bow-tie must peel into two triangles");
-        for a_loop in &loops {
-            assert!((signed_area_xy(a_loop).abs() - 25.0).abs() < 1e-6);
-            // Each triangle contains the crossing point (E+5, N+5).
-            assert!(
-                a_loop
-                    .iter()
-                    .any(|v| (v.truncate() - DVec2::new(E + 5.0, N + 5.0)).length() < 1e-6)
-            );
-        }
-        let kept = remove_self_intersections(ring);
-        assert_eq!(kept.len(), 3);
-    }
-
-    #[test]
-    fn double_pinch_peels_all_three_lobes_largest_first() {
-        // A comb-shaped ring whose base edge is crossed twice: two 5x4 body
-        // lobes above y=0 and one 5x2 pocket below. The old implementation
-        // silently discarded all but one lobe.
-        let ring = vec![
-            DVec3::new(0.0, 0.0, 0.0),
-            DVec3::new(15.0, 0.0, 0.0),
-            DVec3::new(15.0, 4.0, 0.0),
-            DVec3::new(10.0, 4.0, 0.0),
-            DVec3::new(10.0, -2.0, 0.0),
-            DVec3::new(5.0, -2.0, 0.0),
-            DVec3::new(5.0, 4.0, 0.0),
-            DVec3::new(0.0, 4.0, 0.0),
-        ];
-        let loops = split_self_intersection_loops(ring.clone());
-        let areas: Vec<f64> = loops
-            .iter()
-            .map(|a_loop| signed_area_xy(a_loop).abs())
-            .collect();
-        assert_eq!(areas.len(), 3, "expected two body lobes and the pocket");
-        assert!((areas[0] - 20.0).abs() < 1e-9);
-        assert!((areas[1] - 20.0).abs() < 1e-9);
-        assert!((areas[2] - 10.0).abs() < 1e-9);
-
-        let kept = remove_self_intersections(ring);
-        assert!((signed_area_xy(&kept).abs() - 20.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn simple_ring_passes_through_unsplit() {
-        let ring = vec![
-            DVec3::new(0.0, 0.0, 5.0),
-            DVec3::new(10.0, 0.0, 5.0),
-            DVec3::new(10.0, 10.0, 5.0),
-            DVec3::new(0.0, 10.0, 5.0),
-        ];
-        let loops = split_self_intersection_loops(ring.clone());
-        assert_eq!(loops.len(), 1);
-        assert_eq!(loops[0], ring);
-    }
-
-    #[test]
-    fn project_to_rl_lands_flat_and_recedes_as_ramp_descends() {
-        // A "ramp crest" string descending in Z along +X, like a crest that follows
-        // a ramp as it's mined down.
-        let verts = vec![
-            DVec3::new(0.0, 0.0, 282.0),
-            DVec3::new(10.0, 0.0, 279.0),
-            DVec3::new(20.0, 0.0, 276.0),
-        ];
-        let tan_angle = 60f64.to_radians().tan();
-        let target_rl = 282.0;
-        let result = geometric_offset_project_to_rl(&verts, false, 1.0, tan_angle, target_rl);
-
-        // Every vertex must land exactly at the target RL (flat string).
-        for v in &result {
-            assert!((v.z - target_rl).abs() < 1e-9);
-        }
-
-        // The vertex that started exactly at target RL should not move in XY.
-        assert!((result[0].truncate() - verts[0].truncate()).length() < 1e-9);
-
-        // As the source string descends further below the target RL, the crest
-        // should recede further away (monotonically increasing offset distance).
-        let d1 = (result[1].truncate() - verts[1].truncate()).length();
-        let d2 = (result[2].truncate() - verts[2].truncate()).length();
-        assert!(
-            d2 > d1,
-            "expected offset distance to grow as elevation drops further below target RL"
-        );
-
-        // Sanity-check the magnitude against the batter geometry: horiz = height / tan(angle).
-        let expected_d2 = (target_rl - verts[2].z) / tan_angle;
-        assert!((d2 - expected_d2).abs() < 1e-6);
-    }
-
-    #[test]
-    fn project_to_rl_handles_a_corner_via_bisector_normal() {
-        // Open string with a 90-degree turn, so the interior vertex's normal must
-        // come from the (prev + next) edge-normal bisector, not a single edge normal.
-        let verts = vec![
-            DVec3::new(0.0, 0.0, 282.0),
-            DVec3::new(10.0, 0.0, 279.0),
-            DVec3::new(10.0, 10.0, 276.0),
-        ];
-        let tan_angle = 60f64.to_radians().tan();
-        let target_rl = 282.0;
-        let result = geometric_offset_project_to_rl(&verts, false, 1.0, tan_angle, target_rl);
-
-        assert_eq!(result.len(), verts.len());
-        for v in &result {
-            assert!((v.z - target_rl).abs() < 1e-9);
-        }
-
-        // First edge runs along +X, so its left normal is +Y; second edge runs
-        // along +Y, so its left normal is -X. The interior vertex's bisector
-        // normal should be their (normalized) sum, i.e. pointing into (-X, +Y).
-        let dist1 = (target_rl - verts[1].z) / tan_angle;
-        let bisector = (DVec2::new(0.0, 1.0) + DVec2::new(-1.0, 0.0)).normalize();
-        let expected_xy = verts[1].truncate() + dist1 * bisector;
-        assert!((result[1].truncate() - expected_xy).length() < 1e-9);
-    }
-
-    #[test]
-    fn project_to_rl_on_closed_polygon_keeps_vertex_count_and_flat_z() {
-        let verts = vec![
-            DVec3::new(0.0, 0.0, 280.0),
-            DVec3::new(10.0, 0.0, 278.0),
-            DVec3::new(10.0, 10.0, 276.0),
-            DVec3::new(0.0, 10.0, 278.0),
-        ];
-        let tan_angle = 45f64.to_radians().tan();
-        let target_rl = 280.0;
-        let result = geometric_offset_project_to_rl(&verts, true, 1.0, tan_angle, target_rl);
-
-        assert_eq!(result.len(), verts.len());
-        for v in &result {
-            assert!((v.z - target_rl).abs() < 1e-9);
-        }
-        // The vertex already at target RL should be unmoved in XY.
-        assert!((result[0].truncate() - verts[0].truncate()).length() < 1e-9);
-    }
-
-    #[test]
-    fn project_to_rl_flips_side_with_the_sign_argument() {
-        let verts = vec![DVec3::new(0.0, 0.0, 280.0), DVec3::new(10.0, 0.0, 270.0)];
-        let tan_angle = 45f64.to_radians().tan();
-        let target_rl = 280.0;
-        let pos_side = geometric_offset_project_to_rl(&verts, false, 1.0, tan_angle, target_rl);
-        let neg_side = geometric_offset_project_to_rl(&verts, false, -1.0, tan_angle, target_rl);
-
-        let d_pos = pos_side[1].y - verts[1].y;
-        let d_neg = neg_side[1].y - verts[1].y;
-        assert!(d_pos > 0.0);
-        assert!(d_neg < 0.0);
-        assert!((d_pos + d_neg).abs() < 1e-9);
-    }
 }

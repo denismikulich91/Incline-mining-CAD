@@ -9,7 +9,7 @@ use crate::ui::{
 pub(crate) fn draw_exit_confirm_dialog(
     ui: &mut egui::Ui,
     commands: &mut Vec<UiCommand>,
-    editor: &mut EditorState,
+    _editor: &mut EditorState,
 ) {
     let mut open = true;
     DragableMenu::new("Exit: Unsaved Changes")
@@ -27,12 +27,12 @@ pub(crate) fn draw_exit_confirm_dialog(
                     commands.push(UiCommand::ExitWithoutSaving);
                 }
                 if ui.button("Cancel").clicked() {
-                    editor.exit_confirm_open = false;
+                    commands.push(UiCommand::CancelExit);
                 }
             });
         });
     if !open {
-        editor.exit_confirm_open = false;
+        commands.push(UiCommand::CancelExit);
     }
 }
 
@@ -240,7 +240,7 @@ pub(crate) fn draw_close_unsaved_tri_dialog(
             ui.label("This triangulation is not saved to disk.\nSave now?");
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui.button("Save As …").clicked() {
+                if ui.button("Save As...").clicked() {
                     commands.push(UiCommand::SaveAndCloseTriangulationAs(tri_id));
                 }
                 if ui.button("Close Without Saving").clicked() {

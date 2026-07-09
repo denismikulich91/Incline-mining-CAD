@@ -27,12 +27,64 @@ impl<'a> Graphics<'a> {
         if required_items <= *capacity_items {
             return;
         }
-        let new_capacity = required_items.next_power_of_two().max(1);
+        // Power-of-two growth must not overshoot the device's per-buffer
+        // limit; callers clamp their CPU-side data to the same limit first.
+        let max_items = (device.limits().max_buffer_size as usize / item_size).max(1);
+        let new_capacity = required_items.next_power_of_two().clamp(1, max_items);
         *buffer = Self::create_stream_buffer(device, label, new_capacity * item_size, usage);
         *capacity_items = new_capacity;
     }
 
+    /// Truncate a CPU-side vertex/index stream pair so both fit the device's
+    /// per-buffer limit. Draw calls and picking take their counts from these
+    /// vecs, so truncating here keeps every downstream consumer consistent;
+    /// the result is missing geometry rather than a fatal validation error.
+    pub(super) fn clamp_stream_geometry<V>(
+        device: &wgpu::Device,
+        vertices: &mut Vec<V>,
+        indices: &mut Vec<u32>,
+        label: &'static str,
+    ) {
+        let max_buffer_size = device.limits().max_buffer_size;
+        let max_vertices = (max_buffer_size as usize) / std::mem::size_of::<V>();
+        let max_indices = (max_buffer_size as usize) / std::mem::size_of::<u32>() / 3 * 3;
+        if vertices.len() <= max_vertices && indices.len() <= max_indices {
+            return;
+        }
+        crate::userspace_error!(
+            "{label}: tessellated geometry ({} vertices, {} indices) exceeds the GPU's {} MiB per-buffer limit; truncating — some geometry will not be displayed",
+            vertices.len(),
+            indices.len(),
+            max_buffer_size / (1024 * 1024)
+        );
+        vertices.truncate(max_vertices);
+        // Primitives index vertices pushed by the same tessellation call, so
+        // referenced indices are nondecreasing across triangles: scanning back
+        // to the last fully in-range triangle yields a valid prefix.
+        let mut cut = indices.len().min(max_indices);
+        while cut >= 3
+            && indices[cut - 3..cut]
+                .iter()
+                .any(|&i| (i as usize) >= max_vertices)
+        {
+            cut -= 3;
+        }
+        indices.truncate(cut);
+    }
+
     pub(super) fn upload_scene_stream_buffers(&mut self) {
+        Self::clamp_stream_geometry(
+            &self.device,
+            &mut self.lyon_buffer.vertices,
+            &mut self.lyon_buffer.indices,
+            "Lyon Buffer",
+        );
+        Self::clamp_stream_geometry(
+            &self.device,
+            &mut self.stroke_vertex_buf,
+            &mut self.stroke_index_buf,
+            "Stroke Buffer",
+        );
         if !self.lyon_buffer.vertices.is_empty() {
             Self::ensure_stream_capacity(
                 &self.device,

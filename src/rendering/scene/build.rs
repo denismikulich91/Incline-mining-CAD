@@ -3,12 +3,15 @@
 use glam::{DVec3, Mat4, Vec3};
 use lyon::tessellation::VertexBuffers;
 
+use std::collections::HashSet;
+
 use crate::{
-    model::{Document, Object, SceneEntityId},
+    model::{Document, Object, ObjectId, SceneEntityId},
     rendering::{
         StrokeVertex, Vertex,
         geometry::{
-            DrawContext, draw_bulge_segment, draw_line, draw_round_join, draw_screen_cross,
+            DrawContext, draw_line, draw_screen_cross, polyline_segments,
+            tessellate_polyline_stroke,
         },
         graphics::{
             DOC_LINE_WIDTH, DOC_TEXT_FONT_SIZE, INVALID_PREVIEW_COLOR, PREVIEW_COLOR,
@@ -30,6 +33,8 @@ use crate::{
 pub(crate) struct DocumentSceneBuildInput<'a> {
     pub(crate) editor: &'a EditorState,
     pub(crate) document: &'a Document,
+    /// Objects owned by the static stroke chunk cache; skipped here.
+    pub(crate) static_ids: &'a HashSet<ObjectId>,
     pub(crate) text_system: &'a mut TextSystem,
     pub(crate) lyon_buffer: &'a mut VertexBuffers<Vertex, u32>,
     pub(crate) stroke_vertex_buf: &'a mut Vec<StrokeVertex>,
@@ -46,6 +51,7 @@ pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
     let DocumentSceneBuildInput {
         editor,
         document,
+        static_ids,
         text_system,
         lyon_buffer,
         stroke_vertex_buf,
@@ -95,6 +101,9 @@ pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
                 || editor.tool_highlight_id == Some(object.id())
         });
         for object in objects {
+            if static_ids.contains(&object.id()) {
+                continue;
+            }
             let handle = SceneEntityId::Object(object.id());
             let layer_visible = document
                 .layer(object.layer())
@@ -121,39 +130,13 @@ pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
                 } => {
                     let line_rgba = rgba;
                     let fill_rgba = document.object_fill_rgba(object);
-                    for segment in verts.windows(2) {
-                        draw_bulge_segment(
-                            &mut draw_ctx,
-                            segment[0].pos,
-                            segment[1].pos,
-                            segment[0].bulge,
-                            *line_weight,
-                            line_rgba,
-                        );
-                    }
-                    if *closed
-                        && verts.len() >= 2
-                        && let (Some(first), Some(last)) = (verts.first(), verts.last())
-                    {
-                        draw_bulge_segment(
-                            &mut draw_ctx,
-                            last.pos,
-                            first.pos,
-                            last.bulge,
-                            *line_weight,
-                            line_rgba,
-                        );
-                    }
-                    let join_vertices: &[crate::model::PolyVertex] = if *closed {
-                        verts
-                    } else if verts.len() > 2 {
-                        &verts[1..verts.len() - 1]
-                    } else {
-                        &[]
-                    };
-                    for vertex in join_vertices {
-                        draw_round_join(&mut draw_ctx, vertex.pos, *line_weight, line_rgba);
-                    }
+                    tessellate_polyline_stroke(
+                        &mut draw_ctx,
+                        verts,
+                        *closed,
+                        *line_weight,
+                        line_rgba,
+                    );
                     if *closed && verts.len() >= 3 {
                         match fill {
                             crate::model::FillStyle::Solid => {
@@ -313,14 +296,7 @@ pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
                 && !editor.frozen_handles.contains(&handle)
             {
                 let segments = match object {
-                    Object::Polyline { verts, closed, .. } => {
-                        let mut segs: Vec<[DVec3; 2]> =
-                            verts.windows(2).map(|w| [w[0].pos, w[1].pos]).collect();
-                        if *closed && verts.len() >= 2 {
-                            segs.push([verts.last().unwrap().pos, verts.first().unwrap().pos]);
-                        }
-                        segs
-                    }
+                    Object::Polyline { verts, closed, .. } => polyline_segments(verts, *closed),
                     Object::Road { centerline, .. } => centerline
                         .windows(2)
                         .map(|w| [w[0].pos, w[1].pos])

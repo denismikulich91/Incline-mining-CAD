@@ -1,7 +1,7 @@
 # Incline
-Incline is an open-pit mine design project to bring the ideals of free source-available software to the mining industry.
+Incline is a free source-available mine design project to liberate the mining industrys from expensive closed mining CAD software.
 
-Cross-platform, lightweight, and built by mining engineers for mining engineers. Incline is free and open for everyone - aspiring students, professionals, and hobbists.
+Cross-platform, lightweight, and built for mining professionals. Incline is free and open for everyone - aspiring students, professionals, and hobbists.
 
 ![Screenshot of the app](./tutorial/tutorial_screenshot.png)
 
@@ -13,15 +13,13 @@ We're working hard to bring stability and features over the coming months. Howev
 
 ## Features
 
+- Compatible with Vulcan and Deswik file formats
 - Layer-based editing for points, lines, polylines, polygons, text, roads, colours, visibility, and fill styles.
+- Mine-design tools including offsetting, auto-bench style offsets, chamfering, line relimiting, fusing lines into polygons, polygon explosion, bezier shaping, and road creation.
 - DXF import/export for exchanging design linework with other CAD and mine planning tools.
 - Triangulation loading, viewing, saving, and export.
-- Block model viewing.
-- Support for Vulcan `.00t`, OBJ, STL, and PLY triangulation files.
-- Support for importing Vulcan `.dgd.isis` data as PIDB design geometry.
-- GPU accelerated rendering with `wgpu`.
-- Snapping to points, lines, and triangulation surfaces.
-- Mine-design tools including offsetting, auto-bench style offsets, chamfering, line relimiting, fusing lines into polygons, polygon explosion, bezier shaping, and road creation.
+- Block model viewing and filtering, with support for .bmf files.
+- Support for .00t, OBJ, STL, and PLY triangulation files.
 - Cross-platform desktop target: Windows, Linux, and macOS.
 
 ## Getting Started

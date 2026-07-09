@@ -2,6 +2,7 @@ pub(crate) mod canvas; // Handles anything to do with dragging and stuff
 pub(crate) mod commands; // Handles UI commands
 pub(crate) mod events; // Handles window events
 pub(crate) mod io; /* Handles session serialisation */
+pub(crate) mod jobs; // Reusable background-compute job queue
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -24,7 +25,7 @@ use winit::{
 };
 
 use crate::{
-    app::commands::file::FileDialogAction,
+    app::commands::file::PendingFileDialog,
     model::{
         Document, LayerId, Object, ObjectId, SceneEntityId,
         block_model::{BlockModelId, BlockModelSource, OpenBlockModel},
@@ -35,8 +36,8 @@ use crate::{
     },
     rendering::graphics::Graphics,
     ui::state::{
-        EditorState, UiBlockModelEntry, UiLayerEntry, UiProjectEntry, UiProjectView,
-        UiTriangulationEntry,
+        EditorState, UiBlockModelEntry, UiLayerEntry, UiPointCloudEntry, UiProjectEntry,
+        UiProjectView, UiTriangulationEntry,
     },
     userspace_warn,
 };
@@ -84,6 +85,7 @@ pub(crate) struct GizmoDragState {
 
 pub(crate) struct App<'a> {
     close_requested: bool,
+    exit_after_pending_saves: bool,
     redraw_requested: bool,
     window: Option<Arc<Window>>,
     graphics: Option<Graphics<'a>>,
@@ -94,6 +96,7 @@ pub(crate) struct App<'a> {
     last_render_time: Option<Instant>,
     last_scroll_instant: Option<Instant>,
     last_snap_poll_instant: Option<Instant>,
+    last_road_preview_update_instant: Option<Instant>,
     editor: EditorState,
     workspace: Workspace,
     startup_dialog_dismissed: bool,
@@ -111,12 +114,28 @@ pub(crate) struct App<'a> {
     block_model_files: Vec<BlockModelSource>,
     active_block_model: Option<BlockModelId>,
     next_block_model_id: u64,
+    point_clouds: Vec<crate::model::point_cloud::OpenPointCloud>,
+    point_cloud_files: Vec<PathBuf>,
+    next_point_cloud_id: u64,
     empty_document: Document,
     scene_document: Document,
     snap_index: ObjectSnapIndex,
     /// Set by `invalidate_geometry`; the index rebuilds lazily on the next
     /// snap/orbit query via `refresh_snap_index`.
     snap_index_dirty: bool,
+    /// Ghost-free resolved road network for `scene_document`, used by
+    /// SnapToLine road snapping. Rebuilt lazily via
+    /// `refresh_scene_road_network`; cleared with the snap index.
+    scene_road_network: Option<crate::model::road_network::ResolvedNetwork>,
+    /// Ghost-free compromised-road keys of the active document, keyed by
+    /// `(active project index, document revision)`. Grandfathers pre-existing
+    /// rule violations during per-cursor-move ghost validation without
+    /// rebuilding the ghost-free topology each tick.
+    road_preexisting_cache: Option<(
+        usize,
+        u64,
+        std::collections::HashSet<crate::model::road_network::RoadKey>,
+    )>,
     /// `Workspace::composite_key()` of the last `scene_document` build;
     /// `None` forces the next invalidation to rebuild.
     scene_document_key: Option<u64>,
@@ -131,7 +150,6 @@ pub(crate) struct App<'a> {
     right_orbit_active: bool,
     pending_topology_click: Option<(SceneEntityId, DVec3)>,
     move_session_original: Option<Vec<Object>>,
-    move_session_project_dirty: Option<bool>,
     topology_load_pending_gpu: bool,
     /// Number of triangulation loads currently running on background threads.
     pending_loads: usize,
@@ -143,7 +161,17 @@ pub(crate) struct App<'a> {
         BlockModelSource,
         mpsc::Receiver<anyhow::Result<crate::model::block_model::LoadedBlockModel>>,
     )>,
-    pub(crate) pending_file_dialogs: Vec<mpsc::Receiver<Option<FileDialogAction>>>,
+    pending_point_cloud_loads: Vec<(
+        PathBuf,
+        mpsc::Receiver<anyhow::Result<crate::model::point_cloud::LoadedPointCloud>>,
+    )>,
+    pub(crate) pending_file_dialogs: Vec<PendingFileDialog>,
+    /// Triangulation saves/exports running on background threads; drained by
+    /// `poll_saves` each frame.
+    pending_saves: Vec<crate::app::commands::file::PendingSave>,
+    /// Heavy compute jobs (include/cut/create) running on background threads;
+    /// drained by `poll_jobs` each frame.
+    pending_jobs: Vec<crate::app::jobs::BackgroundJob<'a>>,
     window_focused: bool,
 }
 
@@ -151,6 +179,7 @@ impl<'a> App<'a> {
     pub(crate) fn new() -> Result<Self> {
         let mut app = Self {
             close_requested: false,
+            exit_after_pending_saves: false,
             redraw_requested: false,
             window: None,
             graphics: None,
@@ -158,6 +187,7 @@ impl<'a> App<'a> {
             last_render_time: None,
             last_scroll_instant: None,
             last_snap_poll_instant: None,
+            last_road_preview_update_instant: None,
             editor: EditorState::new(),
             workspace: Workspace::default(),
             startup_dialog_dismissed: false,
@@ -172,10 +202,15 @@ impl<'a> App<'a> {
             block_model_files: Vec::new(),
             active_block_model: None,
             next_block_model_id: 0,
+            point_clouds: Vec::new(),
+            point_cloud_files: Vec::new(),
+            next_point_cloud_id: 0,
             empty_document: Document::new(),
             scene_document: Document::new(),
             snap_index: ObjectSnapIndex::default(),
             snap_index_dirty: false,
+            scene_road_network: None,
+            road_preexisting_cache: None,
             scene_document_key: None,
             history: crate::model::History::new(),
             modifiers: ModifiersState::empty(),
@@ -185,12 +220,14 @@ impl<'a> App<'a> {
             right_orbit_active: false,
             pending_topology_click: None,
             move_session_original: None,
-            move_session_project_dirty: None,
             topology_load_pending_gpu: false,
             pending_loads: 0,
             pending_triangulation_loads: Vec::new(),
             pending_block_model_loads: Vec::new(),
+            pending_point_cloud_loads: Vec::new(),
             pending_file_dialogs: Vec::new(),
+            pending_saves: Vec::new(),
+            pending_jobs: Vec::new(),
             window_focused: true,
         };
 
@@ -226,6 +263,7 @@ impl<'a> App<'a> {
             .block_model_interaction_resolution_divisor
             .clamp(1, 64);
         app.editor.frame_counter_enabled = config.frame_counter_enabled;
+        app.editor.debug_chunk_coloring = config.debug_chunk_coloring;
 
         Ok(app)
     }
@@ -234,6 +272,17 @@ impl<'a> App<'a> {
         self.workspace
             .active_document()
             .unwrap_or(&self.empty_document)
+    }
+
+    pub(crate) fn activate_project_for_object(&mut self, object_id: ObjectId) -> bool {
+        let Some(index) = self.workspace.project_index_for_object(object_id) else {
+            return false;
+        };
+        if self.workspace.active_index != Some(index) {
+            self.history.clear();
+        }
+        self.workspace.set_active_index(index);
+        true
     }
 
     fn active_layer(&self) -> Option<LayerId> {
@@ -246,15 +295,8 @@ impl<'a> App<'a> {
         })
     }
 
-    fn active_layer_object(&self, object_id: ObjectId) -> Option<&Object> {
-        let active_layer = self.active_layer()?;
-        self.active_document()
-            .get_object(object_id)
-            .filter(|object| object.layer() == active_layer)
-    }
-
-    fn editing_ready(&mut self) -> bool {
-        self.workspace.has_active_project()
+    fn editing_ready(&self) -> bool {
+        self.workspace.has_active_project() && !self.editor.fly_mode_enabled
     }
 
     fn set_active_project(&mut self, project: OpenProject) {
@@ -272,32 +314,70 @@ impl<'a> App<'a> {
         self.editor.translucent_handles.clear();
         self.editor.active_layer = None;
         self.editor.active_tool = crate::ui::state::ActiveTool::None;
+        self.editor.new_layer_dialog_open = false;
+        self.editor.new_layer_project_index = None;
         self.editor.selection_box_start_px = None;
         self.editor.selection_box_current_px = None;
+        self.editor.pending_stroke.clear();
+        self.editor.poly_finish_dialog = false;
+        self.editor.poly_finish_dialog_px = None;
         self.editor.move_to_layer_dialog = None;
         self.editor.move_layer_dialog = None;
         self.pending_topology_click = None;
         self.editor.measurement_start = None;
         self.editor.measurement_end = None;
+        self.editor.berm_angle_points.clear();
         self.editor.text_editing_enabled = false;
         self.editor.editing_labels_id = None;
         self.editor.text_edit_dialog_px = None;
         self.editor.text_edit_position_frames = 0;
         self.editor.text_edit_focus_requested = false;
         self.editor.text_edit_created = false;
-        self.editor.text_edit_was_dirty = false;
         // Cancel any in-progress offset operation.
         self.editor.offset_dialog_open = false;
         self.editor.offset_target_id = None;
+        self.editor.offset_target_ids.clear();
         self.editor.offset_awaiting_side_pick = false;
         self.editor.offset_preview_world.clear();
         self.editor.offset_source_world.clear();
+        self.editor.offset_preview_screen_px.clear();
+        self.editor.offset_source_screen_px.clear();
+        self.editor.offset_preview_ranges.clear();
         // Cancel any in-progress relimit operation.
         self.editor.relimit_dialog_open = false;
         self.editor.relimit_source_id = None;
         self.editor.relimit_awaiting_source_pick = false;
         self.editor.relimit_waiting_for_pick = false;
         self.editor.relimit_confirming_end = false;
+        self.editor.relimit_second_id = None;
+        self.editor.relimit_intersection_3d = None;
+        self.editor.relimit_candidates.clear();
+        self.editor.relimit_hover_target_id = None;
+        self.editor.relimit_hover_target_screen_px.clear();
+        self.editor.relimit_preview_from_px = None;
+        self.editor.relimit_preview_to_px = None;
+        // Clear road/fuse/batter-berm previews.
+        self.editor.road_dialog_open = false;
+        self.editor.road_preview_left_world.clear();
+        self.editor.road_preview_right_world.clear();
+        self.editor.road_preview_left_screen_px.clear();
+        self.editor.road_preview_right_screen_px.clear();
+        self.editor.road_preview_center_screen_px.clear();
+        self.editor.fuse_segments.clear();
+        self.editor.fuse_awaiting_endpoint = None;
+        self.editor.fuse_endpoint_markers.clear();
+        self.editor.fuse_chain_tail = None;
+        self.editor.fuse_close_marker = None;
+        self.editor.batter_berm_dialog_open = false;
+        self.editor.batter_berm_target_id = None;
+        self.editor.batter_berm_rings_world.clear();
+        self.editor.batter_berm_source_world.clear();
+        self.editor.batter_berm_guides_world.clear();
+        self.editor.batter_berm_rings_screen_px.clear();
+        self.editor.batter_berm_source_screen_px.clear();
+        self.editor.batter_berm_guides_screen_px.clear();
+        self.editor.batter_berm_preview_key = None;
+        self.editor.tool_highlight_id = None;
         // Clear chamfer tool state.
         self.editor.chamfer_poly_id = None;
         self.editor.chamfer_corner_index = None;
@@ -308,7 +388,6 @@ impl<'a> App<'a> {
         self.clear_bezier_state();
         // Clear any in-progress move session so it cannot bleed into the new PIDB.
         self.move_session_original = None;
-        self.move_session_project_dirty = None;
         self.drag = None;
         self.gizmo_drag = None;
         self.editor.gizmo_drag_axis_index = None;
@@ -327,6 +406,7 @@ impl<'a> App<'a> {
             // query: many edits never snap before the next edit, and the
             // BVH build is the expensive part.
             self.snap_index_dirty = true;
+            self.scene_road_network = None;
         }
         if let Some(graphics) = self.graphics.as_mut() {
             graphics.invalidate_geometry();
@@ -362,6 +442,42 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Rebuild the ghost-free resolved road network for the scene document if
+    /// an edit invalidated it. Call before handing `self.scene_road_network`
+    /// to a SnapToLine query so snapping never re-resolves per poll.
+    fn refresh_scene_road_network(&mut self) {
+        if self.scene_road_network.is_none() {
+            self.scene_road_network = Some(crate::model::road_network::resolve(
+                &self.scene_document,
+                None,
+            ));
+        }
+    }
+
+    /// Ghost-free compromised-road keys for the active document, cached per
+    /// `(project, document revision)` so per-cursor-move ghost validation
+    /// skips the second topology build.
+    fn road_preexisting_compromised(
+        &mut self,
+    ) -> std::collections::HashSet<crate::model::road_network::RoadKey> {
+        let Some(index) = self.workspace.active_index else {
+            return Default::default();
+        };
+        let Some(document) = self.workspace.active_document() else {
+            return Default::default();
+        };
+        let revision = document.revision();
+        if let Some((cached_index, cached_revision, keys)) = &self.road_preexisting_cache
+            && *cached_index == index
+            && *cached_revision == revision
+        {
+            return keys.clone();
+        }
+        let keys = crate::model::road_network::prepare(document, None).compromised_keys();
+        self.road_preexisting_cache = Some((index, revision, keys.clone()));
+        keys
+    }
+
     fn invalidate_overlay(&mut self) {
         if let Some(graphics) = self.graphics.as_mut() {
             graphics.invalidate_overlay();
@@ -386,12 +502,27 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Complete one background save. Unlike `finish_topology_load` this must
+    /// not clear `topology_load_pending_gpu` — that flag belongs to the load
+    /// pipeline, whose deferred completion still needs it if a load's GPU
+    /// upload is outstanding when a save finishes.
+    pub(crate) fn finish_background_save(&mut self) {
+        self.pending_loads = self.pending_loads.saturating_sub(1);
+        if self.pending_loads == 0
+            && !self.topology_load_pending_gpu
+            && let Some(window) = &self.window
+        {
+            window.set_cursor(CursorIcon::Default);
+        }
+    }
+
     fn fit_view_to_extents(&mut self) {
         if let Some(graphics) = self.graphics.as_mut() {
             graphics.fit_to_extents(
                 &self.scene_document,
                 &self.triangulations,
                 &self.block_models,
+                &self.point_clouds,
                 &self.editor.hidden_handles,
             );
             self.redraw_requested = true;
@@ -414,7 +545,7 @@ impl<'a> App<'a> {
             .enumerate()
             .map(|(i, p)| {
                 let dirty_layers = p.dirty_layers();
-                let dirty = p.dirty || !dirty_layers.is_empty();
+                let dirty = !dirty_layers.is_empty();
                 UiProjectEntry {
                     name: p.pidb.metadata.name.clone(),
                     dirty,
@@ -590,6 +721,55 @@ impl<'a> App<'a> {
             }
         }
 
+        let loaded_cloud_by_path: BTreeMap<PathBuf, &crate::model::point_cloud::OpenPointCloud> =
+            self.point_clouds
+                .iter()
+                .map(|cloud| (cloud.path.clone(), cloud))
+                .collect();
+        let mut point_clouds = Vec::new();
+        let mut seen_point_clouds = BTreeSet::new();
+        for path in &self.point_cloud_files {
+            if !seen_point_clouds.insert(path.clone()) {
+                continue;
+            }
+            if let Some(cloud) = loaded_cloud_by_path.get(path) {
+                point_clouds.push(UiPointCloudEntry {
+                    id: Some(cloud.id),
+                    name: cloud.name.clone(),
+                    path: path.clone(),
+                    visible: cloud.visible,
+                    is_loaded: true,
+                    point_count: cloud.points.len(),
+                });
+            } else {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("")
+                    .to_owned();
+                point_clouds.push(UiPointCloudEntry {
+                    id: None,
+                    name,
+                    path: path.clone(),
+                    visible: false,
+                    is_loaded: false,
+                    point_count: 0,
+                });
+            }
+        }
+        for cloud in &self.point_clouds {
+            if !seen_point_clouds.contains(&cloud.path) {
+                point_clouds.push(UiPointCloudEntry {
+                    id: Some(cloud.id),
+                    name: cloud.name.clone(),
+                    path: cloud.path.clone(),
+                    visible: cloud.visible,
+                    is_loaded: true,
+                    point_count: cloud.points.len(),
+                });
+            }
+        }
+
         let active_path = self.workspace.active_project().and_then(|p| p.path.clone());
         let active_triangulation_for_menu = self.active_triangulation.and_then(|id| {
             self.triangulations
@@ -601,6 +781,7 @@ impl<'a> App<'a> {
             projects,
             triangulations,
             block_models,
+            point_clouds,
             active_index: self.workspace.active_index,
             needs_startup_dialog: self.workspace.projects.is_empty()
                 && !self.startup_dialog_dismissed,
@@ -631,9 +812,7 @@ impl<'a> App<'a> {
             {
                 continue;
             }
-            match pidb::load(path)
-                .and_then(|pidb| pidb::open_project(Some(path.clone()), pidb, false))
-            {
+            match pidb::load(path).and_then(|pidb| pidb::open_project(Some(path.clone()), pidb)) {
                 Ok(project) => {
                     self.workspace.add_inactive(project);
                 }
@@ -711,6 +890,12 @@ impl<'a> App<'a> {
                 self.block_model_files.push(source.clone());
             }
         }
+
+        for path in &session.point_cloud_file_paths {
+            if path.is_file() && !self.point_cloud_files.contains(path) {
+                self.point_cloud_files.push(path.clone());
+            }
+        }
     }
 
     fn scan_triangulation_dir(dir: &Path) -> Vec<PathBuf> {
@@ -768,6 +953,10 @@ impl<'a> App<'a> {
             let deduped: BTreeSet<_> = self.block_model_files.iter().cloned().collect();
             deduped.into_iter().collect()
         };
+        let point_cloud_file_paths: Vec<PathBuf> = {
+            let deduped: BTreeSet<_> = self.point_cloud_files.iter().cloned().collect();
+            deduped.into_iter().collect()
+        };
         let session = crate::app::io::Session {
             project_paths: paths,
             active_path,
@@ -775,6 +964,7 @@ impl<'a> App<'a> {
             triangulation_file_paths,
             triangulation_excluded_paths,
             block_model_sources,
+            point_cloud_file_paths,
         };
         if let Err(e) = crate::app::io::save_session(&session) {
             log::warn!("Failed to save session: {e}");
@@ -793,7 +983,7 @@ impl<'a> ApplicationHandler for App<'a> {
         #[cfg(target_os = "linux")]
         let window_attributes = window_attributes.with_name(crate::APP_ID, crate::APP_ID);
         #[cfg(target_os = "macos")]
-        if let Err(error) = crate::startup::macos::set_dock_icon() {
+        if let Err(error) = crate::os::macos::set_dock_icon() {
             log::warn!("Failed to set macOS Dock icon: {error}");
         }
 
@@ -850,14 +1040,10 @@ impl<'a> ApplicationHandler for App<'a> {
         }
 
         self.poll_file_dialogs();
-        // Under egui_inspection automation the window may be occluded/unfocused, so it won't
-        // receive the OS events a normal redraw relies on. Force the same continuous-redraw
-        // path used for animations so inspection requests still get serviced.
-        let continuous_redraw = inspection_polling_enabled()
-            || self
-                .graphics
-                .as_ref()
-                .is_some_and(Graphics::needs_continuous_redraw);
+        let continuous_redraw = self
+            .graphics
+            .as_ref()
+            .is_some_and(Graphics::needs_continuous_redraw);
 
         if (self.redraw_requested || continuous_redraw)
             && let Some(window) = self.window.as_ref()
@@ -878,7 +1064,10 @@ impl<'a> ApplicationHandler for App<'a> {
             window.request_redraw();
         }
 
-        if !self.pending_file_dialogs.is_empty() {
+        if !self.pending_file_dialogs.is_empty()
+            || !self.pending_saves.is_empty()
+            || !self.pending_jobs.is_empty()
+        {
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(16),
             ));
@@ -890,12 +1079,6 @@ impl<'a> ApplicationHandler for App<'a> {
     fn exiting(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
         self.teardown_window();
     }
-}
-
-/// True when built with `--features inspection` and run with `EGUI_INSPECTION` set, i.e.
-/// `egui_inspection::attach_from_env` actually attached.
-fn inspection_polling_enabled() -> bool {
-    cfg!(feature = "inspection") && std::env::var_os("EGUI_INSPECTION").is_some()
 }
 
 pub(crate) fn file_name(path: &Path) -> String {

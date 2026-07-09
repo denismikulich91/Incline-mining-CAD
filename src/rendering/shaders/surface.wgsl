@@ -11,31 +11,43 @@ struct SurfaceStyle {
 @group(1) @binding(0)
 var<uniform> surface_style: SurfaceStyle;
 
+// Scene-origin-relative offset of this chunk's local origin. Vertices are
+// stored relative to their chunk's AABB centre so interpolated positions keep
+// f32 precision far from the scene origin.
+struct SurfaceChunk {
+    offset: vec4<f32>,
+};
+@group(2) @binding(0)
+var<uniform> chunk: SurfaceChunk;
+
 struct VertexInput {
     @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
 };
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec4<f32>,
-    @location(1) local_position: vec3<f32>,
+    // Flat face normal from the triangle's provoking vertex, unit length and
+    // pre-oriented with z >= 0 on the CPU. Using a stored normal instead of
+    // dpdx/dpdy of the position avoids derivative cancellation noise when the
+    // per-pixel position delta approaches the f32 ULP (static-like speckle,
+    // worst close-up in fly mode).
+    @location(1) @interpolate(flat) normal: vec3<f32>,
 };
 
 @vertex
 fn vs_main(model: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     out.color = surface_style.color;
-    out.local_position = model.position;
-    out.clip_position = camera.view_proj * vec4<f32>(model.position, 1.0);
+    out.normal = model.normal;
+    out.clip_position = camera.view_proj * vec4<f32>(model.position + chunk.offset.xyz, 1.0);
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    var normal = normalize(cross(dpdx(in.local_position), dpdy(in.local_position)));
-    if (normal.z < 0.0) {
-        normal = -normal;
-    }
+    let normal = in.normal;
     // Oblique key light from NW at a low sun angle — maximises contrast between
     // faces at different slopes because horizontal faces receive little key light
     // while lit slopes receive full intensity.  A soft fill from the opposite-high

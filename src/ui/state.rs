@@ -18,6 +18,7 @@ use crate::{
         FillStyle, LayerId, ObjectColor, ObjectId, RoadShape, SceneEntityId,
         block_model::{BlockModelId, BlockModelSource, ColorStop, FIRST_CUSTOM_COLOR_STOP_ID},
         formats::MeshFormat,
+        point_cloud::PointCloudId,
         triangulation::TriangulationId,
     },
     userspace_log,
@@ -40,6 +41,7 @@ pub(crate) struct PreferencesDraft {
     pub(crate) resize_frame_rate_cap: u32,
     pub(crate) block_model_interaction_resolution_divisor: u32,
     pub(crate) frame_counter_enabled: bool,
+    pub(crate) debug_chunk_coloring: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -62,7 +64,7 @@ impl Default for PreferencesDraft {
             renderer_background_color: crate::app::io::default_renderer_background_color(),
             topology_wireframes_enabled: false,
             dark_mode: false,
-            show_console: false,
+            show_console: true,
             show_world_axis_gizmo: crate::app::io::default_show_world_axis_gizmo(),
             snap_poll_rate: crate::app::io::default_snap_poll_rate(),
             frame_rate_cap: crate::app::io::default_frame_rate_cap(),
@@ -70,6 +72,7 @@ impl Default for PreferencesDraft {
             block_model_interaction_resolution_divisor:
                 crate::app::io::default_block_model_interaction_resolution_divisor(),
             frame_counter_enabled: false,
+            debug_chunk_coloring: false,
         }
     }
 }
@@ -95,21 +98,12 @@ impl EditorState {
     }
 }
 
-/// Projection type for the Offset Element tool.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum OffsetProjection {
-    /// Pure XY offset — no Z change (berm).
-    Horizontal,
-    /// Offset edges in XY by `height / tan(angle)` and shift Z by `height` (batter).
-    Angled(f64),
-}
-
 /// What the user-entered value means for an angled offset.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum OffsetMeasure {
     /// Direct horizontal (XY-plane) distance.
     Distance,
-    /// The Z component (height). Used with `Angled` projection.
+    /// The Z component (height).
     Height(HeightMode),
     /// Same as Distance — kept for naming clarity in the UI.
     Width,
@@ -153,6 +147,13 @@ pub(crate) enum TriCreatePhase {
     MainDialog,
 }
 
+/// Source object type accepted by the Create Triangulation picker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TriCreateSource {
+    Polygons,
+    Roads,
+}
+
 /// A failed Create Triangulation run, retained for the failure dialog.
 #[derive(Clone, Debug)]
 pub(crate) struct TriCreateFailure {
@@ -171,6 +172,17 @@ pub(crate) struct TriCreateFailure {
 pub(crate) enum BatterBermMode {
     Pit,
     Stockpile,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BatterBermPreviewKey {
+    pub(crate) target_id: ObjectId,
+    pub(crate) document_revision: u64,
+    pub(crate) width: f64,
+    pub(crate) angle: f64,
+    pub(crate) bench_height: f64,
+    pub(crate) benches: u32,
+    pub(crate) mode: BatterBermMode,
 }
 
 /// Which sub-mode the Relimit Line tool is operating in.
@@ -223,6 +235,53 @@ pub(crate) struct FuseSegment {
     /// Vertex at which a closed polygon is opened for insertion into the chain.
     pub(crate) start_index: usize,
     pub(crate) closed: bool,
+    /// When true, the segment's first ordered vertex was designated as the
+    /// join with the chain tail and sits (visually) on it, so commit drops it
+    /// instead of keeping a doubled point / micro edge.
+    pub(crate) weld_start: bool,
+}
+
+/// A transient message shown in the bottom status bar. Generic shape so any
+/// background task (save, contour generation, etc.) can drive the same UI slot
+/// without per-task plumbing.
+#[derive(Clone, Debug)]
+pub(crate) struct StatusBarMessage {
+    pub(crate) text: String,
+    /// `Some(f)` in `0.0..=1.0` shows `(percent%)` after the text; `None` is indeterminate.
+    pub(crate) progress: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BermAngleMeasurement {
+    pub(crate) angle_degrees: f64,
+    pub(crate) projection: DVec3,
+}
+
+pub(crate) fn berm_angle_measurement(points: &[DVec3]) -> Option<BermAngleMeasurement> {
+    let [a, b, c] = points.get(..3)? else {
+        return None;
+    };
+    let ab_xy = b.truncate() - a.truncate();
+    let ab_len_sq = ab_xy.length_squared();
+    if ab_len_sq <= 1.0e-12 {
+        return None;
+    }
+
+    let ac_xy = c.truncate() - a.truncate();
+    let t = ac_xy.dot(ab_xy) / ab_len_sq;
+    let projection_xy = a.truncate() + ab_xy * t;
+    let projection_z = a.z + (b.z - a.z) * t;
+    let projection = DVec3::new(projection_xy.x, projection_xy.y, projection_z);
+    let horizontal = c.truncate().distance(projection_xy);
+    let vertical = (c.z - projection_z).abs();
+    if horizontal <= 1.0e-9 && vertical <= 1.0e-9 {
+        return None;
+    }
+
+    Some(BermAngleMeasurement {
+        angle_degrees: vertical.atan2(horizontal).to_degrees(),
+        projection,
+    })
 }
 
 /// Central mutable editor state.
@@ -257,16 +316,25 @@ pub(crate) struct EditorState {
     pub(crate) block_model_interaction_resolution_divisor: u32,
     pub(crate) frame_counter_enabled: bool,
     pub(crate) measured_fps: Option<f32>,
+    /// Developer view: colour each surface chunk distinctly to visualise the
+    /// Morton spatial chunking (and drive the chunk-cull stats readout).
+    pub(crate) debug_chunk_coloring: bool,
+    /// `(rendered, total)` surface chunks from the last frame; shown in the
+    /// status bar while `debug_chunk_coloring` is on.
+    pub(crate) debug_chunk_stats: Option<(u32, u32)>,
+    /// Transient status-bar message from a background task (e.g. "Saving to …").
+    /// `None` shows nothing; the field is updated from `poll_saves` each frame.
+    pub(crate) status_message: Option<StatusBarMessage>,
     pub(crate) active_tool: ActiveTool,
     pub(crate) cursor_mode: CursorMode,
     pub(crate) tool_line_color: [f32; 4],
-    pub(crate) tool_fill_color: [f32; 4],
     pub(crate) tool_line_weight: f32,
     pub(crate) tool_hatch: ToolHatch,
     /// Active drawing layer, if any.
     pub(crate) active_layer: Option<LayerId>,
     /// Live world coordinate under the cursor (z on the active pick plane).
     pub(crate) cursor_world: Option<DVec3>,
+    pub(crate) new_layer_dialog_open: bool,
     pub(crate) new_layer_name: String,
     pub(crate) new_layer_project_index: Option<usize>,
     /// Active layer rename: (project_index, layer_id, name_buffer).
@@ -278,6 +346,7 @@ pub(crate) struct EditorState {
     pub(crate) pending_stroke: Vec<DVec3>,
     pub(crate) measurement_start: Option<DVec3>,
     pub(crate) measurement_end: Option<DVec3>,
+    pub(crate) berm_angle_points: Vec<DVec3>,
 
     // Text editing
     /// Chars accumulated for an in-progress MakeText.
@@ -290,8 +359,6 @@ pub(crate) struct EditorState {
     pub(crate) text_edit_focus_requested: bool,
     pub(crate) text_edit_created: bool,
     /// Dirty state of the active project before the new-text AddObject was committed.
-    /// Used to restore the dirty flag when the user cancels text creation.
-    pub(crate) text_edit_was_dirty: bool,
     /// Whether the text properties popup is open.
     pub(crate) text_editing_enabled: bool,
     /// The ObjectId of the actively edited text label.
@@ -320,7 +387,6 @@ pub(crate) struct EditorState {
     pub(crate) move_to_layer_dialog: Option<MoveToLayerDialog>,
     pub(crate) set_selection_z_dialog: Option<crate::ui::dialogs::SetSelectionZDialog>,
     pub(crate) move_layer_dialog: Option<MoveLayerDialog>,
-    pub(crate) file_operation_dialog: Option<FileOperationDialog>,
 
     // Display overrides
     pub(crate) xray_enabled: bool,
@@ -337,7 +403,7 @@ pub(crate) struct EditorState {
     // Offset Element tool
     pub(crate) offset_dialog_open: bool,
     pub(crate) offset_target_id: Option<ObjectId>,
-    pub(crate) offset_projection: OffsetProjection,
+    pub(crate) offset_target_ids: Vec<ObjectId>,
     pub(crate) offset_angle_degrees: f64,
     pub(crate) offset_measure: OffsetMeasure,
     pub(crate) offset_value_input: f64,
@@ -351,6 +417,9 @@ pub(crate) struct EditorState {
     /// individually (by its own elevation) along `tan(angle)` so the whole result
     /// lands flat at `target_rl`. Fields are `(tan_angle, target_rl)`.
     pub(crate) offset_project_to_rl: Option<(f64, f64)>,
+    /// Clamp offset vertices to the first visible triangulation they hit along
+    /// the requested offset vector.
+    pub(crate) offset_collide_with_triangulation: bool,
     /// Preview polygon vertices in world coordinates.
     pub(crate) offset_preview_world: Vec<DVec3>,
     /// Source vertices matching `offset_preview_world`, used for offset guide connectors.
@@ -359,6 +428,9 @@ pub(crate) struct EditorState {
     pub(crate) offset_preview_screen_px: Vec<(f32, f32)>,
     /// Source vertices projected to physical-pixel screen coordinates this frame.
     pub(crate) offset_source_screen_px: Vec<(f32, f32)>,
+    /// Preview screen ranges as `(start, end, closed)` so multiple offset
+    /// previews are drawn independently.
+    pub(crate) offset_preview_ranges: Vec<(usize, usize, bool)>,
     /// Whether the preview geometry is closed (polygon) or open (polyline).
     pub(crate) offset_preview_closed: bool,
 
@@ -405,6 +477,10 @@ pub(crate) struct EditorState {
     pub(crate) fuse_chain_tail: Option<DVec3>,
     /// Opposite endpoint offered to close a single open source polyline.
     pub(crate) fuse_close_marker: Option<DVec3>,
+    // Split At Points tool
+    pub(crate) split_poly_id: Option<ObjectId>,
+    pub(crate) split_selected_verts: [Option<usize>; 2],
+    pub(crate) split_poly_verts_screen_px: Vec<(f32, f32)>,
 
     // Chamfer tool
     pub(crate) chamfer_radius: f64,
@@ -475,6 +551,7 @@ pub(crate) struct EditorState {
     // Create Triangulation workflow
     pub(crate) tri_create_open: bool,
     pub(crate) tri_create_phase: TriCreatePhase,
+    pub(crate) tri_create_source: TriCreateSource,
     /// A failed Create Triangulation run, kept so the failure dialog can
     /// offer a coarse-weld retry with the same inputs.
     pub(crate) tri_create_failure: Option<TriCreateFailure>,
@@ -534,6 +611,16 @@ pub(crate) struct EditorState {
     pub(crate) tri_contour_major_color: [f32; 4],
     pub(crate) tri_contour_minor_color: [f32; 4],
     pub(crate) tri_contour_project_index: usize,
+    pub(crate) tri_contour_use_z_range: bool,
+    pub(crate) tri_contour_z_min_input: f64,
+    pub(crate) tri_contour_z_max_input: f64,
+    pub(crate) point_cloud_tin_open: bool,
+    pub(crate) point_cloud_tin_cloud_id: Option<PointCloudId>,
+    pub(crate) point_cloud_tin_name_input: String,
+    /// Maximum terrain TIN edge length. 0 disables edge filtering.
+    pub(crate) point_cloud_tin_max_edge: f64,
+    /// Input clouds larger than this are subsampled first.
+    pub(crate) point_cloud_tin_max_points: u32,
 
     // Block Models
     pub(crate) block_model_table_pages: HashMap<BlockModelId, usize>,
@@ -591,6 +678,7 @@ pub(crate) struct EditorState {
     pub(crate) batter_berm_source_screen_px: Vec<OptionalScreenPointPx>,
     pub(crate) batter_berm_guides_screen_px: Vec<(OptionalScreenPointPx, OptionalScreenPointPx)>,
     pub(crate) batter_berm_preview_closed: bool,
+    pub(crate) batter_berm_preview_key: Option<BatterBermPreviewKey>,
 
     // Bezier tool
     pub(crate) bezier_poly_id: Option<ObjectId>,
@@ -613,8 +701,22 @@ pub(crate) struct EditorState {
     /// Which CP handle is hovered (0 = cp1, 1 = cp2), None if neither.
     pub(crate) bezier_hover_cp: Option<u8>,
     pub(crate) bezier_dialog_open: bool,
-    /// Determins what prefrences to show in the prefrences tab
-    pub(crate) active_prefrence_catagory: PrefrenceCatagory,
+    /// Determines what preferences to show in the preferences tab
+    pub(crate) active_preference_category: PreferenceCategory,
+    pub(crate) show_import: bool,
+    pub(crate) show_export: bool,
+    /// What filetype should be selected in the import/export menu
+    pub(crate) data_menu: DataMenu,
+    pub(crate) import_source_menu: DataMenu,
+    pub(crate) import_source_paths: Vec<PathBuf>,
+    pub(crate) import_dxf_as_pidb: bool,
+    pub(crate) import_dxf_project_index: Option<usize>,
+    pub(crate) import_bmf_path: Option<PathBuf>,
+    pub(crate) import_bdf_path: Option<PathBuf>,
+    pub(crate) export_dxf_layer: bool,
+    pub(crate) export_project_index: Option<usize>,
+    pub(crate) export_layer: Option<(usize, LayerId)>,
+    pub(crate) export_triangulation: Option<TriangulationId>,
 }
 
 impl EditorState {
@@ -631,6 +733,7 @@ impl EditorState {
             block_model_interaction_resolution_divisor: self
                 .block_model_interaction_resolution_divisor,
             frame_counter_enabled: self.frame_counter_enabled,
+            debug_chunk_coloring: self.debug_chunk_coloring,
         }
     }
 
@@ -652,7 +755,7 @@ impl EditorState {
             translucent_handles: HashSet::new(),
             topology_wireframes_enabled: false,
             dark_mode: false,
-            show_console: false,
+            show_console: true,
             show_world_axis_gizmo: crate::app::io::default_show_world_axis_gizmo(),
             renderer_background_color: crate::app::io::default_renderer_background_color(),
             preferences_draft: None,
@@ -663,14 +766,17 @@ impl EditorState {
                 crate::app::io::default_block_model_interaction_resolution_divisor(),
             frame_counter_enabled: false,
             measured_fps: None,
+            debug_chunk_coloring: false,
+            debug_chunk_stats: None,
+            status_message: None,
             active_tool: ActiveTool::None,
             cursor_mode: CursorMode::Select,
             tool_line_color: [1.0, 1.0, 1.0, 1.0],
-            tool_fill_color: [1.0, 1.0, 1.0, 1.0],
             tool_line_weight: 1.0,
             tool_hatch: ToolHatch::Clear,
             active_layer: None,
             cursor_world: None,
+            new_layer_dialog_open: false,
             new_layer_name: "design".to_owned(),
             new_layer_project_index: None,
             renaming_layer: None,
@@ -678,6 +784,7 @@ impl EditorState {
             pending_stroke: Vec::new(),
             measurement_start: None,
             measurement_end: None,
+            berm_angle_points: Vec::new(),
             pending_text: String::new(),
             pending_text_height: 15.0,
             pending_text_rotation_degrees: 0.0,
@@ -685,7 +792,6 @@ impl EditorState {
             text_edit_position_frames: 0,
             text_edit_focus_requested: false,
             text_edit_created: false,
-            text_edit_was_dirty: false,
             text_editing_enabled: false,
             editing_labels_id: None,
             cursor_snapped: false,
@@ -699,7 +805,6 @@ impl EditorState {
             move_to_layer_dialog: None,
             set_selection_z_dialog: None,
             move_layer_dialog: None,
-            file_operation_dialog: None,
             xray_enabled: false,
             vertical_exaggeration_dialog_open: false,
             vertical_exaggeration: 1.0,
@@ -709,7 +814,7 @@ impl EditorState {
             selection_box_current_px: None,
             offset_dialog_open: false,
             offset_target_id: None,
-            offset_projection: OffsetProjection::Horizontal,
+            offset_target_ids: Vec::new(),
             offset_angle_degrees: 60.0,
             offset_measure: OffsetMeasure::Distance,
             offset_value_input: 0.0,
@@ -717,10 +822,12 @@ impl EditorState {
             offset_horiz_dist: 0.0,
             offset_z_delta: 0.0,
             offset_project_to_rl: None,
+            offset_collide_with_triangulation: false,
             offset_preview_world: Vec::new(),
             offset_source_world: Vec::new(),
             offset_preview_screen_px: Vec::new(),
             offset_source_screen_px: Vec::new(),
+            offset_preview_ranges: Vec::new(),
             offset_preview_closed: false,
             relimit_dialog_open: false,
             relimit_source_id: None,
@@ -746,6 +853,9 @@ impl EditorState {
             fuse_endpoint_markers: Vec::new(),
             fuse_chain_tail: None,
             fuse_close_marker: None,
+            split_poly_id: None,
+            split_selected_verts: [None; 2],
+            split_poly_verts_screen_px: Vec::new(),
             chamfer_radius: 1.0,
             chamfer_segments: 8,
             chamfer_max_radius: f64::MAX,
@@ -785,6 +895,7 @@ impl EditorState {
             confirm_load_all_folder: None,
             tri_create_open: false,
             tri_create_phase: TriCreatePhase::MainDialog,
+            tri_create_source: TriCreateSource::Polygons,
             tri_create_failure: None,
             tri_create_picker_px: None,
             tri_hover_handles: HashSet::new(),
@@ -824,6 +935,14 @@ impl EditorState {
             tri_contour_major_color: [1.0, 0.5, 0.0, 1.0],
             tri_contour_minor_color: [0.8, 0.8, 0.8, 1.0],
             tri_contour_project_index: 0,
+            tri_contour_use_z_range: false,
+            tri_contour_z_min_input: 0.0,
+            tri_contour_z_max_input: 100.0,
+            point_cloud_tin_open: false,
+            point_cloud_tin_cloud_id: None,
+            point_cloud_tin_name_input: String::new(),
+            point_cloud_tin_max_edge: 0.0,
+            point_cloud_tin_max_points: 150_000,
             block_model_table_pages: HashMap::new(),
             viewport_block_model_id: None,
             block_model_variable_ranges: HashMap::new(),
@@ -864,6 +983,7 @@ impl EditorState {
             batter_berm_source_screen_px: Vec::new(),
             batter_berm_guides_screen_px: Vec::new(),
             batter_berm_preview_closed: false,
+            batter_berm_preview_key: None,
             bezier_poly_id: None,
             bezier_selected_verts: [None; 2],
             bezier_cp1: [0.0; 3],
@@ -876,7 +996,20 @@ impl EditorState {
             bezier_dragging_cp: None,
             bezier_hover_cp: None,
             bezier_dialog_open: false,
-            active_prefrence_catagory: PrefrenceCatagory::Interface,
+            active_preference_category: PreferenceCategory::Interface,
+            show_import: false,
+            show_export: false,
+            data_menu: DataMenu::None,
+            import_source_menu: DataMenu::None,
+            import_source_paths: Vec::new(),
+            import_dxf_as_pidb: true,
+            import_dxf_project_index: None,
+            import_bmf_path: None,
+            import_bdf_path: None,
+            export_dxf_layer: false,
+            export_project_index: None,
+            export_layer: None,
+            export_triangulation: None,
         }
     }
 
@@ -942,46 +1075,6 @@ impl EditorState {
     }
 }
 
-/// Kind of file import or export operation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FileOperationKind {
-    ImportLayers,
-    ImportPidb,
-    ImportTriangulation,
-    ImportBlockModel,
-    ExportLayer,
-    ExportPidb,
-    ExportTriangulation,
-}
-
-/// State for an in-progress file import or export dialog.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct FileOperationDialog {
-    pub(crate) kind: FileOperationKind,
-    pub(crate) project_index: Option<usize>,
-    pub(crate) layer: Option<(usize, LayerId)>,
-    pub(crate) triangulation: Option<TriangulationId>,
-    pub(crate) mesh_format: MeshFormat,
-    pub(crate) source_path: Option<PathBuf>,
-    pub(crate) bmf_path: Option<PathBuf>,
-    pub(crate) bdf_path: Option<PathBuf>,
-}
-
-impl FileOperationDialog {
-    pub(crate) fn new(kind: FileOperationKind) -> Self {
-        Self {
-            kind,
-            project_index: None,
-            layer: None,
-            triangulation: None,
-            mesh_format: MeshFormat::Obj,
-            source_path: None,
-            bmf_path: None,
-            bdf_path: None,
-        }
-    }
-}
-
 /// How a canvas pick modifies the selection set.
 #[derive(Clone, Copy)]
 pub(crate) enum SelectionMode {
@@ -994,7 +1087,6 @@ pub(crate) enum SelectionMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActiveTool {
     None,
-    NewLayer,
     MakePoint,
     MakeLine,
     MakePoly,
@@ -1002,10 +1094,12 @@ pub(crate) enum ActiveTool {
     MakeRoad,
     DeleteElement,
     MeasureDistance,
+    MeasureBermAngle,
     OffsetElement,
     RelimitLine,
     ExplodePolygon,
     FuseIntoPolygon,
+    SplitAtPoints,
     Move,
     Chamfer,
     BatterBermOffset,
@@ -1076,13 +1170,23 @@ impl ToolHatch {
 /// matches on these in its event loop.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum UiCommand {
+    SetActiveTool(ActiveTool),
+    SetFlyModeEnabled(bool),
     NewPidb,
     OpenPidb,
     CloseStartupDialog,
     SaveAllPidbs,
-    ImportDxfInto(usize),
-    ImportTriangulation,
-    OpenImportBlockModel,
+    ImportAsPidbPaths(DataMenu, Vec<PathBuf>),
+    ImportDxfPathsInto(usize, Vec<PathBuf>),
+    ImportTriangulationPaths(Vec<PathBuf>),
+    ImportPointCloudPaths(Vec<PathBuf>),
+    LoadPointCloud(PathBuf),
+    ClosePointCloud(crate::model::point_cloud::PointCloudId),
+    TogglePointCloudVisible(crate::model::point_cloud::PointCloudId),
+    RemovePointCloud(PathBuf),
+    RevealPointCloud(crate::model::point_cloud::PointCloudId),
+    ChooseImportSourceFiles(DataMenu),
+    OpenPidbPaths(Vec<PathBuf>),
     ChooseBlockModelBmf,
     ChooseBlockModelBdf,
     ConfirmImportBlockModel {
@@ -1090,30 +1194,31 @@ pub(crate) enum UiCommand {
         bdf_path: Option<PathBuf>,
     },
     ExportPidbDxf(usize),
+    ExportPidbCopy(usize),
     ExportLayerDxf(usize, LayerId),
-    ExportTriangulation(TriangulationId),
+    ExportTriangulationAs(TriangulationId, MeshFormat),
     SaveTriangulationAs(TriangulationId),
     SaveAndCloseTriangulationAs(TriangulationId),
     RevealTriangulation(TriangulationId),
     RevealBlockModel(BlockModelId),
-    OpenFileOperation(FileOperationKind),
-    CloseFileOperation,
-    ChooseDgdIsisSource,
-    ConfirmImportDgdIsis,
     RequestExit,
     SaveAndExit,
     ExitWithoutSaving,
+    CancelExit,
     CreateLayer {
         project_index: usize,
         name: String,
     },
     FinishPolyClose,
-    FinishPolyOpen,
+    CommitStrokeOpen,
+    CancelOffset,
+    CancelRelimit,
     ResetView,
     SetTopologyWireframes(bool),
     SetDarkMode(bool),
     SetShowConsole(bool),
     SetShowWorldAxisGizmo(bool),
+    SetDebugChunkColoring(bool),
     SetStandardView(StandardView),
     ApplyPreferences(PreferencesDraft),
     OpenPreferences,
@@ -1205,7 +1310,7 @@ pub(crate) enum UiCommand {
     ZoomToExtents,
     /// Dialog "Apply" pressed — begin the canvas side-pick phase.
     BeginOffsetPick {
-        object_id: ObjectId,
+        object_ids: Vec<ObjectId>,
         /// Absolute horizontal offset distance (sign determined by cursor).
         horiz_dist: f64,
         /// Z shift to apply to all new vertices.
@@ -1214,6 +1319,9 @@ pub(crate) enum UiCommand {
         /// individually along `(tan_angle, target_rl)` so it lands flat at
         /// `target_rl` (angled batter projection to an absolute RL).
         project_to_rl: Option<(f64, f64)>,
+        /// Clamp each offset vertex to the first visible triangulation hit
+        /// between the source vertex and the requested offset endpoint.
+        collide_with_triangulation: bool,
     },
     RelimitLineResize {
         source_id: ObjectId,
@@ -1233,6 +1341,10 @@ pub(crate) enum UiCommand {
     CancelBatterBerm,
     /// Open the Create Triangulation main dialog.
     OpenCreateTriangulation,
+    /// Open the road-to-triangulation dialog.
+    OpenConvertRoadsToTriangulation,
+    /// Replace selected road objects with their resolved polyline representation.
+    ConvertSelectedRoadsToPolylines,
     /// Open the Set selections to Z value.
     OpenSetSelectionZValueDialog,
     /// Run CDT on the supplied object list and add the result as a loaded triangulation.
@@ -1241,12 +1353,26 @@ pub(crate) enum UiCommand {
         object_ids: Vec<ObjectId>,
         surface_type: TriSurfaceType,
     },
+    /// Convert selected road objects to a triangulation mesh.
+    ExecuteConvertRoadsToTriangulation {
+        name: String,
+        object_ids: Vec<ObjectId>,
+    },
     /// Retry a failed Create Triangulation with breakline endpoints welded
     /// at the coarse (cm-scale) tolerance the failure dialog offered.
     ExecuteCreateTriangulationWithWeld {
         name: String,
         object_ids: Vec<ObjectId>,
         surface_type: TriSurfaceType,
+    },
+    /// Open the point cloud terrain TIN dialog (Survey menu).
+    OpenPointCloudTin,
+    /// Reconstruct a terrain TIN from a point cloud.
+    ExecutePointCloudTin {
+        cloud_id: PointCloudId,
+        name: String,
+        max_edge: f64,
+        max_points: u32,
     },
     /// Load all layers in the given project (no confirmation needed).
     LoadAllLayersInProject(usize),
@@ -1326,6 +1452,8 @@ pub(crate) enum UiCommand {
         major_color: [f32; 4],
         minor_color: [f32; 4],
         project_index: usize,
+        /// Optional `(min, max)` RL band to contour instead of the full mesh.
+        z_range: Option<(f64, f64)>,
     },
 }
 
@@ -1362,6 +1490,16 @@ pub(crate) struct UiProjectEntry {
 
 /// One triangulation shown in the explorer tree (individual file or within a folder group).
 #[derive(Clone, Debug)]
+pub(crate) struct UiPointCloudEntry {
+    pub(crate) id: Option<crate::model::point_cloud::PointCloudId>,
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    pub(crate) visible: bool,
+    pub(crate) is_loaded: bool,
+    pub(crate) point_count: usize,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct UiTriangulationEntry {
     pub(crate) id: Option<TriangulationId>,
     pub(crate) name: String,
@@ -1395,6 +1533,7 @@ pub(crate) struct UiProjectView {
     pub(crate) projects: Vec<UiProjectEntry>,
     pub(crate) triangulations: Vec<UiTriangulationEntry>,
     pub(crate) block_models: Vec<UiBlockModelEntry>,
+    pub(crate) point_clouds: Vec<UiPointCloudEntry>,
     pub(crate) active_index: Option<usize>,
     pub(crate) needs_startup_dialog: bool,
     /// Full filesystem path of the currently active PIDB, if any.
@@ -1404,7 +1543,25 @@ pub(crate) struct UiProjectView {
 }
 
 #[derive(PartialEq)]
-pub(crate) enum PrefrenceCatagory {
+pub(crate) enum PreferenceCategory {
     Interface,
-    Preformance,
+    Performance,
+    Developer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DataMenu {
+    None,
+    Dxf,
+    Pidb,
+    DgdIsis,
+    Duf,
+    Tri00t,
+    Obj,
+    Stl,
+    Ply,
+    Las,
+    Xyz,
+    Pcd,
+    Bmf,
 }

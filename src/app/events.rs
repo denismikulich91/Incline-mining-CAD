@@ -43,10 +43,6 @@ impl<'a> App<'a> {
             return;
         }
 
-        if self.handle_mouse_fly_control(&event) {
-            return;
-        }
-
         let gui_response = self
             .graphics
             .as_mut()
@@ -110,6 +106,9 @@ impl<'a> App<'a> {
                 WindowEvent::RedrawRequested => {
                     self.poll_triangulation_loads();
                     self.poll_block_model_loads();
+                    self.poll_point_cloud_loads();
+                    self.poll_saves();
+                    self.poll_jobs();
                     let now = Instant::now();
                     let frame_interval = if self.pending_resize.is_some() {
                         super::rate_interval(self.editor.resize_frame_rate_cap)
@@ -154,11 +153,14 @@ impl<'a> App<'a> {
                             &mut self.scene_document,
                             &self.triangulations,
                             &self.block_models,
+                            &self.point_clouds,
                             &project,
                         ) {
                             Ok(ui_output) => {
                                 if let Some(graphics) = self.graphics.as_mut() {
                                     graphics.set_fly_mode_enabled(self.editor.fly_mode_enabled);
+                                    self.editor.debug_chunk_stats =
+                                        Some(graphics.chunk_render_stats);
                                 }
                                 if let Some(layer_id) = self.editor.active_layer
                                     && let Some(index) =
@@ -204,7 +206,7 @@ impl<'a> App<'a> {
                                 }
                                 if self.editor.active_tool != ActiveTool::ExplodePolygon
                                     && self.editor.tool_highlight_id.is_some()
-                                    && self.editor.offset_target_id.is_none()
+                                    && self.editor.offset_target_ids.is_empty()
                                     && self.editor.batter_berm_target_id.is_none()
                                     && !self.editor.tri_cut_poly_open
                                 {
@@ -242,6 +244,11 @@ impl<'a> App<'a> {
                                 {
                                     self.fuse_init_from_selection();
                                 }
+                                if self.editor.active_tool == ActiveTool::SplitAtPoints
+                                    && self.editor.split_poly_id.is_none()
+                                {
+                                    self.split_init_from_selection();
+                                }
                             }
                             Err(RenderSurfaceError::Lost | RenderSurfaceError::Outdated) => {
                                 graphics.reconfigure();
@@ -276,6 +283,7 @@ impl<'a> App<'a> {
                             | ActiveTool::MakePoly
                             | ActiveTool::MakeText
                             | ActiveTool::MeasureDistance
+                            | ActiveTool::MeasureBermAngle
                             | ActiveTool::MakeRoad
                     );
                     let is_scrolling = self
@@ -299,11 +307,18 @@ impl<'a> App<'a> {
                     let snapped = if snap_eligible && snap_poll_due {
                         self.last_snap_poll_instant = Some(now);
                         self.refresh_snap_index();
+                        // Line snapping targets resolved road centerlines;
+                        // hand it the cached ghost-free network so the snap
+                        // query never re-resolves the whole network per poll.
+                        if self.editor.cursor_mode == crate::ui::state::CursorMode::SnapToLine {
+                            self.refresh_scene_road_network();
+                        }
                         let document = &self.scene_document;
                         self.graphics.as_ref().and_then(|g| {
                             g.snap_cursor(
                                 document,
                                 &self.snap_index,
+                                self.scene_road_network.as_ref(),
                                 &self.triangulations,
                                 &self.editor.hidden_handles,
                                 &self.editor.frozen_handles,
@@ -319,7 +334,8 @@ impl<'a> App<'a> {
                     let was_snapped = self.editor.cursor_snapped;
                     let effective = snapped.or(raw);
                     self.editor.cursor_snapped = snapped.is_some();
-                    if self.editor.cursor_world != effective {
+                    let cursor_world_changed = self.editor.cursor_world != effective;
+                    if cursor_world_changed {
                         self.editor.cursor_world = effective;
                         self.redraw_requested = true;
                     }
@@ -364,14 +380,18 @@ impl<'a> App<'a> {
                                 crate::app::PICK_THRESHOLD_PX * 2.5,
                             );
                             let hover_px = nearest.and_then(|(oid, _vi, world)| {
-                                let is_closed =
+                                let is_closed_polygon =
                                     self.scene_document.get_object(oid).is_some_and(|o| {
                                         matches!(
                                             o,
-                                            crate::model::Object::Polyline { closed: true, .. }
+                                            crate::model::Object::Polyline {
+                                                verts,
+                                                closed: true,
+                                                ..
+                                            } if verts.len() >= 3
                                         )
                                     });
-                                if !is_closed {
+                                if !is_closed_polygon {
                                     return None;
                                 }
                                 crate::rendering::pick::world_to_screen(&vp, world, screen)
@@ -383,9 +403,19 @@ impl<'a> App<'a> {
                             }
                         }
                     }
-                    if self.editor.active_tool == ActiveTool::DeleteElement {
+                    let hover_pick_due = snap_poll_due
+                        && (self.editor.active_tool == ActiveTool::DeleteElement
+                            || self.editor.active_tool == ActiveTool::ExplodePolygon
+                            || self.editor.relimit_waiting_for_pick
+                            || self.editor.relimit_confirming_end);
+                    if hover_pick_due {
+                        self.last_snap_poll_instant = Some(now);
+                    }
+                    if self.editor.active_tool == ActiveTool::DeleteElement && hover_pick_due {
                         self.update_delete_hover_vertex();
-                    } else if self.editor.delete_hover_vertex_px.is_some() {
+                    } else if self.editor.active_tool != ActiveTool::DeleteElement
+                        && self.editor.delete_hover_vertex_px.is_some()
+                    {
                         self.editor.delete_hover_vertex_px = None;
                         self.invalidate_overlay();
                     }
@@ -477,12 +507,24 @@ impl<'a> App<'a> {
                             self.invalidate_overlay();
                         }
                     }
-                    self.update_relimit_hover_end();
+                    if hover_pick_due {
+                        self.update_relimit_hover_end();
+                    }
                     self.update_offset_preview();
-                    if self.editor.active_tool == ActiveTool::MakeRoad {
+                    let road_preview_due =
+                        self.last_road_preview_update_instant
+                            .is_none_or(|last_update| {
+                                now.duration_since(last_update)
+                                    >= super::rate_interval(self.editor.snap_poll_rate)
+                            });
+                    if self.editor.active_tool == ActiveTool::MakeRoad
+                        && cursor_world_changed
+                        && road_preview_due
+                    {
+                        self.last_road_preview_update_instant = Some(now);
                         self.update_road_preview();
                     }
-                    if self.editor.active_tool == ActiveTool::ExplodePolygon {
+                    if self.editor.active_tool == ActiveTool::ExplodePolygon && hover_pick_due {
                         self.update_explode_hover();
                     }
                     if !self.editor.pending_stroke.is_empty()
@@ -494,6 +536,7 @@ impl<'a> App<'a> {
                         || self.gizmo_drag.is_some()
                         || self.editor.active_tool == ActiveTool::Move
                         || self.editor.active_tool == ActiveTool::MeasureDistance
+                        || self.editor.active_tool == ActiveTool::MeasureBermAngle
                         || self.editor.active_tool == ActiveTool::DeleteElement
                         || self.editor.active_tool == ActiveTool::Chamfer
                         || self.editor.active_tool == ActiveTool::MakeRoad
@@ -552,6 +595,7 @@ impl<'a> App<'a> {
                 }
                 ActiveTool::MakeRoad => self.place_road_point(),
                 ActiveTool::MeasureDistance => self.measure_distance_click(),
+                ActiveTool::MeasureBermAngle => self.measure_berm_angle_click(),
                 ActiveTool::DeleteElement => {
                     self.editor.selection_box_start_px = self.editor.cursor_screen_px;
                     self.editor.selection_box_current_px = self.editor.cursor_screen_px;
@@ -592,6 +636,7 @@ impl<'a> App<'a> {
                 }
                 ActiveTool::ExplodePolygon => self.explode_at_cursor(),
                 ActiveTool::FuseIntoPolygon => self.fuse_click(),
+                ActiveTool::SplitAtPoints => self.split_at_points_click(),
                 ActiveTool::RelimitLine => self.relimit_line_click(),
                 ActiveTool::OffsetElement => {
                     if self.editor.offset_awaiting_side_pick {
@@ -750,6 +795,10 @@ impl<'a> App<'a> {
             } = event
         {
             match key {
+                KeyCode::KeyZ if self.modifiers.shift_key() => {
+                    userspace_log!("Ctrl+Shift+Z");
+                    self.apply_history_step(false)
+                }
                 KeyCode::KeyZ => {
                     userspace_log!("Ctrl+Z");
                     self.apply_history_step(true)
@@ -758,11 +807,21 @@ impl<'a> App<'a> {
                     userspace_log!("Ctrl+Y");
                     self.apply_history_step(false)
                 }
+                KeyCode::KeyS => {
+                    userspace_log!("Ctrl+S");
+                    if let Err(error) = self.save_all_dirty_projects() {
+                        userspace_error!("Couldn't save: {}", error);
+                    }
+                }
+                KeyCode::KeyA => {
+                    userspace_log!("Ctrl+A");
+                    self.select_all_active_objects();
+                }
+                KeyCode::KeyD => {
+                    userspace_log!("Ctrl+D");
+                    self.duplicate_selection();
+                }
                 _ => {}
-            }
-            if *key == KeyCode::KeyD {
-                userspace_log!("Ctrl+D");
-                self.duplicate_selection();
             }
         }
     }
@@ -811,29 +870,6 @@ impl<'a> App<'a> {
         }
     }
 
-    fn handle_mouse_fly_control(&mut self, event: &WindowEvent) -> bool {
-        if !self.editor.fly_mode_enabled {
-            return false;
-        }
-
-        matches!(
-            event,
-            WindowEvent::KeyboardInput {
-                event: KeyEvent {
-                    physical_key: PhysicalKey::Code(
-                        KeyCode::Enter
-                            | KeyCode::NumpadEnter
-                            | KeyCode::Escape
-                            | KeyCode::Delete
-                            | KeyCode::Backspace
-                    ),
-                    ..
-                },
-                ..
-            }
-        )
-    }
-
     fn handle_key_code(&mut self, key: KeyCode) {
         match &key {
             KeyCode::Escape => {
@@ -847,27 +883,20 @@ impl<'a> App<'a> {
                 } else if self.editor.offset_awaiting_side_pick || self.editor.offset_dialog_open {
                     self.cancel_offset();
                     userspace_log!("Escape cancelled offset tool");
-                } else if self.editor.relimit_confirming_end || self.editor.relimit_waiting_for_pick
+                } else if self.editor.relimit_confirming_end
+                    || self.editor.relimit_waiting_for_pick
+                    || self.editor.relimit_awaiting_source_pick
+                    || self.editor.relimit_dialog_open
                 {
-                    self.editor.relimit_confirming_end = false;
-                    self.editor.relimit_waiting_for_pick = false;
-                    self.editor.relimit_awaiting_source_pick = false;
-                    self.editor.relimit_dialog_open = false;
-                    self.editor.relimit_source_id = None;
-                    self.editor.relimit_second_id = None;
-                    self.editor.relimit_intersection_3d = None;
-                    self.editor.relimit_candidates.clear();
-                    self.editor.relimit_hover_target_id = None;
-                    self.editor.relimit_hover_target_screen_px.clear();
-                    self.editor.relimit_preview_from_px = None;
-                    self.editor.relimit_preview_to_px = None;
-                    self.editor.active_tool = ActiveTool::None;
-                    self.invalidate_overlay();
+                    self.cancel_relimit();
                     userspace_log!("Escape cancelled relimit tool");
                 } else if self.editor.active_tool == ActiveTool::FuseIntoPolygon {
                     self.cancel_fuse();
                     self.editor.active_tool = ActiveTool::None;
                     userspace_log!("Escape cancelled fuse tool");
+                } else if self.editor.active_tool == ActiveTool::SplitAtPoints {
+                    self.cancel_split_at_points();
+                    userspace_log!("Escape cancelled split at points tool");
                 } else if self.editor.active_tool == ActiveTool::Move {
                     self.gizmo_drag = None;
                     self.editor.gizmo_drag_axis_index = None;
@@ -926,12 +955,14 @@ impl<'a> App<'a> {
                     userspace_log!("Enter");
                     if self.editor.active_tool == ActiveTool::MakeRoad {
                         self.commit_road();
-                    } else if self.editor.active_tool == ActiveTool::FuseIntoPolygon {
-                        self.commit_fuse_polygon();
                     } else if self.editor.active_tool == ActiveTool::Move {
                         let d = self.editor.move_panel_delta;
                         self.apply_move_delta(glam::DVec3::new(d[0], d[1], d[2]));
                         self.editor.active_tool = ActiveTool::None;
+                    } else if self.editor.active_tool == ActiveTool::OffsetElement
+                        && self.editor.offset_awaiting_side_pick
+                    {
+                        self.commit_offset();
                     } else {
                         self.try_finish_tool();
                     }
@@ -964,24 +995,14 @@ impl<'a> App<'a> {
         } else if self.editor.relimit_confirming_end
             || self.editor.relimit_waiting_for_pick
             || self.editor.relimit_awaiting_source_pick
+            || self.editor.relimit_dialog_open
         {
-            self.editor.relimit_confirming_end = false;
-            self.editor.relimit_waiting_for_pick = false;
-            self.editor.relimit_awaiting_source_pick = false;
-            self.editor.relimit_dialog_open = false;
-            self.editor.relimit_source_id = None;
-            self.editor.relimit_second_id = None;
-            self.editor.relimit_intersection_3d = None;
-            self.editor.relimit_candidates.clear();
-            self.editor.relimit_hover_target_id = None;
-            self.editor.relimit_hover_target_screen_px.clear();
-            self.editor.relimit_preview_from_px = None;
-            self.editor.relimit_preview_to_px = None;
-            self.editor.active_tool = ActiveTool::None;
-            self.invalidate_overlay();
+            self.cancel_relimit();
         } else if self.editor.active_tool == ActiveTool::FuseIntoPolygon {
             self.cancel_fuse();
             self.editor.active_tool = ActiveTool::None;
+        } else if self.editor.active_tool == ActiveTool::SplitAtPoints {
+            self.cancel_split_at_points();
         } else if self.editor.active_tool == ActiveTool::Move {
             self.gizmo_drag = None;
             self.editor.gizmo_drag_axis_index = None;
@@ -991,15 +1012,103 @@ impl<'a> App<'a> {
             self.editor.tool_highlight_id = None;
             self.editor.active_tool = ActiveTool::None;
             self.invalidate_geometry();
+        } else if self.editor.active_tool == ActiveTool::Chamfer {
+            self.cancel_chamfer();
         } else if self.editor.active_tool == ActiveTool::Bezier {
             self.cancel_bezier();
         } else if self.editor.active_tool == ActiveTool::MakeRoad {
             self.cancel_road();
+        } else if self.editor.active_tool == ActiveTool::BatterBermOffset
+            || self.editor.batter_berm_dialog_open
+            || self.editor.batter_berm_target_id.is_some()
+        {
+            self.cancel_batter_berm();
+        } else if self.editor.active_tool == ActiveTool::MeasureBermAngle {
+            self.editor.berm_angle_points.clear();
+            self.editor.active_tool = ActiveTool::None;
+            self.invalidate_overlay();
         } else if !self.editor.pending_stroke.is_empty() {
             self.discard_stroke();
         } else {
             self.editor.active_tool = ActiveTool::None;
         }
+    }
+
+    pub(crate) fn set_active_tool_from_toolbar(&mut self, tool: ActiveTool) {
+        if self.editor.text_editing_enabled {
+            return;
+        }
+        if self.editor.fly_mode_enabled && tool != ActiveTool::None {
+            return;
+        }
+
+        let previous_tool = self.editor.active_tool;
+        let next_tool = if previous_tool == tool {
+            ActiveTool::None
+        } else {
+            tool
+        };
+
+        match previous_tool {
+            ActiveTool::OffsetElement if next_tool != ActiveTool::OffsetElement => {
+                self.cancel_offset();
+            }
+            ActiveTool::RelimitLine if next_tool != ActiveTool::RelimitLine => {
+                self.cancel_relimit();
+            }
+            ActiveTool::BatterBermOffset if next_tool != ActiveTool::BatterBermOffset => {
+                self.cancel_batter_berm();
+            }
+            ActiveTool::MakeRoad if next_tool != ActiveTool::MakeRoad => {
+                self.cancel_road();
+            }
+            ActiveTool::Bezier if next_tool != ActiveTool::Bezier => {
+                self.cancel_bezier();
+            }
+            ActiveTool::Chamfer if next_tool != ActiveTool::Chamfer => {
+                self.cancel_chamfer();
+            }
+            ActiveTool::SplitAtPoints if next_tool != ActiveTool::SplitAtPoints => {
+                self.cancel_split_at_points();
+            }
+            _ => {}
+        }
+
+        self.editor.active_tool = next_tool;
+        if next_tool != ActiveTool::None {
+            self.editor.new_layer_dialog_open = false;
+        }
+
+        if matches!(
+            tool,
+            ActiveTool::MeasureDistance | ActiveTool::MeasureBermAngle
+        ) {
+            self.editor.measurement_start = None;
+            self.editor.measurement_end = None;
+            self.editor.berm_angle_points.clear();
+        }
+    }
+
+    pub(crate) fn set_fly_mode_enabled(&mut self, enabled: bool) {
+        if self.editor.fly_mode_enabled == enabled {
+            return;
+        }
+
+        if enabled {
+            if self.editor.text_editing_enabled {
+                self.cancel_text_edit();
+            } else {
+                self.cancel_active_tool();
+            }
+            self.finish_left_button_interactions();
+            self.editor.canvas_context_menu_open = false;
+            self.editor.cursor_snapped = false;
+            self.right_press_px = None;
+            self.right_orbit_active = false;
+        }
+
+        self.editor.fly_mode_enabled = enabled;
+        self.redraw_requested = true;
     }
 }
 

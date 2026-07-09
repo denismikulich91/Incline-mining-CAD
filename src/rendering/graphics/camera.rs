@@ -106,6 +106,32 @@ impl<'a> Graphics<'a> {
         .map(|point| self.unexaggerate_point(point))
     }
 
+    /// All pickable CPU geometry: the per-rebuild stream plus every visible
+    /// static stroke chunk. Chunks whose layer is hidden are excluded, matching
+    /// the stream path where hidden objects emit no pick records.
+    pub(super) fn pick_geometry_groups(&self) -> Vec<PickGeometry<'_>> {
+        let mut groups = vec![PickGeometry {
+            records: &self.pick_records,
+            stroke_verts: &self.stroke_vertex_buf,
+            stroke_indices: &self.stroke_index_buf,
+            fill_verts: &self.lyon_buffer.vertices,
+            fill_indices: &self.lyon_buffer.indices,
+        }];
+        for chunk in self.static_strokes.chunks() {
+            if !chunk.layer_visible || chunk.records.is_empty() {
+                continue;
+            }
+            groups.push(PickGeometry {
+                records: &chunk.records,
+                stroke_verts: &chunk.vertices,
+                stroke_indices: &chunk.indices,
+                fill_verts: &[],
+                fill_indices: &[],
+            });
+        }
+        groups
+    }
+
     /// Nearest rendered entity geometry under the cursor, as `(handle, world)`
     /// with the geometry's true world position (including Z). Frozen handles are
     /// visible but excluded from picking. `None` if no geometry is within
@@ -121,11 +147,7 @@ impl<'a> Graphics<'a> {
         let view_proj = self.view_proj();
         let screen = self.screen_size();
         let geometry_hit = pick_nearest(
-            &self.pick_records,
-            &self.stroke_vertex_buf,
-            &self.stroke_index_buf,
-            &self.lyon_buffer.vertices,
-            &self.lyon_buffer.indices,
+            &self.pick_geometry_groups(),
             self.scene_origin,
             &view_proj,
             screen,
@@ -201,30 +223,29 @@ impl<'a> Graphics<'a> {
         let view_proj = self.view_proj();
         let screen = self.screen_size();
 
-        let geometry_hits = self.pick_records.iter().filter_map(|record| {
-            let stroke = record.stroke_range.0 as usize
-                ..(record.stroke_range.1 as usize).min(self.stroke_vertex_buf.len());
-            let fill = record.fill_range.0 as usize
-                ..(record.fill_range.1 as usize).min(self.lyon_buffer.vertices.len());
-            let points = self.stroke_vertex_buf[stroke]
-                .iter()
-                .map(|vertex| vertex.pos)
-                .chain(
-                    self.lyon_buffer.vertices[fill]
-                        .iter()
-                        .map(|vertex| vertex.pos),
-                );
-            let mut any = false;
-            let enclosed = points
-                .filter_map(|position| {
-                    let world = DVec3::from_array(position.map(f64::from)) + self.scene_origin;
-                    crate::rendering::pick::world_to_screen(&view_proj, world, screen)
-                })
-                .all(|point| {
-                    any = true;
-                    point.x >= min_x && point.x <= max_x && point.y >= min_y && point.y <= max_y
-                });
-            (any && enclosed).then_some(record.entity)
+        let groups = self.pick_geometry_groups();
+        let geometry_hits = groups.iter().flat_map(|group| {
+            group.records.iter().filter_map(|record| {
+                let stroke = record.stroke_range.0 as usize
+                    ..(record.stroke_range.1 as usize).min(group.stroke_verts.len());
+                let fill = record.fill_range.0 as usize
+                    ..(record.fill_range.1 as usize).min(group.fill_verts.len());
+                let points = group.stroke_verts[stroke]
+                    .iter()
+                    .map(|vertex| vertex.pos)
+                    .chain(group.fill_verts[fill].iter().map(|vertex| vertex.pos));
+                let mut any = false;
+                let enclosed = points
+                    .filter_map(|position| {
+                        let world = DVec3::from_array(position.map(f64::from)) + self.scene_origin;
+                        crate::rendering::pick::world_to_screen(&view_proj, world, screen)
+                    })
+                    .all(|point| {
+                        any = true;
+                        point.x >= min_x && point.x <= max_x && point.y >= min_y && point.y <= max_y
+                    });
+                (any && enclosed).then_some(record.entity)
+            })
         });
 
         let text_hits = self.text_pick_records.iter().filter_map(|record| {
@@ -261,41 +282,40 @@ impl<'a> Graphics<'a> {
         let view_proj = self.view_proj();
         let screen = self.screen_size();
 
-        let geometry_hits = self.pick_records.iter().filter_map(|record| {
-            let stroke = record.stroke_range.0 as usize
-                ..(record.stroke_range.1 as usize).min(self.stroke_vertex_buf.len());
-            let fill = record.fill_range.0 as usize
-                ..(record.fill_range.1 as usize).min(self.lyon_buffer.vertices.len());
-            let points = self.stroke_vertex_buf[stroke]
-                .iter()
-                .map(|vertex| vertex.pos)
-                .chain(
-                    self.lyon_buffer.vertices[fill]
-                        .iter()
-                        .map(|vertex| vertex.pos),
-                );
-            let any_vertex_inside = points
-                .filter_map(|position| {
-                    let world = DVec3::from_array(position.map(f64::from)) + self.scene_origin;
-                    crate::rendering::pick::world_to_screen(&view_proj, world, screen)
-                })
-                .any(|point| {
-                    point.x >= min_x && point.x <= max_x && point.y >= min_y && point.y <= max_y
+        let groups = self.pick_geometry_groups();
+        let geometry_hits = groups.iter().flat_map(|group| {
+            group.records.iter().filter_map(|record| {
+                let stroke = record.stroke_range.0 as usize
+                    ..(record.stroke_range.1 as usize).min(group.stroke_verts.len());
+                let fill = record.fill_range.0 as usize
+                    ..(record.fill_range.1 as usize).min(group.fill_verts.len());
+                let points = group.stroke_verts[stroke]
+                    .iter()
+                    .map(|vertex| vertex.pos)
+                    .chain(group.fill_verts[fill].iter().map(|vertex| vertex.pos));
+                let any_vertex_inside = points
+                    .filter_map(|position| {
+                        let world = DVec3::from_array(position.map(f64::from)) + self.scene_origin;
+                        crate::rendering::pick::world_to_screen(&view_proj, world, screen)
+                    })
+                    .any(|point| {
+                        point.x >= min_x && point.x <= max_x && point.y >= min_y && point.y <= max_y
+                    });
+                if any_vertex_inside {
+                    return Some(record.entity);
+                }
+                // Cross-select: also include if any segment crosses the box boundary.
+                let any_segment_crosses = record.segments.iter().any(|&[a3, b3]| {
+                    let (Some(a), Some(b)) = (
+                        crate::rendering::pick::world_to_screen(&view_proj, a3, screen),
+                        crate::rendering::pick::world_to_screen(&view_proj, b3, screen),
+                    ) else {
+                        return false;
+                    };
+                    segment_intersects_rect(a, b, min_x, max_x, min_y, max_y)
                 });
-            if any_vertex_inside {
-                return Some(record.entity);
-            }
-            // Cross-select: also include if any segment crosses the box boundary.
-            let any_segment_crosses = record.segments.iter().any(|&[a3, b3]| {
-                let (Some(a), Some(b)) = (
-                    crate::rendering::pick::world_to_screen(&view_proj, a3, screen),
-                    crate::rendering::pick::world_to_screen(&view_proj, b3, screen),
-                ) else {
-                    return false;
-                };
-                segment_intersects_rect(a, b, min_x, max_x, min_y, max_y)
-            });
-            any_segment_crosses.then_some(record.entity)
+                any_segment_crosses.then_some(record.entity)
+            })
         });
 
         let text_hits = self.text_pick_records.iter().filter_map(|record| {
@@ -333,6 +353,8 @@ impl<'a> Graphics<'a> {
         let snap_pt = SceneQuery::snap(
             document,
             snap_index,
+            // Point snapping never touches resolved road geometry.
+            None,
             triangulations,
             hidden,
             frozen,
@@ -375,6 +397,7 @@ impl<'a> Graphics<'a> {
         &self,
         document: &Document,
         snap_index: &crate::model::spatial::ObjectSnapIndex,
+        road_network: Option<&crate::model::road_network::ResolvedNetwork>,
         triangulations: &[OpenTriangulation],
         hidden: &std::collections::HashSet<SceneEntityId>,
         frozen: &std::collections::HashSet<SceneEntityId>,
@@ -389,6 +412,7 @@ impl<'a> Graphics<'a> {
         SceneQuery::snap(
             document,
             snap_index,
+            road_network,
             triangulations,
             hidden,
             frozen,
@@ -408,28 +432,30 @@ impl<'a> Graphics<'a> {
         document: &Document,
         triangulations: &[OpenTriangulation],
         block_models: &[OpenBlockModel],
+        point_clouds: &[OpenPointCloud],
         hidden: &std::collections::HashSet<crate::model::SceneEntityId>,
     ) {
         let screen = self.screen_size();
         let aspect = (screen.0 as f64 / screen.1.max(1.0) as f64).max(1e-9);
 
-        let (center, zoom) = match scene_bounds(document, triangulations, block_models, hidden) {
-            Some((min, max)) => {
-                let center = (min + max) * 0.5;
-                let size = max - min;
-                // Degenerate (single point or all collinear on one axis): unit zoom.
-                if size.length() < 1e-6 {
-                    (center, 1.0_f64)
-                } else {
-                    // Plan view: right == X, up == Y.
-                    let zoom_h = size.y / 2.0;
-                    let zoom_w = size.x / (2.0 * aspect);
-                    // 10 % padding so content never touches the viewport edge.
-                    (center, zoom_h.max(zoom_w) * 1.1)
+        let (center, zoom) =
+            match scene_bounds(document, triangulations, block_models, point_clouds, hidden) {
+                Some((min, max)) => {
+                    let center = (min + max) * 0.5;
+                    let size = max - min;
+                    // Degenerate (single point or all collinear on one axis): unit zoom.
+                    if size.length() < 1e-6 {
+                        (center, 1.0_f64)
+                    } else {
+                        // Plan view: right == X, up == Y.
+                        let zoom_h = size.y / 2.0;
+                        let zoom_w = size.x / (2.0 * aspect);
+                        // 10 % padding so content never touches the viewport edge.
+                        (center, zoom_h.max(zoom_w) * 1.1)
+                    }
                 }
-            }
-            None => (DVec3::ZERO, 1.0_f64),
-        };
+                None => (DVec3::ZERO, 1.0_f64),
+            };
 
         let zoom = zoom.max(1e-4);
         self.projection.zoom = zoom;
@@ -442,9 +468,10 @@ impl<'a> Graphics<'a> {
         self.scene_origin = center;
         self.triangulation_gpu.clear();
         self.block_model_gpu.clear();
+        self.point_cloud_gpu.clear();
         self.geometry_dirty = true;
         // Update znear/zfar immediately so snap/pick work before the first render.
-        self.fit_depth_to_scene(document, triangulations, block_models, hidden);
+        self.fit_depth_to_scene(document, triangulations, block_models, point_clouds, hidden);
     }
 
     /// Frame all visible content while keeping the current camera orientation
@@ -455,9 +482,12 @@ impl<'a> Graphics<'a> {
         document: &Document,
         triangulations: &[OpenTriangulation],
         block_models: &[OpenBlockModel],
+        point_clouds: &[OpenPointCloud],
         hidden: &std::collections::HashSet<crate::model::SceneEntityId>,
     ) {
-        let Some((min, max)) = scene_bounds(document, triangulations, block_models, hidden) else {
+        let Some((min, max)) =
+            scene_bounds(document, triangulations, block_models, point_clouds, hidden)
+        else {
             return;
         };
         let center = (min + max) * 0.5;
@@ -495,9 +525,10 @@ impl<'a> Graphics<'a> {
         self.scene_origin = center;
         self.triangulation_gpu.clear();
         self.block_model_gpu.clear();
+        self.point_cloud_gpu.clear();
         self.geometry_dirty = true;
         // Update znear/zfar immediately so snap/pick work before the first render.
-        self.fit_depth_to_scene(document, triangulations, block_models, hidden);
+        self.fit_depth_to_scene(document, triangulations, block_models, point_clouds, hidden);
     }
 
     pub(crate) fn set_standard_view(&mut self, view: crate::ui::state::StandardView) {
@@ -527,10 +558,12 @@ impl<'a> Graphics<'a> {
         document: &Document,
         triangulations: &[OpenTriangulation],
         block_models: &[OpenBlockModel],
+        point_clouds: &[OpenPointCloud],
         hidden: &std::collections::HashSet<crate::model::SceneEntityId>,
     ) {
         if self.geometry_dirty || self.cached_bounds_document_revision != document.revision() {
-            self.cached_scene_bounds = scene_bounds(document, triangulations, block_models, hidden);
+            self.cached_scene_bounds =
+                scene_bounds(document, triangulations, block_models, point_clouds, hidden);
             self.cached_bounds_document_revision = document.revision();
         }
         let Some((min, max)) = self.cached_scene_bounds else {

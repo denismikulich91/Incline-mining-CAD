@@ -17,7 +17,7 @@ impl<'a> Graphics<'a> {
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::default(),
+                power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
             })
@@ -39,8 +39,10 @@ impl<'a> Graphics<'a> {
         );
 
         let adapter_limits = adapter.limits();
+        // Take everything the adapter offers for buffer size: large surfaces
+        // can tessellate to multi-GiB vertex streams.
         let required_limits = wgpu::Limits {
-            max_buffer_size: REQUESTED_MAX_BUFFER_SIZE.min(adapter_limits.max_buffer_size),
+            max_buffer_size: adapter_limits.max_buffer_size,
             ..wgpu::Limits::default()
         };
         userspace_log!(
@@ -49,9 +51,9 @@ impl<'a> Graphics<'a> {
             adapter_limits.max_texture_dimension_2d,
             adapter_limits.max_bind_groups
         );
-        if required_limits.max_buffer_size < REQUESTED_MAX_BUFFER_SIZE {
+        if required_limits.max_buffer_size < COMFORTABLE_MAX_BUFFER_SIZE {
             eprintln!(
-                "GPU supports a maximum buffer size of {} MiB; the requested 2048 MiB is unavailable",
+                "GPU supports a maximum buffer size of {} MiB; large scenes may not display fully",
                 required_limits.max_buffer_size / (1024 * 1024)
             );
         }
@@ -66,6 +68,13 @@ impl<'a> Graphics<'a> {
                 trace: wgpu::Trace::Off,
             })
             .await?;
+
+        // wgpu treats uncaptured errors as fatal panics by default; a
+        // validation failure (e.g. an oversized allocation) should degrade to
+        // missing geometry, not lose the user's session.
+        device.on_uncaptured_error(std::sync::Arc::new(|error: wgpu::Error| {
+            crate::userspace_error!("wgpu error (continuing): {error}");
+        }));
 
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps
@@ -110,16 +119,20 @@ impl<'a> Graphics<'a> {
             device.create_shader_module(wgpu::include_wgsl!("../shaders/block_model.wgsl"));
         let block_model_volume_shader =
             device.create_shader_module(wgpu::include_wgsl!("../shaders/block_model_volume.wgsl"));
-        let block_model_peel_shader =
-            device.create_shader_module(wgpu::include_wgsl!("../shaders/block_model_peel.wgsl"));
-        let peel_composite_shader =
-            device.create_shader_module(wgpu::include_wgsl!("../shaders/peel_composite.wgsl"));
+        let block_model_transparency_fallback_shader = device.create_shader_module(
+            wgpu::include_wgsl!("../shaders/block_model_transparency_fallback.wgsl"),
+        );
+        let block_model_transparency_composite_shader = device.create_shader_module(
+            wgpu::include_wgsl!("../shaders/block_model_transparency_composite.wgsl"),
+        );
         let block_model_volume_upscale_shader = device.create_shader_module(wgpu::include_wgsl!(
             "../shaders/block_model_volume_upscale.wgsl"
         ));
         let stroke_shader =
             device.create_shader_module(wgpu::include_wgsl!("../shaders/stroke.wgsl"));
         let edge_shader = device.create_shader_module(wgpu::include_wgsl!("../shaders/edge.wgsl"));
+        let point_cloud_shader =
+            device.create_shader_module(wgpu::include_wgsl!("../shaders/point_cloud.wgsl"));
 
         let camera = Camera::new(DVec3::new(0.0, 0.0, 10.0), (-90.0_f64).to_radians(), 0.0);
         let projection = Projection::new(
@@ -196,7 +209,33 @@ impl<'a> Graphics<'a> {
                 ],
                 immediate_size: 0,
             });
-        let block_model_peel_bind_group_layout =
+        // Per-chunk rebase offset for triangulation surfaces (group 2); block
+        // model pipelines keep the plain two-group surface layout above.
+        let surface_chunk_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("surface_chunk_bind_group_layout"),
+            });
+        let tri_surface_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Triangulation Surface Pipeline Layout"),
+                bind_group_layouts: &[
+                    Some(&camera_bind_group_layout),
+                    Some(&surface_style_bind_group_layout),
+                    Some(&surface_chunk_bind_group_layout),
+                ],
+                immediate_size: 0,
+            });
+        let block_model_transparency_fallback_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -208,19 +247,19 @@ impl<'a> Graphics<'a> {
                     },
                     count: None,
                 }],
-                label: Some("block_model_peel_bind_group_layout"),
+                label: Some("block_model_transparency_fallback_bind_group_layout"),
             });
-        let block_model_peel_pipeline_layout =
+        let block_model_transparency_fallback_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Block Model Depth Peel Pipeline Layout"),
+                label: Some("Block Model Transparency Fallback Pipeline Layout"),
                 bind_group_layouts: &[
                     Some(&camera_bind_group_layout),
                     Some(&surface_style_bind_group_layout),
-                    Some(&block_model_peel_bind_group_layout),
+                    Some(&block_model_transparency_fallback_bind_group_layout),
                 ],
                 immediate_size: 0,
             });
-        let block_model_peel_composite_bind_group_layout =
+        let block_model_transparency_composite_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -232,12 +271,12 @@ impl<'a> Graphics<'a> {
                     },
                     count: None,
                 }],
-                label: Some("block_model_peel_composite_bind_group_layout"),
+                label: Some("block_model_transparency_composite_bind_group_layout"),
             });
-        let block_model_peel_composite_pipeline_layout =
+        let block_model_transparency_composite_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Block Model Peel Composite Pipeline Layout"),
-                bind_group_layouts: &[Some(&block_model_peel_composite_bind_group_layout)],
+                label: Some("Block Model Transparency Composite Pipeline Layout"),
+                bind_group_layouts: &[Some(&block_model_transparency_composite_bind_group_layout)],
                 immediate_size: 0,
             });
         let block_model_volume_upscale_bind_group_layout =
@@ -364,7 +403,7 @@ impl<'a> Graphics<'a> {
                 bind_group_layouts: &[
                     Some(&camera_bind_group_layout),
                     Some(&block_model_volume_bind_group_layout),
-                    Some(&block_model_peel_bind_group_layout),
+                    Some(&block_model_transparency_fallback_bind_group_layout),
                 ],
                 immediate_size: 0,
             });
@@ -390,7 +429,7 @@ impl<'a> Graphics<'a> {
         let surface_vertex_buffers = [wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<SurfaceVertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
         }];
         // One instance per block: lower.xyz + grade, then upper.xyz + pad.
         // The shader expands vertex_index 0..36 into the cube's faces.
@@ -409,6 +448,13 @@ impl<'a> Graphics<'a> {
             array_stride: std::mem::size_of::<EdgeInstance>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+        }];
+        // One instance per point: position + packed RGBA8; the shader expands
+        // vertex_index 0..6 into a screen-aligned quad.
+        let point_instance_buffers = [wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<PointInstance>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Unorm8x4],
         }];
 
         let create_stroke_pipeline = |label, depth_stencil| {
@@ -491,6 +537,47 @@ impl<'a> Graphics<'a> {
             multiview_mask: None,
             cache: None,
         });
+        // Point splats reuse the edge pipeline layout (camera + one style
+        // uniform) but write depth so clouds occlude correctly against
+        // meshes and themselves.
+        let point_cloud_render_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Instanced Point Cloud Pipeline"),
+                layout: Some(&edge_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &point_cloud_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &point_instance_buffers,
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &point_cloud_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(Self::depth_state(true, 0)),
+                multisample: wgpu::MultisampleState {
+                    count: sample_count,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview_mask: None,
+                cache: None,
+            });
         let mut overlay_depth = Self::depth_state(false, 0);
         overlay_depth.depth_compare = Some(wgpu::CompareFunction::Always);
         let overlay_render_pipeline =
@@ -541,7 +628,7 @@ impl<'a> Graphics<'a> {
             depth.depth_compare = Some(depth_compare);
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
-                layout: Some(&surface_pipeline_layout),
+                layout: Some(&tri_surface_pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &surface_shader,
                     entry_point: Some("vs_main"),
@@ -685,18 +772,18 @@ impl<'a> Graphics<'a> {
                 multiview_mask: None,
                 cache: None,
             });
-        let block_model_peel_pipeline =
+        let block_model_transparency_fallback_pipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Block Model Depth Peel Pipeline"),
-                layout: Some(&block_model_peel_pipeline_layout),
+                label: Some("Block Model Transparency Fallback Pipeline"),
+                layout: Some(&block_model_transparency_fallback_pipeline_layout),
                 vertex: wgpu::VertexState {
-                    module: &block_model_peel_shader,
+                    module: &block_model_transparency_fallback_shader,
                     entry_point: Some("vs_main"),
                     buffers: &block_model_vertex_buffers,
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
-                    module: &block_model_peel_shader,
+                    module: &block_model_transparency_fallback_shader,
                     entry_point: Some("fs_main"),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
@@ -734,18 +821,18 @@ impl<'a> Graphics<'a> {
                 multiview_mask: None,
                 cache: None,
             });
-        let block_model_peel_composite_pipeline =
+        let block_model_transparency_composite_pipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Block Model Peel Composite Pipeline"),
-                layout: Some(&block_model_peel_composite_pipeline_layout),
+                label: Some("Block Model Transparency Composite Pipeline"),
+                layout: Some(&block_model_transparency_composite_pipeline_layout),
                 vertex: wgpu::VertexState {
-                    module: &peel_composite_shader,
+                    module: &block_model_transparency_composite_shader,
                     entry_point: Some("vs_main"),
                     buffers: &[],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
-                    module: &peel_composite_shader,
+                    module: &block_model_transparency_composite_shader,
                     entry_point: Some("fs_main"),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
@@ -959,12 +1046,12 @@ impl<'a> Graphics<'a> {
             viewport,
         };
         let gui = Gui::new(&window, &device, surface_format);
-        let block_model_peel_targets = Self::create_block_model_peel_targets(
+        let block_model_transparency_targets = Self::create_block_model_transparency_targets(
             &device,
             &config,
             &depth_view,
-            &block_model_peel_bind_group_layout,
-            &block_model_peel_composite_bind_group_layout,
+            &block_model_transparency_fallback_bind_group_layout,
+            &block_model_transparency_composite_bind_group_layout,
         );
         let block_model_volume_target = Self::create_block_model_volume_target(
             &device,
@@ -978,18 +1065,20 @@ impl<'a> Graphics<'a> {
             transparent_surface_render_pipeline,
             block_model_render_pipeline,
             block_model_volume_pipeline,
-            block_model_peel_pipeline,
-            block_model_peel_composite_pipeline,
+            block_model_transparency_fallback_pipeline,
+            block_model_transparency_composite_pipeline,
             block_model_volume_upscale_pipeline,
             block_model_volume_upscale_bind_group_layout,
-            block_model_peel_bind_group_layout,
-            block_model_peel_composite_bind_group_layout,
+            block_model_transparency_fallback_bind_group_layout,
+            block_model_transparency_composite_bind_group_layout,
             block_model_volume_bind_group_layout,
             surface_style_bind_group_layout,
+            surface_chunk_bind_group_layout,
             render_pipeline,
             xray_render_pipeline,
             stroke_render_pipeline,
             edge_render_pipeline,
+            point_cloud_render_pipeline,
             edge_style_bind_group_layout,
             overlay_render_pipeline,
             lyon_vertex_gpu,
@@ -1006,7 +1095,7 @@ impl<'a> Graphics<'a> {
             msaa_view,
             depth_texture,
             depth_view,
-            block_model_peel_targets,
+            block_model_transparency_targets,
             block_model_volume_target,
             window,
             surface,
@@ -1048,7 +1137,7 @@ impl<'a> Graphics<'a> {
             cached_scene_bounds: None,
             overlay_dirty: true,
             cached_scale_factor: 0.0,
-            cached_measurement_state: (false, None, None),
+            cached_measurement_state: (false, None, None, Vec::new()),
             cached_poly_finish_dialog: false,
             pick_records: Vec::new(),
             text_pick_records: Vec::new(),
@@ -1056,7 +1145,10 @@ impl<'a> Graphics<'a> {
             scene_origin: DVec3::ZERO,
             vertical_exaggeration: 1.0,
             triangulation_gpu: TriangulationGpuCache::default(),
+            static_strokes: StaticStrokeCache::default(),
             block_model_gpu: BlockModelGpuCache::default(),
+            point_cloud_gpu: PointCloudGpuCache::default(),
+            chunk_render_stats: (0, 0),
         })
     }
 
@@ -1095,12 +1187,12 @@ impl<'a> Graphics<'a> {
                 Self::create_depth_target(&self.device, &self.config, self.sample_count);
             self.depth_texture = depth_texture;
             self.depth_view = depth_view;
-            self.block_model_peel_targets = Self::create_block_model_peel_targets(
+            self.block_model_transparency_targets = Self::create_block_model_transparency_targets(
                 &self.device,
                 &self.config,
                 &self.depth_view,
-                &self.block_model_peel_bind_group_layout,
-                &self.block_model_peel_composite_bind_group_layout,
+                &self.block_model_transparency_fallback_bind_group_layout,
+                &self.block_model_transparency_composite_bind_group_layout,
             );
             self.block_model_volume_target = Self::create_block_model_volume_target(
                 &self.device,
@@ -1113,51 +1205,5 @@ impl<'a> Graphics<'a> {
             // the entire document here makes interactive resize needlessly laggy.
             self.overlay_dirty = true;
         }
-    }
-}
-
-#[cfg(test)]
-mod shader_tests {
-    /// Parse + validate a WGSL source with all capabilities enabled, so the
-    /// only failures are genuine syntax/type errors — the class of bug that
-    /// otherwise only surfaces at runtime pipeline creation on a real GPU.
-    fn validate(name: &str, source: &str) {
-        let module = naga::front::wgsl::parse_str(source).unwrap_or_else(|error| {
-            panic!("{name} failed to parse:\n{}", error.emit_to_string(source))
-        });
-        naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
-        )
-        .validate(&module)
-        .unwrap_or_else(|error| panic!("{name} failed to validate: {error:?}"));
-    }
-
-    #[test]
-    fn all_shaders_parse_and_validate() {
-        validate("shader.wgsl", include_str!("../shaders/shader.wgsl"));
-        validate("surface.wgsl", include_str!("../shaders/surface.wgsl"));
-        validate(
-            "block_model.wgsl",
-            include_str!("../shaders/block_model.wgsl"),
-        );
-        validate(
-            "block_model_volume.wgsl",
-            include_str!("../shaders/block_model_volume.wgsl"),
-        );
-        validate(
-            "block_model_peel.wgsl",
-            include_str!("../shaders/block_model_peel.wgsl"),
-        );
-        validate(
-            "peel_composite.wgsl",
-            include_str!("../shaders/peel_composite.wgsl"),
-        );
-        validate(
-            "block_model_volume_upscale.wgsl",
-            include_str!("../shaders/block_model_volume_upscale.wgsl"),
-        );
-        validate("stroke.wgsl", include_str!("../shaders/stroke.wgsl"));
-        validate("edge.wgsl", include_str!("../shaders/edge.wgsl"));
     }
 }

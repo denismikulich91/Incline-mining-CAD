@@ -62,6 +62,20 @@ fn aabb_scissor_rect(
 }
 
 impl<'a> Graphics<'a> {
+    /// Scene-origin-relative AABB of a triangulation mesh, in the same space as
+    /// the uploaded surface vertices (`world - scene_origin`, no vertical
+    /// exaggeration — that lives in `view_proj`). Matches `surface_vertex` so a
+    /// frustum built from `camera_uniform.view_proj` culls it correctly.
+    fn mesh_scene_aabb(
+        &self,
+        mesh: &crate::model::formats::tri00t::Triangulation,
+    ) -> (glam::Vec3, glam::Vec3) {
+        let bounds = mesh.bounds();
+        let min = glam::DVec3::new(bounds.min.x, bounds.min.y, bounds.min.z) - self.scene_origin;
+        let max = glam::DVec3::new(bounds.max.x, bounds.max.y, bounds.max.z) - self.scene_origin;
+        (min.as_vec3(), max.as_vec3())
+    }
+
     pub(super) fn render_scene_pass(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -69,6 +83,7 @@ impl<'a> Graphics<'a> {
         editor: &EditorState,
         triangulations: &[OpenTriangulation],
         block_models: &[OpenBlockModel],
+        point_clouds: &[crate::model::point_cloud::OpenPointCloud],
     ) {
         let bg_color = editor.renderer_background_color;
         let clear_color = [
@@ -112,6 +127,35 @@ impl<'a> Graphics<'a> {
             &self.camera_uniform.view_proj,
         ));
 
+        // Developer chunk-debug view: colour each surface chunk distinctly and
+        // report how many chunks survive frustum culling.
+        let debug_chunks = editor.debug_chunk_coloring;
+        let mut rendered_chunks: u32 = 0;
+        let mut total_chunks: u32 = 0;
+
+        // Point splats write depth, so they draw with the opaque geometry —
+        // before the transparent surfaces that must blend over them.
+        if !self.point_cloud_gpu.is_empty() {
+            render_pass.set_pipeline(&self.point_cloud_render_pipeline);
+            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            for point_cloud in point_clouds {
+                if !point_cloud.visible {
+                    continue;
+                }
+                let Some(cached) = self.point_cloud_gpu.get(point_cloud.id) else {
+                    continue;
+                };
+                render_pass.set_bind_group(1, &cached.style_bind_group, &[]);
+                for chunk in &cached.chunks {
+                    if !frustum.intersects_aabb(chunk.bounds_min, chunk.bounds_max) {
+                        continue;
+                    }
+                    render_pass.set_vertex_buffer(0, chunk.instance_buffer.slice(..));
+                    render_pass.draw(0..6, 0..chunk.instance_count);
+                }
+            }
+        }
+
         if !self.triangulation_gpu.is_empty() || !self.block_model_gpu.is_empty() {
             render_pass.set_pipeline(&self.surface_render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
@@ -126,8 +170,26 @@ impl<'a> Graphics<'a> {
                 if cached.color[3] < 0.999 {
                     continue;
                 }
-                render_pass.set_bind_group(1, &cached.surface_style_bind_group, &[]);
+                total_chunks += cached.surface_chunks.len() as u32;
+                // Cheap whole-mesh reject before touching individual chunks.
+                let (aabb_min, aabb_max) = self.mesh_scene_aabb(&triangulation.mesh);
+                if !frustum.intersects_aabb(aabb_min, aabb_max) {
+                    continue;
+                }
+                if !debug_chunks {
+                    render_pass.set_bind_group(1, &cached.surface_style_bind_group, &[]);
+                }
                 for chunk in &cached.surface_chunks {
+                    // Per-chunk frustum cull: chunks are Morton-spatial, so their
+                    // AABBs are tight enough for this to reject real geometry.
+                    if !frustum.intersects_aabb(chunk.bounds_min, chunk.bounds_max) {
+                        continue;
+                    }
+                    if debug_chunks {
+                        render_pass.set_bind_group(1, &chunk.debug_style_bind_group, &[]);
+                    }
+                    render_pass.set_bind_group(2, &chunk.chunk_bind_group, &[]);
+                    rendered_chunks += 1;
                     render_pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
                     render_pass
                         .set_index_buffer(chunk.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -189,8 +251,23 @@ impl<'a> Graphics<'a> {
                 let Some(cached) = self.triangulation_gpu.get(triangulation.id) else {
                     continue;
                 };
-                render_pass.set_bind_group(1, &cached.surface_style_bind_group, &[]);
+                total_chunks += cached.surface_chunks.len() as u32;
+                let (aabb_min, aabb_max) = self.mesh_scene_aabb(&triangulation.mesh);
+                if !frustum.intersects_aabb(aabb_min, aabb_max) {
+                    continue;
+                }
+                if !debug_chunks {
+                    render_pass.set_bind_group(1, &cached.surface_style_bind_group, &[]);
+                }
                 for chunk in &cached.surface_chunks {
+                    if !frustum.intersects_aabb(chunk.bounds_min, chunk.bounds_max) {
+                        continue;
+                    }
+                    if debug_chunks {
+                        render_pass.set_bind_group(1, &chunk.debug_style_bind_group, &[]);
+                    }
+                    render_pass.set_bind_group(2, &chunk.chunk_bind_group, &[]);
+                    rendered_chunks += 1;
                     render_pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
                     render_pass
                         .set_index_buffer(chunk.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -200,6 +277,7 @@ impl<'a> Graphics<'a> {
         }
 
         drop(render_pass);
+        self.chunk_render_stats = (rendered_chunks, total_chunks);
         self.render_volume_block_models(encoder, view, editor, block_models, &frustum);
         self.render_fallback_transparent_block_models(
             encoder,
@@ -243,6 +321,29 @@ impl<'a> Graphics<'a> {
             render_pass.set_vertex_buffer(0, self.lyon_vertex_gpu.slice(..));
             render_pass.set_index_buffer(self.lyon_index_gpu.slice(..), wgpu::IndexFormat::Uint32);
             render_pass.draw_indexed(0..self.lyon_buffer.indices.len() as u32, 0, 0..1);
+        }
+
+        // Static stroke chunks draw before the stream strokes so selected
+        // objects (always on the stream path) still land on top of them.
+        if self.static_strokes.chunks().iter().any(|c| c.drawable()) {
+            render_pass.set_pipeline(if editor.xray_enabled {
+                &self.overlay_render_pipeline
+            } else {
+                &self.stroke_render_pipeline
+            });
+            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            for chunk in self.static_strokes.chunks() {
+                if !chunk.drawable() {
+                    continue;
+                }
+                let (Some(vertex_gpu), Some(index_gpu)) = (&chunk.vertex_gpu, &chunk.index_gpu)
+                else {
+                    continue;
+                };
+                render_pass.set_vertex_buffer(0, vertex_gpu.slice(..));
+                render_pass.set_index_buffer(index_gpu.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..chunk.index_count, 0, 0..1);
+            }
         }
 
         if !self.stroke_vertex_buf.is_empty() && !self.stroke_index_buf.is_empty() {
@@ -412,7 +513,13 @@ impl<'a> Graphics<'a> {
             volume_pass.set_viewport(0.0, 0.0, scaled_width, scaled_height, 0.0, 1.0);
             volume_pass.set_pipeline(&self.block_model_volume_pipeline);
             volume_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            volume_pass.set_bind_group(2, &self.block_model_peel_targets.peel_bind_groups[0], &[]);
+            volume_pass.set_bind_group(
+                2,
+                &self
+                    .block_model_transparency_targets
+                    .transparency_fallback_bind_groups[0],
+                &[],
+            );
             let view_proj = glam::Mat4::from_cols_array_2d(&self.camera_uniform.view_proj);
             let full_rect = (
                 0u32,
@@ -498,7 +605,7 @@ impl<'a> Graphics<'a> {
             let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Block Model Transparency Clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.block_model_peel_targets.accum_views[0],
+                    view: &self.block_model_transparency_targets.accum_views[0],
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -514,10 +621,10 @@ impl<'a> Graphics<'a> {
         }
 
         {
-            let mut peel_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut transparency_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Block Model Order-Independent Transparency Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.block_model_peel_targets.accum_views[0],
+                    view: &self.block_model_transparency_targets.accum_views[0],
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -530,26 +637,32 @@ impl<'a> Graphics<'a> {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            peel_pass.set_pipeline(&self.block_model_peel_pipeline);
-            peel_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            peel_pass.set_bind_group(2, &self.block_model_peel_targets.peel_bind_groups[0], &[]);
+            transparency_pass.set_pipeline(&self.block_model_transparency_fallback_pipeline);
+            transparency_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            transparency_pass.set_bind_group(
+                2,
+                &self
+                    .block_model_transparency_targets
+                    .transparency_fallback_bind_groups[0],
+                &[],
+            );
             for block_model in &visible_transparent_blocks {
                 let Some(cached) = self.block_model_gpu.get(block_model.id) else {
                     continue;
                 };
-                peel_pass.set_bind_group(1, &cached.surface_style_bind_group, &[]);
+                transparency_pass.set_bind_group(1, &cached.surface_style_bind_group, &[]);
                 for chunk in &cached.transparent_surface_chunks {
                     if !frustum.intersects_aabb(chunk.gpu.bounds_min, chunk.gpu.bounds_max) {
                         continue;
                     }
-                    peel_pass.set_vertex_buffer(0, chunk.gpu.instance_buffer.slice(..));
-                    peel_pass.draw(0..36, 0..chunk.gpu.instance_count);
+                    transparency_pass.set_vertex_buffer(0, chunk.gpu.instance_buffer.slice(..));
+                    transparency_pass.draw(0..36, 0..chunk.gpu.instance_count);
                 }
             }
         }
 
         let mut composite_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Block Model Peel Composite Pass"),
+            label: Some("Block Model Transparency Composite Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &self.msaa_view,
                 resolve_target: Some(view),
@@ -564,10 +677,10 @@ impl<'a> Graphics<'a> {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        composite_pass.set_pipeline(&self.block_model_peel_composite_pipeline);
+        composite_pass.set_pipeline(&self.block_model_transparency_composite_pipeline);
         composite_pass.set_bind_group(
             0,
-            &self.block_model_peel_targets.composite_bind_groups[0],
+            &self.block_model_transparency_targets.composite_bind_groups[0],
             &[],
         );
         composite_pass.draw(0..3, 0..1);

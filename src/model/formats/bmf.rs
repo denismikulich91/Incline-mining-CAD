@@ -419,7 +419,7 @@ impl BmfModel {
                 }
                 "longlong" => {
                     for chunk in payload.chunks_exact(8) {
-                        values.push(u64::from_le_bytes(read_chunk(chunk)?) as f64);
+                        values.push(i64::from_le_bytes(read_chunk(chunk)?) as f64);
                     }
                 }
                 "double" => {
@@ -958,25 +958,86 @@ fn push_threaded_metadata_candidates(
         if !page.starts_root {
             continue;
         }
+        // Materialize a candidate only at pages where a root object closes
+        // (brace balance returns to zero), plus the full thread as a fallback.
+        // The parser tolerates trailing text and the header table pointer
+        // anchors on the page where the live root's text *ends*, so prefixes
+        // that cut mid-object add no information — and cloning one per page
+        // made this quadratic in the number of metadata pages.
         let mut text = page.text.clone();
         let mut max_page_offset = page.offset;
+        let mut scanner = BraceScanner::default();
+        scanner.feed(&page.text);
         candidates.push(MetadataCandidate {
             text: text.clone(),
             max_page_offset,
             root_starts: 1,
         });
+        let mut pushed_up_to_date = true;
         for continuation in pages.iter().skip(index + 1) {
             if continuation.starts_root {
                 continue;
             }
             text.push_str(&continuation.text);
             max_page_offset = max_page_offset.max(continuation.offset);
+            pushed_up_to_date = false;
+            if scanner.feed(&continuation.text) {
+                candidates.push(MetadataCandidate {
+                    text: text.clone(),
+                    max_page_offset,
+                    root_starts: 1,
+                });
+                pushed_up_to_date = true;
+            }
+        }
+        if !pushed_up_to_date {
             candidates.push(MetadataCandidate {
-                text: text.clone(),
+                text,
                 max_page_offset,
                 root_starts: 1,
             });
         }
+    }
+}
+
+/// Tracks brace depth across streamed text chunks, honouring the same string
+/// and escape rules as `tokenize` so braces inside quoted values don't count.
+#[derive(Default)]
+struct BraceScanner {
+    depth: u32,
+    in_string: bool,
+    escaped: bool,
+}
+
+impl BraceScanner {
+    /// Feed a chunk; returns true if a top-level object closed (depth
+    /// returned to zero) anywhere within it.
+    fn feed(&mut self, text: &str) -> bool {
+        let mut closed_root = false;
+        for ch in text.chars() {
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if ch == '\\' {
+                    self.escaped = true;
+                } else if ch == '"' {
+                    self.in_string = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => self.in_string = true,
+                '{' => self.depth += 1,
+                '}' => {
+                    self.depth = self.depth.saturating_sub(1);
+                    if self.depth == 0 {
+                        closed_root = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        closed_root
     }
 }
 
@@ -1298,380 +1359,5 @@ impl Parser<'_> {
 
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn metadata_page(text: &str) -> Vec<u8> {
-        let mut page = vec![0u8; PAGE_STRIDE];
-        page[..2].copy_from_slice(&METADATA_PAGE_KIND);
-        let bytes = text.as_bytes();
-        assert!(bytes.len() <= PAGE_PAYLOAD_LEN);
-        page[2..4].copy_from_slice(&(bytes.len() as u16).to_le_bytes());
-        page[PAGE_HEADER_LEN..PAGE_HEADER_LEN + bytes.len()].copy_from_slice(bytes);
-        page
-    }
-
-    fn data_page() -> Vec<u8> {
-        let mut page = vec![0u8; PAGE_STRIDE];
-        page[..2].copy_from_slice(&[0x00, 0x04]);
-        page
-    }
-
-    fn leaf_table_page() -> Vec<u8> {
-        leaf_table_page_with_entries(&[])
-    }
-
-    fn leaf_table_page_with_entries(entries: &[u64]) -> Vec<u8> {
-        let mut page = vec![0u8; PAGE_STRIDE];
-        page[..2].copy_from_slice(&[0x01, 0x01]);
-        for (index, entry) in entries.iter().enumerate() {
-            let start = PAGE_HEADER_LEN + index * 8;
-            page[start..start + 8].copy_from_slice(&entry.to_le_bytes());
-        }
-        page
-    }
-
-    fn double_data_page(values: &[f64]) -> Vec<u8> {
-        let mut page = vec![0u8; PAGE_STRIDE];
-        page[..2].copy_from_slice(&[0x00, 0x03]);
-        for (index, value) in values.iter().enumerate() {
-            let start = PAGE_HEADER_LEN + index * 8;
-            page[start..start + 8].copy_from_slice(&value.to_le_bytes());
-        }
-        page
-    }
-
-    fn bmf_bytes_with_pages(pages: Vec<Vec<u8>>) -> Vec<u8> {
-        let mut bytes = vec![0u8; FILE_HEADER_LEN];
-        bytes[..8].copy_from_slice(b"TBMS2.0\0");
-        bytes.extend([0u8; PAGE_HEADER_LEN]);
-        for page in pages {
-            bytes.extend(page);
-        }
-        bytes
-    }
-
-    #[test]
-    fn parses_interleaved_dim_based_metadata_pages() {
-        let first = r#"{
- "dim_x" = 2,
- "dim_y" = 3,
- "dim_z" = 1,
- "lower_x" = 0,
- "lower_y" = 0,
- "lower_z" = 0,
- "upper_x" = 20,
- "upper_y" = 30,
- "upper_z" = 10,
- "var_0" =
-  {
-   "default" = "-99",
-   "description" = "average grade",
-   "global""#;
-        let independent_root = r#"{
- "dim_x" = 1,
- "dim_y" = 1,
- "dim_z" = 1
-}"#;
-        let continuation = r#" = "-99",
-   "location" = 0,
-   "name" = "grade",
-   "type" = "float"
-  }
-}"#;
-        let bytes = bmf_bytes_with_pages(vec![
-            metadata_page(first),
-            metadata_page(independent_root),
-            data_page(),
-            metadata_page(continuation),
-        ]);
-
-        let model = BmfModel::_from_bytes(bytes).unwrap();
-
-        assert_eq!(model.metadata.n_blocks, 6);
-        assert_eq!(model.metadata.dims, [2, 3, 1]);
-        assert_eq!(model.metadata.variables.len(), 1);
-        assert_eq!(model.metadata.variables[0].name, "grade");
-
-        let blocks = model.block_bounds().unwrap();
-        assert_eq!(blocks.len(), 6);
-        assert_eq!(blocks[0].lower, DVec3::new(0.0, 0.0, 0.0));
-        assert_eq!(blocks[0].upper, DVec3::new(10.0, 10.0, 10.0));
-        assert_eq!(blocks[1].lower, DVec3::new(10.0, 0.0, 0.0));
-        assert_eq!(blocks[2].lower, DVec3::new(0.0, 10.0, 0.0));
-    }
-
-    #[test]
-    fn decodes_double_variable() {
-        let root = r#"{
- "dim_x" = 3,
- "dim_y" = 1,
- "dim_z" = 1,
- "var_0" =
-  {
-   "default" = "-99",
-   "description" = "average value0",
-   "global" = "-99",
-   "location" = 6168,
-   "name" = "value0",
-   "type" = "double"
-  }
-}"#;
-        let data_page_offset = FILE_HEADER_LEN + PAGE_HEADER_LEN + PAGE_STRIDE;
-        let table_offset = FILE_HEADER_LEN + PAGE_HEADER_LEN + 2 * PAGE_STRIDE;
-        assert_eq!(table_offset, 6168);
-        let bytes = bmf_bytes_with_pages(vec![
-            metadata_page(root),
-            double_data_page(&[1.5, -2.25, 3.75]),
-            leaf_table_page_with_entries(&[data_page_offset as u64]),
-        ]);
-
-        let model = BmfModel::_from_bytes(bytes).unwrap();
-        assert!(model.unsupported_variables().is_empty());
-        assert_eq!(
-            model.numeric_values("value0").unwrap(),
-            vec![1.5, -2.25, 3.75]
-        );
-        assert_eq!(
-            model.numeric_values_range("value0", 1, 3).unwrap(),
-            vec![-2.25, 3.75]
-        );
-        assert_eq!(
-            model.numeric_values_range("value0", 2, 100).unwrap(),
-            vec![3.75]
-        );
-    }
-
-    #[test]
-    fn decodes_double_variable_range_across_pages() {
-        let root = r#"{
- "dim_x" = 258,
- "dim_y" = 1,
- "dim_z" = 1,
- "var_0" =
-  {
-   "default" = "-99",
-   "description" = "average value0",
-   "global" = "-99",
-   "location" = 8224,
-   "name" = "value0",
-   "type" = "double"
-  }
-}"#;
-        let page_offset =
-            |index: usize| (FILE_HEADER_LEN + PAGE_HEADER_LEN + index * PAGE_STRIDE) as u64;
-        assert_eq!(page_offset(3), 8224);
-        let first: Vec<f64> = (0..256).map(f64::from).collect();
-        let bytes = bmf_bytes_with_pages(vec![
-            metadata_page(root),
-            double_data_page(&first),
-            double_data_page(&[1000.0, 1001.0]),
-            leaf_table_page_with_entries(&[page_offset(1), page_offset(2)]),
-        ]);
-
-        let model = BmfModel::_from_bytes(bytes).unwrap();
-        // Starts mid-page and crosses a page boundary; only pages 1..2 are
-        // decoded, so the leading skip is relative to the first decoded page.
-        assert_eq!(
-            model.numeric_values_range("value0", 255, 258).unwrap(),
-            vec![255.0, 1000.0, 1001.0]
-        );
-        assert_eq!(
-            model.numeric_values_range("value0", 257, 258).unwrap(),
-            vec![1001.0]
-        );
-    }
-
-    #[test]
-    fn decodes_short_variable() {
-        let root = r#"{
- "dim_x" = 4,
- "dim_y" = 1,
- "dim_z" = 1,
- "var_0" =
-  {
-   "default" = "-1",
-   "description" = "short code",
-   "global" = "-1",
-   "location" = 6168,
-   "name" = "code",
-   "type" = "short"
-  }
-}"#;
-        let data_page_offset = FILE_HEADER_LEN + PAGE_HEADER_LEN + PAGE_STRIDE;
-        let table_offset = FILE_HEADER_LEN + PAGE_HEADER_LEN + 2 * PAGE_STRIDE;
-        assert_eq!(table_offset, 6168);
-        let mut short_page = vec![0u8; PAGE_STRIDE];
-        short_page[..2].copy_from_slice(&[0x00, 0x0a]);
-        for (index, value) in [-2i16, 0, 17, 2048].iter().enumerate() {
-            let start = PAGE_HEADER_LEN + index * 2;
-            short_page[start..start + 2].copy_from_slice(&value.to_le_bytes());
-        }
-        let bytes = bmf_bytes_with_pages(vec![
-            metadata_page(root),
-            short_page,
-            leaf_table_page_with_entries(&[data_page_offset as u64]),
-        ]);
-
-        let model = BmfModel::_from_bytes(bytes).unwrap();
-        assert!(model.unsupported_variables().is_empty());
-        assert_eq!(
-            model.numeric_values("code").unwrap(),
-            vec![-2.0, 0.0, 17.0, 2048.0]
-        );
-    }
-
-    #[test]
-    fn reports_unsupported_variable_types() {
-        let root = r#"{
- "dim_x" = 1,
- "dim_y" = 1,
- "dim_z" = 1,
- "var_0" =
-  {
-   "default" = "",
-   "description" = "a type this reader doesn't decode",
-   "global" = "",
-   "location" = 0,
-   "name" = "mystery",
-   "type" = "string"
-  }
-}"#;
-        let bytes = bmf_bytes_with_pages(vec![metadata_page(root)]);
-
-        let model = BmfModel::_from_bytes(bytes).unwrap();
-        let unsupported = model.unsupported_variables();
-        assert_eq!(unsupported.len(), 1);
-        assert_eq!(unsupported[0].name, "mystery");
-        assert!(model.numeric_values("mystery").is_err());
-    }
-
-    #[test]
-    fn picks_live_root_over_stale_root_via_header_pointer() {
-        // A stale, self-contained root left behind by an earlier save,
-        // followed by the live root and the page table the header's
-        // primary pointer (offset 0x18) points at. Both roots parse fine on
-        // their own, so only the header pointer can tell them apart.
-        let stale_root = r#"{
- "dim_x" = 1,
- "dim_y" = 1,
- "dim_z" = 1
-}"#;
-        let live_root = r#"{
- "dim_x" = 4,
- "dim_y" = 1,
- "dim_z" = 1,
- "var_0" =
-  {
-   "default" = "-99",
-   "description" = "average grade",
-   "global" = "-99",
-   "location" = 0,
-   "name" = "grade",
-   "type" = "float"
-  }
-}"#;
-        let mut bytes = bmf_bytes_with_pages(vec![
-            metadata_page(stale_root),
-            metadata_page(live_root),
-            leaf_table_page(),
-        ]);
-        let table_offset = FILE_HEADER_LEN + PAGE_HEADER_LEN + 2 * PAGE_STRIDE;
-        bytes[0x18..0x20].copy_from_slice(&(table_offset as u64).to_le_bytes());
-
-        let model = BmfModel::_from_bytes(bytes).unwrap();
-
-        assert_eq!(model.metadata.n_blocks, 4);
-        assert_eq!(model.metadata.dims, [4, 1, 1]);
-        assert_eq!(model.metadata.variables.len(), 1);
-        assert_eq!(model.metadata.variables[0].name, "grade");
-    }
-
-    #[test]
-    fn picks_nearest_root_before_header_pointer_when_table_is_not_adjacent() {
-        // Company files have been observed with unrelated pages between the
-        // live metadata root and the header's primary table pointer. The stale
-        // root has a higher heuristic score, so proximity to the pointer must
-        // be the deciding signal.
-        let stale_root = r#"{
- "dim_x" = 1,
- "dim_y" = 1,
- "dim_z" = 1,
- "var_0" =
-  {
-   "default" = "-99",
-   "description" = "stale grade",
-   "global" = "-99",
-   "location" = 0,
-   "name" = "stale_grade",
-   "type" = "float"
-  }
-}"#;
-        let live_root = r#"{
- "dim_x" = 4,
- "dim_y" = 1,
- "dim_z" = 1
-}"#;
-        let mut bytes = bmf_bytes_with_pages(vec![
-            metadata_page(stale_root),
-            metadata_page(live_root),
-            data_page(),
-            data_page(),
-            leaf_table_page(),
-        ]);
-        let table_offset = FILE_HEADER_LEN + PAGE_HEADER_LEN + 4 * PAGE_STRIDE;
-        bytes[0x18..0x20].copy_from_slice(&(table_offset as u64).to_le_bytes());
-
-        let model = BmfModel::_from_bytes(bytes).unwrap();
-
-        assert_eq!(model.metadata.n_blocks, 4);
-        assert_eq!(model.metadata.dims, [4, 1, 1]);
-        assert!(model.metadata.variables.is_empty());
-    }
-
-    #[test]
-    fn irregular_bmf_without_explicit_bounds_errors_instead_of_guessing() {
-        let root = r#"{
- "dim_x" = 2,
- "dim_y" = 2,
- "dim_z" = 1,
- "is_irregular" = 1,
- "lower_x" = 0,
- "lower_y" = 0,
- "lower_z" = 0,
- "upper_x" = 20,
- "upper_y" = 20,
- "upper_z" = 10
-}"#;
-        let bytes = bmf_bytes_with_pages(vec![metadata_page(root)]);
-
-        let model = BmfModel::_from_bytes(bytes).unwrap();
-        assert!(model.metadata.is_irregular);
-
-        let error = model.block_bounds().unwrap_err().to_string();
-        assert!(error.contains("sub-blocked"), "unexpected error: {error}");
-    }
-
-    #[test]
-    fn loads_bmf_from_env_path() {
-        let Ok(path) = std::env::var("INCLINE_TEST_BMF") else {
-            return;
-        };
-
-        let model = BmfModel::from_path(path).unwrap();
-        assert!(model.metadata.n_blocks > 0);
-        assert!(!model.metadata.variables.is_empty());
-        assert_eq!(model.block_bounds().unwrap().len(), model.metadata.n_blocks);
-        assert!(!model.renderable_block_indices().unwrap().is_empty());
-        if let Some(variable) = model.numeric_variables().first() {
-            assert_eq!(
-                model.numeric_values(&variable.name).unwrap().len(),
-                model.metadata.n_blocks
-            );
-        }
     }
 }

@@ -24,7 +24,7 @@ pub(crate) fn draw_orientation_gizmo(
     );
 
     egui::Area::new(egui::Id::new("world_orientation_gizmo"))
-        .order(egui::Order::Foreground)
+        .order(egui::Order::Middle)
         .fixed_pos(pos)
         .show(ui.ctx(), |ui| {
             let (rect, response) =

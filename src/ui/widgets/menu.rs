@@ -1,4 +1,4 @@
-use std::{fmt::Debug, hash::Hash};
+use std::{fmt::Debug, hash::Hash, path::PathBuf};
 
 /// A non-resizable, non-collapsible floating menu with a draggable title bar.
 ///
@@ -99,6 +99,83 @@ impl MenuField {
         add_field: impl FnOnce(&mut egui::Ui, f32) -> R,
     ) -> R {
         menu_field_row(ui, self.label, add_field)
+    }
+}
+
+/// A labelled file-picker row showing the selected file count/name and a choose button.
+pub(crate) struct MenuFieldFilePicker<'paths> {
+    label: egui::WidgetText,
+    paths: &'paths [PathBuf],
+    empty_text: egui::WidgetText,
+    button_text: egui::WidgetText,
+    width: f32,
+}
+
+impl<'paths> MenuFieldFilePicker<'paths> {
+    pub(crate) fn new(label: impl Into<egui::WidgetText>, paths: &'paths [PathBuf]) -> Self {
+        Self {
+            label: label.into(),
+            paths,
+            empty_text: "No file chosen".into(),
+            button_text: "Choose...".into(),
+            width: MENU_FIELD_WIDTH,
+        }
+    }
+
+    pub(crate) fn empty_text(mut self, text: impl Into<egui::WidgetText>) -> Self {
+        self.empty_text = text.into();
+        self
+    }
+
+    pub(crate) fn button_text(mut self, text: impl Into<egui::WidgetText>) -> Self {
+        self.button_text = text.into();
+        self
+    }
+
+    pub(crate) fn width(mut self, width: f32) -> Self {
+        self.width = width;
+        self
+    }
+
+    pub(crate) fn show(self, ui: &mut egui::Ui) -> egui::Response {
+        let Self {
+            label,
+            paths,
+            empty_text,
+            button_text,
+            width,
+        } = self;
+        let text = selected_file_label(paths, empty_text);
+        menu_field_row(ui, label, |ui, row_height| {
+            let inner = ui.horizontal(|ui| {
+                let clicked = ui
+                    .add_sized(
+                        [row_height * 3.8, row_height],
+                        egui::Button::new(button_text),
+                    )
+                    .clicked();
+                ui.add_sized([width, row_height], egui::Label::new(text).truncate());
+                clicked
+            });
+            let mut response = inner.response;
+            if inner.inner {
+                response.mark_changed();
+            }
+            response
+        })
+    }
+}
+
+fn selected_file_label(paths: &[PathBuf], empty_text: egui::WidgetText) -> egui::WidgetText {
+    match paths {
+        [] => empty_text,
+        [path] => path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| path.to_string_lossy().into_owned())
+            .into(),
+        paths => format!("{} files selected", paths.len()).into(),
     }
 }
 
@@ -512,13 +589,13 @@ impl<'value, T: PartialEq> MenuFieldCombo<'value, T> {
     }
 }
 
-/// Used in prefrences to select a catagory
-pub(crate) struct PrefrenceCatagory {
+/// Used in preferences to select a category
+pub(crate) struct PreferenceCategory {
     label: String,
     active: bool,
 }
 
-impl PrefrenceCatagory {
+impl PreferenceCategory {
     pub(crate) fn new(label: String) -> Self {
         Self {
             label,

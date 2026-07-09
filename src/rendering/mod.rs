@@ -15,11 +15,16 @@ pub(crate) struct Vertex {
     pub(crate) color: [f32; 4],
 }
 
-/// Position-only vertex for triangulation surfaces — colour comes from a per-draw uniform.
+/// Vertex for triangulation surfaces — colour comes from a per-draw uniform.
+/// `pos` is chunk-origin-relative (see `CachedSurfaceChunk`) so f32 stays
+/// precise far from the scene origin. `normal` is the flat face normal of the
+/// triangle this vertex provokes (`@interpolate(flat)` in the shader), already
+/// oriented with `z >= 0` for the two-sided surface lighting.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Debug)]
 pub(crate) struct SurfaceVertex {
     pub(crate) pos: [f32; 3],
+    pub(crate) normal: [f32; 3],
 }
 
 /// One instanced block: local-space axis-aligned bounds plus grade. The

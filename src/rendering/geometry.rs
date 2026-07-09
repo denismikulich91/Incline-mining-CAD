@@ -5,7 +5,10 @@ use std::sync::LazyLock;
 
 use glam::DVec3;
 
-use crate::rendering::{StrokeVertex, Vertex};
+use crate::{
+    model::PolyVertex,
+    rendering::{StrokeVertex, Vertex},
+};
 
 pub(crate) struct DrawContext<'a> {
     pub(crate) stroke_vertex_buf: &'a mut Vec<StrokeVertex>,
@@ -19,6 +22,22 @@ pub(crate) struct DrawContext<'a> {
 const MIN_CURVE_SEGMENTS: usize = 16;
 const MAX_CURVE_SEGMENTS: usize = 4096;
 const TARGET_SEGMENT_LENGTH_WORLD: f64 = 0.15;
+/// Cosine of the turn angle below which a round join is visually redundant:
+/// the wedge gap between adjacent stroke quads is `half_width * tan(angle/2)`,
+/// sub-pixel at document line widths for turns under ~11 degrees. Densely
+/// sampled polylines (contours, imported strings) are almost entirely such
+/// turns, and a join costs 18 vertices.
+const JOIN_COLLINEAR_COS: f64 = 0.98;
+
+/// Whether the turn from direction `incoming` to `outgoing` is sharp enough
+/// that the joint between their stroke quads needs a round join to cover it.
+pub(crate) fn needs_round_join(incoming: DVec3, outgoing: DVec3) -> bool {
+    let scale = incoming.length_squared() * outgoing.length_squared();
+    if scale <= f64::EPSILON {
+        return false;
+    }
+    incoming.dot(outgoing) < JOIN_COLLINEAR_COS * scale.sqrt()
+}
 
 fn local(point: DVec3, origin: DVec3) -> [f32; 3] {
     let p = point - origin;
@@ -218,6 +237,69 @@ pub(crate) fn draw_round_join(
     }
 }
 
+/// Tessellate a polyline's stroke (segments, arcs and the round joins between
+/// them) into the context's stroke buffers. Shared by the per-rebuild scene
+/// builder and the static stroke chunk cache so both produce identical
+/// geometry.
+pub(crate) fn tessellate_polyline_stroke(
+    ctx: &mut DrawContext,
+    verts: &[PolyVertex],
+    closed: bool,
+    line_weight: f32,
+    line_rgba: [f32; 4],
+) {
+    for segment in verts.windows(2) {
+        draw_bulge_segment(
+            ctx,
+            segment[0].pos,
+            segment[1].pos,
+            segment[0].bulge,
+            line_weight,
+            line_rgba,
+        );
+    }
+    if closed
+        && verts.len() >= 2
+        && let (Some(first), Some(last)) = (verts.first(), verts.last())
+    {
+        draw_bulge_segment(ctx, last.pos, first.pos, last.bulge, line_weight, line_rgba);
+    }
+    let n = verts.len();
+    let joint_indices = if closed && n >= 2 {
+        0..n
+    } else if n > 2 {
+        1..n - 1
+    } else {
+        0..0
+    };
+    for i in joint_indices {
+        let prev = &verts[(i + n - 1) % n];
+        let cur = &verts[i];
+        let next = &verts[(i + 1) % n];
+        // Bulged segments meet the joint at the arc tangent,
+        // not the chord direction, so always keep their joins.
+        let keep = prev.bulge.abs() > f64::EPSILON
+            || cur.bulge.abs() > f64::EPSILON
+            || needs_round_join(cur.pos - prev.pos, next.pos - cur.pos);
+        if keep {
+            draw_round_join(ctx, cur.pos, line_weight, line_rgba);
+        }
+    }
+}
+
+/// Original (untessellated) segment endpoints of a polyline, as stored in pick
+/// records for cross-select edge tests.
+pub(crate) fn polyline_segments(verts: &[PolyVertex], closed: bool) -> Vec<[DVec3; 2]> {
+    let mut segments: Vec<[DVec3; 2]> = verts.windows(2).map(|w| [w[0].pos, w[1].pos]).collect();
+    if closed
+        && verts.len() >= 2
+        && let (Some(first), Some(last)) = (verts.first(), verts.last())
+    {
+        segments.push([last.pos, first.pos]);
+    }
+    segments
+}
+
 pub(crate) fn draw_bulge_segment(
     ctx: &mut DrawContext,
     start: DVec3,
@@ -246,6 +328,9 @@ pub(crate) fn draw_bulge_segment(
     let start_vec = start - center;
     let segments = ((radius * theta.abs() / TARGET_SEGMENT_LENGTH_WORLD).ceil() as usize)
         .clamp(MIN_CURVE_SEGMENTS, MAX_CURVE_SEGMENTS);
+    // The turn between consecutive arc segments is theta/segments; when it is
+    // near-collinear the interior joins are invisible and can be skipped.
+    let interior_joins = (theta / segments as f64).cos() < JOIN_COLLINEAR_COS;
     let mut previous = start;
     for i in 1..=segments {
         let point = if i == segments {
@@ -256,7 +341,7 @@ pub(crate) fn draw_bulge_segment(
                     .mul_vec3(start_vec)
         };
         draw_line(ctx, previous, point, line_width, color);
-        if i < segments {
+        if i < segments && interior_joins {
             draw_round_join(ctx, point, line_width, color);
         }
         previous = point;

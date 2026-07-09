@@ -6,13 +6,13 @@ use crate::{
     ui::{
         state::{
             ActiveTool, BatterBermMode, EditorState, HeightMode, MoveToLayerDialog, OffsetMeasure,
-            OffsetProjection, RelimitMode, TrimEnd, UiCommand, UiProjectView,
+            RelimitMode, TrimEnd, UiCommand, UiProjectView,
         },
         themed_icon, unthemed_icon,
         widgets::{
             menu::{
-                DragableMenu, MenuField, MenuFieldColor32, MenuFieldCombo, MenuFieldF32,
-                MenuFieldF64, MenuFieldRgba, MenuFieldText, MenuFieldU32,
+                DragableMenu, MenuField, MenuFieldBool, MenuFieldColor32, MenuFieldCombo,
+                MenuFieldF32, MenuFieldF64, MenuFieldRgba, MenuFieldText, MenuFieldU32,
             },
             viewport::ViewportDockPanel,
         },
@@ -92,7 +92,7 @@ pub(crate) fn draw_right_click_context(
                         .map(|obj| document.object_rgba(obj))
                         .unwrap_or([0.0; 4]);
                     let mut color32 = rgba_to_color32(first_line_color);
-                    let color_resp = MenuFieldColor32::new("Line Color", &mut color32).show(ui);
+                    let color_resp = MenuFieldColor32::new("Line Colour", &mut color32).show(ui);
                     if color_resp.drag_stopped() || (color_resp.changed() && !color_resp.dragged())
                     {
                         let rgba = color32_to_rgba(color32);
@@ -109,9 +109,8 @@ pub(crate) fn draw_right_click_context(
                     && let Some((tri_id, mut face_color)) = project.active_triangulation_for_menu
                 {
                     let mut color32 = rgba_to_color32(face_color);
-                    if MenuFieldColor32::new("Face Color", &mut color32)
-                        .show(ui)
-                        .changed()
+                    let color_resp = MenuFieldColor32::new("Face Colour", &mut color32).show(ui);
+                    if color_resp.drag_stopped() || (color_resp.changed() && !color_resp.dragged())
                     {
                         face_color = color32_to_rgba(color32);
                         commands.push(UiCommand::SetTriangulationColor(tri_id, face_color));
@@ -475,7 +474,11 @@ pub(crate) fn draw_move_layer_dialog(
 }
 
 /// Draw the startup dialog prompting the user to open or create a .pidb file.
-pub(crate) fn draw_select_pidb_dialog(ui: &mut egui::Ui, commands: &mut Vec<UiCommand>) {
+pub(crate) fn draw_select_pidb_dialog(
+    ui: &mut egui::Ui,
+    editor: &mut crate::ui::state::EditorState,
+    commands: &mut Vec<UiCommand>,
+) {
     const PANEL_SIZE: f32 = 500.0;
     const COLUMN_WIDTH: f32 = 190.0;
     const ROW_HEIGHT: f32 = 22.0;
@@ -511,6 +514,19 @@ pub(crate) fn draw_select_pidb_dialog(ui: &mut egui::Ui, commands: &mut Vec<UiCo
                             .clicked()
                             {
                                 commands.push(UiCommand::NewPidb);
+                            }
+                            if select_pidb_action_row(
+                                ui,
+                                egui::Image::new(themed_icon!(ui, "convert_to_pidb.svg")),
+                                "Import",
+                                COLUMN_WIDTH,
+                                ROW_HEIGHT,
+                            )
+                            .clicked()
+                            {
+                                editor.show_export = false;
+                                editor.show_import = true;
+                                commands.push(UiCommand::CloseStartupDialog);
                             }
                             if select_pidb_action_row(
                                 ui,
@@ -687,10 +703,11 @@ pub(crate) fn draw_create_layer_dialog(
             .show(ui);
             let can_save = editor.new_layer_project_index.is_some()
                 && !editor.new_layer_name.trim().is_empty();
-            MenuFieldText::new("Layer name", &mut editor.new_layer_name)
+            let name_response = MenuFieldText::new("Layer name", &mut editor.new_layer_name)
                 .hint_text("Required")
                 .show(ui);
-            let submitted = ui.input(|input| input.key_pressed(egui::Key::Enter));
+            let submitted =
+                name_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
             ui.horizontal(|ui| {
                 if (submitted
                     || ui
@@ -704,11 +721,11 @@ pub(crate) fn draw_create_layer_dialog(
                         name: editor.new_layer_name.trim().to_string(),
                     });
                     editor.new_layer_project_index = None;
-                    editor.active_tool = ActiveTool::None;
+                    editor.new_layer_dialog_open = false;
                 }
                 if ui.button("Cancel").clicked() {
                     editor.new_layer_project_index = None;
-                    editor.active_tool = ActiveTool::None;
+                    editor.new_layer_dialog_open = false;
                 }
             });
         });
@@ -783,7 +800,7 @@ pub(crate) fn draw_text_edit_dialog(
     let Some(object_id) = editor.editing_labels_id else {
         return;
     };
-    ViewportDockPanel::new("text_edit_panel", "Editing text", viewport_rect)
+    ViewportDockPanel::new("text_edit_panel", "Edit Text", viewport_rect)
         .min_width(260.0)
         .show(ui.ctx(), |ui| {
             let response = MenuFieldText::new("Text", &mut editor.pending_text)
@@ -813,7 +830,7 @@ pub(crate) fn draw_text_edit_dialog(
             .suffix("°")
             .show(ui)
             .changed();
-            *geometry_dirty |= MenuFieldRgba::new("Color", &mut editor.pending_text_color)
+            *geometry_dirty |= MenuFieldRgba::new("Colour", &mut editor.pending_text_color)
                 .show(ui)
                 .changed();
 
@@ -863,7 +880,7 @@ pub(crate) fn draw_finish_polygon_dialog(
                     editor.poly_finish_dialog = false;
                 }
                 if ui.button("Open").clicked() {
-                    commands.push(UiCommand::FinishPolyOpen);
+                    commands.push(UiCommand::CommitStrokeOpen);
                     editor.poly_finish_dialog = false;
                 }
             });
@@ -872,174 +889,143 @@ pub(crate) fn draw_finish_polygon_dialog(
 }
 
 // I dont like this - we need to clean this up later - too many options and sub menus
-/// Draw the Offset Element dialog (horizontal berm or angled batter projection).
+/// Draw the Offset Element dialog.
 pub(crate) fn draw_offset_dialog(
     ui: &mut egui::Ui,
     commands: &mut Vec<UiCommand>,
     editor: &mut EditorState,
     viewport_rect: egui::Rect,
 ) {
-    let Some(object_id) = editor.offset_target_id else {
+    if editor.offset_target_ids.is_empty() {
         return;
-    };
+    }
 
     ViewportDockPanel::new("offset_element_panel", "Offset Element", viewport_rect)
         .min_width(350.0)
         .show(ui.ctx(), |ui| {
-            // Projection row
-            MenuField::new("Projection").show(ui, |ui, _| {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut editor.offset_projection,
-                        OffsetProjection::Horizontal,
-                        "Horizontal (berm)",
-                    );
-                    let angle_active =
-                        matches!(editor.offset_projection, OffsetProjection::Angled(_));
-                    if ui
-                        .add(egui::Button::selectable(angle_active, "Angle (batter)"))
-                        .clicked()
-                        && !angle_active
-                    {
-                        editor.offset_projection =
-                            OffsetProjection::Angled(editor.offset_angle_degrees);
-                    }
-                })
-                .response
-            });
-            if matches!(editor.offset_projection, OffsetProjection::Angled(_)) {
-                let response =
-                    MenuFieldF64::new("Angle", &mut editor.offset_angle_degrees, -89.9..=89.9)
-                        .width(70.0)
-                        .speed(0.5)
-                        .suffix("°")
-                        .show(ui);
-                if response.changed() {
-                    editor.offset_projection =
-                        OffsetProjection::Angled(editor.offset_angle_degrees);
-                }
+            let response =
+                MenuFieldF64::new("Angle", &mut editor.offset_angle_degrees, -90.0..=90.0)
+                    .width(70.0)
+                    .speed(0.5)
+                    .suffix("°")
+                    .show(ui);
+            if response.changed() {
+                editor.offset_angle_degrees = editor.offset_angle_degrees.clamp(-90.0, 90.0);
             }
 
             ui.add_space(4.0);
 
-            // Measure row (only meaningful for Angled)
-            let angle_mode = matches!(editor.offset_projection, OffsetProjection::Angled(_));
-            if angle_mode {
-                MenuField::new("Measure").show(ui, |ui, _| {
+            MenuField::new("Measure").show(ui, |ui, _| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut editor.offset_measure,
+                        OffsetMeasure::Distance,
+                        "Distance",
+                    );
+                    ui.selectable_value(&mut editor.offset_measure, OffsetMeasure::Width, "Width");
+                    let height_active = matches!(editor.offset_measure, OffsetMeasure::Height(_));
+                    if ui
+                        .add(egui::Button::selectable(height_active, "Height"))
+                        .clicked()
+                        && !height_active
+                    {
+                        editor.offset_measure = OffsetMeasure::Height(HeightMode::Relative);
+                    }
+                })
+                .response
+            });
+            if let OffsetMeasure::Height(ref mut mode) = editor.offset_measure {
+                MenuField::new("Height mode").show(ui, |ui, _| {
                     ui.horizontal(|ui| {
-                        ui.selectable_value(
-                            &mut editor.offset_measure,
-                            OffsetMeasure::Distance,
-                            "Distance",
-                        );
-                        ui.selectable_value(
-                            &mut editor.offset_measure,
-                            OffsetMeasure::Width,
-                            "Width",
-                        );
-                        let height_active =
-                            matches!(editor.offset_measure, OffsetMeasure::Height(_));
-                        if ui
-                            .add(egui::Button::selectable(height_active, "Height"))
-                            .clicked()
-                            && !height_active
-                        {
-                            editor.offset_measure = OffsetMeasure::Height(HeightMode::Relative);
-                        }
+                        ui.selectable_value(mode, HeightMode::Relative, "Relative (+/-)");
+                        ui.selectable_value(mode, HeightMode::AbsoluteRL, "Absolute RL");
                     })
                     .response
                 });
-                if let OffsetMeasure::Height(ref mut mode) = editor.offset_measure {
-                    MenuField::new("Height mode").show(ui, |ui, _| {
-                        ui.horizontal(|ui| {
-                            ui.selectable_value(mode, HeightMode::Relative, "Relative (+/-)");
-                            ui.selectable_value(mode, HeightMode::AbsoluteRL, "Absolute RL");
-                        })
-                        .response
-                    });
-                }
-            } else {
-                editor.offset_measure = OffsetMeasure::Distance;
             }
 
             ui.add_space(4.0);
 
             // Value label adapts to context
-            let value_label = match (&editor.offset_projection, &editor.offset_measure) {
-                (OffsetProjection::Horizontal, _) => "Offset distance (m)",
-                (OffsetProjection::Angled(_), OffsetMeasure::Distance) => "Distance along slope",
-                (OffsetProjection::Angled(_), OffsetMeasure::Width) => "Horizontal distance",
-                (OffsetProjection::Angled(_), OffsetMeasure::Height(HeightMode::Relative)) => {
-                    "Height change"
-                }
-                (OffsetProjection::Angled(_), OffsetMeasure::Height(HeightMode::AbsoluteRL)) => {
-                    "Target RL"
-                }
+            let value_label = match editor.offset_measure {
+                OffsetMeasure::Distance => "Distance along slope",
+                OffsetMeasure::Width => "Horizontal distance",
+                OffsetMeasure::Height(HeightMode::Relative) => "Height change",
+                OffsetMeasure::Height(HeightMode::AbsoluteRL) => "Target RL",
             };
             MenuFieldF64::new(value_label, &mut editor.offset_value_input, 0.0..=f64::MAX)
                 .speed(0.1)
                 .suffix("m")
                 .show(ui);
 
+            MenuFieldBool::new(
+                "Collide with Triangulation",
+                &mut editor.offset_collide_with_triangulation,
+            )
+            .show(ui);
+
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("Cancel").clicked() {
-                    editor.offset_dialog_open = false;
-                    editor.offset_target_id = None;
-                    editor.active_tool = ActiveTool::None;
+                    commands.push(UiCommand::CancelOffset);
                 }
-                if ui.button("Continue: Pick Side").clicked() {
-                    // Compute horiz_dist and z_delta from projection + measure + value.
-                    let (horiz_dist, z_delta, project_to_rl) = match editor.offset_projection {
-                        OffsetProjection::Horizontal => (editor.offset_value_input, 0.0, None),
-                        OffsetProjection::Angled(deg) => {
-                            let rad = deg.to_radians();
-                            let tan = rad.tan();
-                            match editor.offset_measure {
-                                OffsetMeasure::Distance => {
-                                    // distance along slope
-                                    let h = editor.offset_value_input * rad.sin();
-                                    let horiz = editor.offset_value_input * rad.cos();
-                                    (horiz, h, None)
-                                }
-                                OffsetMeasure::Width => (
-                                    editor.offset_value_input,
-                                    editor.offset_value_input * tan,
-                                    None,
-                                ),
-                                OffsetMeasure::Height(HeightMode::Relative) => {
-                                    if tan.abs() < 1e-9 {
-                                        (editor.offset_value_input, 0.0, None)
-                                    } else {
-                                        (
-                                            editor.offset_value_input / tan,
-                                            editor.offset_value_input,
-                                            None,
-                                        )
-                                    }
-                                }
-                                OffsetMeasure::Height(HeightMode::AbsoluteRL) => {
-                                    // Project each vertex individually along the batter
-                                    // angle so the whole string lands flat at the target
-                                    // RL, rather than uniformly shifting the string.
-                                    (0.0, 0.0, Some((tan, editor.offset_value_input)))
-                                }
-                            }
-                        }
-                    };
-
-                    commands.push(UiCommand::BeginOffsetPick {
-                        object_id,
-                        horiz_dist,
-                        z_delta,
-                        project_to_rl,
-                    });
+                let can_pick_side = matches!(
+                    editor.offset_measure,
+                    OffsetMeasure::Height(HeightMode::AbsoluteRL)
+                ) || editor.offset_value_input.abs() > 1e-9;
+                let pick_side_clicked = ui
+                    .add_enabled(can_pick_side, egui::Button::new("Pick Side"))
+                    .clicked();
+                let enter_pressed = ui.input(|input| input.key_pressed(egui::Key::Enter));
+                if can_pick_side && (pick_side_clicked || enter_pressed) {
+                    queue_begin_offset_pick(commands, editor);
                 }
             });
         });
 }
 
-/// Draw the Bench Batter-Berm Generator dialog.
+fn queue_begin_offset_pick(commands: &mut Vec<UiCommand>, editor: &EditorState) {
+    let rad = editor.offset_angle_degrees.to_radians();
+    let tan = rad.tan();
+    let (horiz_dist, z_delta, project_to_rl) = match editor.offset_measure {
+        OffsetMeasure::Distance => {
+            let h = editor.offset_value_input * rad.sin();
+            let horiz = editor.offset_value_input * rad.cos();
+            (horiz, h, None)
+        }
+        OffsetMeasure::Width => (
+            editor.offset_value_input,
+            editor.offset_value_input * tan,
+            None,
+        ),
+        OffsetMeasure::Height(HeightMode::Relative) => {
+            if tan.abs() < 1e-9 {
+                (editor.offset_value_input, 0.0, None)
+            } else {
+                (
+                    editor.offset_value_input / tan,
+                    editor.offset_value_input,
+                    None,
+                )
+            }
+        }
+        OffsetMeasure::Height(HeightMode::AbsoluteRL) => {
+            // Project each vertex individually along the batter angle so the
+            // whole string lands flat at the target RL.
+            (0.0, 0.0, Some((tan, editor.offset_value_input)))
+        }
+    };
+
+    commands.push(UiCommand::BeginOffsetPick {
+        object_ids: editor.offset_target_ids.clone(),
+        horiz_dist,
+        z_delta,
+        project_to_rl,
+        collide_with_triangulation: editor.offset_collide_with_triangulation,
+    });
+}
+
+/// Draw the Generate Batter-Berms dialog.
 pub(crate) fn draw_batter_berm_dialog(
     ui: &mut egui::Ui,
     commands: &mut Vec<UiCommand>,
@@ -1050,69 +1036,65 @@ pub(crate) fn draw_batter_berm_dialog(
         return;
     }
 
-    ViewportDockPanel::new(
-        "batter_berm_panel",
-        "Bench Batter-Berm Generator",
-        viewport_rect,
-    )
-    .min_width(310.0)
-    .show(ui.ctx(), |ui| {
-        MenuFieldF64::new("Berm width", &mut editor.batter_berm_width, 0.1..=500.0)
+    ViewportDockPanel::new("batter_berm_panel", "Generate Batter-Berms", viewport_rect)
+        .min_width(310.0)
+        .show(ui.ctx(), |ui| {
+            MenuFieldF64::new("Berm width", &mut editor.batter_berm_width, 0.1..=500.0)
+                .speed(0.1)
+                .max_decimals(2)
+                .suffix("m")
+                .show(ui);
+            MenuFieldF64::new(
+                "Batter angle (\u{b0})",
+                &mut editor.batter_berm_angle,
+                1.0..=89.0,
+            )
+            .speed(0.5)
+            .max_decimals(1)
+            .show(ui);
+            MenuFieldF64::new(
+                "Bench height",
+                &mut editor.batter_berm_bench_height,
+                0.1..=500.0,
+            )
             .speed(0.1)
             .max_decimals(2)
             .suffix("m")
             .show(ui);
-        MenuFieldF64::new(
-            "Batter angle (\u{b0})",
-            &mut editor.batter_berm_angle,
-            1.0..=89.0,
-        )
-        .speed(0.5)
-        .max_decimals(1)
-        .show(ui);
-        MenuFieldF64::new(
-            "Bench height",
-            &mut editor.batter_berm_bench_height,
-            0.1..=500.0,
-        )
-        .speed(0.1)
-        .max_decimals(2)
-        .suffix("m")
-        .show(ui);
-        let max_benches = editor.batter_berm_max_benches.max(1);
-        MenuFieldU32::new("Benches", &mut editor.batter_berm_benches, 1..=max_benches)
-            .speed(0.1)
-            .show(ui);
+            let max_benches = editor.batter_berm_max_benches.max(1);
+            MenuFieldU32::new("Benches", &mut editor.batter_berm_benches, 1..=max_benches)
+                .speed(0.1)
+                .show(ui);
 
-        MenuField::new("Type").show(ui, |ui, _| {
+            MenuField::new("Type").show(ui, |ui, _| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut editor.batter_berm_mode, BatterBermMode::Pit, "Pit");
+                    ui.selectable_value(
+                        &mut editor.batter_berm_mode,
+                        BatterBermMode::Stockpile,
+                        "Stockpile",
+                    );
+                })
+                .response
+            });
+
+            ui.add_space(8.0);
+
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut editor.batter_berm_mode, BatterBermMode::Pit, "Pit");
-                ui.selectable_value(
-                    &mut editor.batter_berm_mode,
-                    BatterBermMode::Stockpile,
-                    "Stockpile",
-                );
-            })
-            .response
+                if ui.button("Cancel").clicked() {
+                    commands.push(UiCommand::CancelBatterBerm);
+                }
+                if ui
+                    .add_enabled(
+                        !editor.batter_berm_rings_world.is_empty(),
+                        egui::Button::new("Apply"),
+                    )
+                    .clicked()
+                {
+                    commands.push(UiCommand::CommitBatterBerm);
+                }
+            });
         });
-
-        ui.add_space(8.0);
-
-        ui.horizontal(|ui| {
-            if ui.button("Cancel").clicked() {
-                commands.push(UiCommand::CancelBatterBerm);
-            }
-            if ui
-                .add_enabled(
-                    !editor.batter_berm_rings_world.is_empty(),
-                    egui::Button::new("Apply"),
-                )
-                .clicked()
-            {
-                commands.push(UiCommand::CommitBatterBerm);
-            }
-        });
-    });
 }
 
 /// Draw the Relimit Line dialog (intersect, absolute length, or relative length modes).
@@ -1202,22 +1184,11 @@ pub(crate) fn draw_relimit_dialog(
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("Cancel").clicked() {
-                    editor.relimit_dialog_open = false;
-                    editor.relimit_awaiting_source_pick = false;
-                    editor.relimit_source_id = None;
-                    editor.relimit_waiting_for_pick = false;
-                    editor.relimit_confirming_end = false;
-                    editor.relimit_intersection_3d = None;
-                    editor.relimit_candidates.clear();
-                    editor.relimit_hover_target_id = None;
-                    editor.relimit_hover_target_screen_px.clear();
-                    editor.relimit_preview_from_px = None;
-                    editor.relimit_preview_to_px = None;
-                    editor.active_tool = ActiveTool::None;
+                    commands.push(UiCommand::CancelRelimit);
                 }
                 match editor.relimit_mode {
                     RelimitMode::Intersect => {
-                        if ui.button("Apply — pick target →").clicked() {
+                        if ui.button("Apply and Pick Target").clicked() {
                             editor.relimit_dialog_open = false;
                             editor.relimit_waiting_for_pick = true;
                         }
@@ -1303,11 +1274,9 @@ pub(crate) fn draw_chamfer_panel(
             if !corner_picked {
                 ui.label("Click a corner on a closed polygon.");
             } else {
-                let mut seg = editor.chamfer_segments as i32;
-                MenuField::new("Segments").show(ui, |ui, _| {
-                    ui.add(egui::DragValue::new(&mut seg).range(1..=64).speed(0.1))
-                });
-                editor.chamfer_segments = seg.clamp(1, 64) as u32;
+                MenuFieldU32::new("Segments", &mut editor.chamfer_segments, 1..=64)
+                    .speed(0.1)
+                    .show(ui);
 
                 let mut r = editor.chamfer_radius;
                 let max_r = if editor.chamfer_max_radius.is_finite() {
@@ -1322,14 +1291,12 @@ pub(crate) fn draw_chamfer_panel(
             }
 
             ui.add_space(4.0);
-            let apply_from_enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
             ui.horizontal(|ui| {
                 // Grey out when the displayed value is "0.00" (2 dp) — matches user perception.
                 let can_apply = corner_picked && (editor.chamfer_radius * 100.0).round() > 0.0;
-                if (apply_from_enter
-                    || ui
-                        .add_enabled(can_apply, egui::Button::new("Apply"))
-                        .clicked())
+                if ui
+                    .add_enabled(can_apply, egui::Button::new("Apply"))
+                    .clicked()
                     && can_apply
                 {
                     commands.push(UiCommand::ApplyChamfer);
@@ -1366,12 +1333,9 @@ pub(crate) fn draw_bezier_panel(
                     }
                 }
             } else {
-                // Segments
-                let mut seg = editor.bezier_segments as i32;
-                MenuField::new("Segments").show(ui, |ui, _| {
-                    ui.add(egui::DragValue::new(&mut seg).range(2..=64).speed(0.1))
-                });
-                editor.bezier_segments = seg.clamp(2, 64) as u32;
+                MenuFieldU32::new("Segments", &mut editor.bezier_segments, 2..=64)
+                    .speed(0.1)
+                    .show(ui);
 
                 ui.add_space(4.0);
 
@@ -1409,13 +1373,11 @@ pub(crate) fn draw_bezier_panel(
             }
 
             ui.add_space(4.0);
-            let apply_from_enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
             ui.horizontal(|ui| {
                 let can_apply = both_selected;
-                if (apply_from_enter
-                    || ui
-                        .add_enabled(can_apply, egui::Button::new("Apply"))
-                        .clicked())
+                if ui
+                    .add_enabled(can_apply, egui::Button::new("Apply"))
+                    .clicked()
                     && can_apply
                 {
                     commands.push(UiCommand::ApplyBezier);

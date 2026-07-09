@@ -25,7 +25,6 @@ macro_rules! batch_property {
             .collect();
         if !cmds.is_empty() {
             $self.history.execute(doc, Command::Batch(cmds));
-            project.dirty = true;
         }
         userspace_log!($log, $ids.len());
         $self.invalidate_geometry();
@@ -155,7 +154,6 @@ impl<'a> App<'a> {
         }
 
         self.history.execute(doc, Command::Batch(cmds));
-        project.dirty = true;
         self.editor.selected_handles = selected_after
             .into_iter()
             .map(SceneEntityId::Object)

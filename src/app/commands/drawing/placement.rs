@@ -30,6 +30,26 @@ impl<'a> App<'a> {
         self.invalidate_overlay();
     }
 
+    pub(crate) fn measure_berm_angle_click(&mut self) {
+        if matches!(
+            self.editor.cursor_mode,
+            crate::ui::state::CursorMode::SnapToPoint
+                | crate::ui::state::CursorMode::SnapToLine
+                | crate::ui::state::CursorMode::SnapToSurface
+        ) && !self.editor.cursor_snapped
+        {
+            return;
+        }
+        let Some(point) = self.editor.cursor_world else {
+            return;
+        };
+        if self.editor.berm_angle_points.len() >= 3 {
+            self.editor.berm_angle_points.clear();
+        }
+        self.editor.berm_angle_points.push(point);
+        self.invalidate_overlay();
+    }
+
     pub(crate) fn place_point_at_cursor(&mut self) {
         if !self.editing_ready() {
             return;
@@ -63,7 +83,6 @@ impl<'a> App<'a> {
                     color,
                 }),
             );
-            project.dirty = true;
         }
         userspace_log!(
             "Placed point @ {:.3}, {:.3}, {:.3}",
@@ -123,7 +142,6 @@ impl<'a> App<'a> {
                     return;
                 }
             }
-            ActiveTool::MakeLine if !self.editor.pending_stroke.is_empty() => {}
             _ => {}
         }
         self.invalidate_geometry();
@@ -173,6 +191,7 @@ impl<'a> App<'a> {
         self.editor.pending_stroke.clear();
         self.editor.measurement_start = None;
         self.editor.measurement_end = None;
+        self.editor.berm_angle_points.clear();
         self.editor.poly_finish_dialog = false;
         self.editor.poly_finish_dialog_px = None;
         self.editor.active_tool = ActiveTool::None;
@@ -180,8 +199,8 @@ impl<'a> App<'a> {
         userspace_log!("Discarded in-progress stroke ({discarded_vertices} vertices)");
     }
 
-    /// Cancel the current stroke (commits open polyline if ≥2 verts, otherwise discards).
-    pub(crate) fn cancel_stroke(&mut self) {
+    /// Commit the current polygon stroke as an open polyline if it has enough vertices.
+    pub(crate) fn commit_stroke_open(&mut self) {
         if self.editor.active_tool == ActiveTool::MakePoly
             && self.editor.pending_stroke.len() >= 2
             && let Some(layer) = self.active_layer()
@@ -194,7 +213,7 @@ impl<'a> App<'a> {
                 .collect();
             self.commit_polyline(verts, false, layer);
             userspace_log!(
-                "Cancelled polygon (committed {} vertex/vertices as open polyline)",
+                "Committed {} vertex/vertices as open polyline",
                 self.editor.pending_stroke.len()
             );
         }
@@ -227,21 +246,6 @@ impl<'a> App<'a> {
                 self.invalidate_geometry();
             }
             ActiveTool::MakeLine => {
-                if self.editor.pending_stroke.len() >= 2 {
-                    let verts: Vec<PolyVertex> = self
-                        .editor
-                        .pending_stroke
-                        .iter()
-                        .map(|&p| PolyVertex::straight(p))
-                        .collect();
-                    if let Some(layer) = self.active_layer() {
-                        self.commit_polyline(verts, false, layer);
-                        userspace_log!(
-                            "Finished line via Enter ({} vertices)",
-                            self.editor.pending_stroke.len()
-                        );
-                    }
-                }
                 if self.editor.pending_stroke.is_empty() {
                     self.editor.active_tool = ActiveTool::None;
                     self.invalidate_geometry();
@@ -260,9 +264,6 @@ impl<'a> App<'a> {
             return;
         }
         let color = crate::model::ObjectColor::Fixed(self.editor.tool_line_color);
-        let fill_color = Some(crate::model::ObjectColor::Fixed(
-            self.editor.tool_fill_color,
-        ));
         let line_weight = self.editor.tool_line_weight;
         let fill = self.editor.tool_hatch.to_fill_style();
         if let Some(project) = self.workspace.active_project_mut() {
@@ -277,11 +278,9 @@ impl<'a> App<'a> {
                     closed,
                     color,
                     fill,
-                    fill_color,
                     line_weight,
                 }),
             );
-            project.dirty = true;
         }
     }
 }

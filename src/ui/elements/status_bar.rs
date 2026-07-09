@@ -25,6 +25,27 @@ pub(crate) fn draw_status_bar(ui: &mut egui::Ui, editor: &EditorState) -> egui::
                         None => ui.label("FPS: --"),
                     };
                 }
+                if editor.debug_chunk_coloring {
+                    ui.separator();
+                    match editor.debug_chunk_stats {
+                        Some((rendered, total)) => ui.label(format!(
+                            "Chunks: {rendered}/{total} ({} culled)",
+                            total.saturating_sub(rendered)
+                        )),
+                        None => ui.label("Chunks: --"),
+                    };
+                }
+                if let Some(msg) = &editor.status_message {
+                    ui.separator();
+                    match msg.progress {
+                        Some(p) => ui.label(format!(
+                            "{} ({:.0}%)",
+                            msg.text,
+                            (p * 100.0).clamp(0.0, 100.0)
+                        )),
+                        None => ui.label(&msg.text),
+                    };
+                }
             });
         })
         .response

@@ -56,6 +56,19 @@ impl<'a> App<'a> {
             userspace_warn!("Fuse: click did not hit any object (nothing under cursor)");
             return;
         };
+        // Near a shared endpoint the pick can land back on a line already in
+        // the chain; fusing a line onto itself would double its vertices.
+        if self
+            .editor
+            .fuse_segments
+            .iter()
+            .any(|segment| segment.object_id == object_id)
+        {
+            userspace_warn!(
+                "Fuse: object {object_id:?} is already part of the fuse chain, click a different line"
+            );
+            return;
+        }
         // Must be an open polyline. Fusing modifies/deletes existing objects, so
         // it isn't restricted to the active layer (that restriction only matters
         // for where *new* geometry gets created).
@@ -166,11 +179,22 @@ impl<'a> App<'a> {
                 .find(|(index, _)| *index != vertex_index)
                 .map_or(join_point, |(_, point)| *point)
         };
+        // The chosen endpoint is the designated join with the chain tail. If
+        // it sits on the tail — or merely looks like it does at the current
+        // zoom (unsnapped digitising, import rounding) — weld: commit drops
+        // the duplicate instead of keeping a doubled point plus a micro edge.
+        // Endpoints clearly apart stay, becoming a deliberate bridging edge.
+        let weld_start = !first_segment
+            && self.editor.fuse_chain_tail.is_some_and(|chain_tail| {
+                points_coincident(join_point, chain_tail)
+                    || self.fuse_points_visually_coincident(join_point, chain_tail)
+            });
         self.editor.fuse_segments.push(FuseSegment {
             object_id: awaiting_id,
             reversed,
             start_index,
             closed,
+            weld_start,
         });
         self.editor.fuse_chain_tail = Some(tail);
         self.editor.fuse_close_marker = if first_segment && !closed && vertex_count >= 3 {
@@ -224,6 +248,25 @@ impl<'a> App<'a> {
             .map(|(index, _)| index)
     }
 
+    /// True when two world points render within the endpoint-pick radius of
+    /// each other, i.e. the user cannot tell them apart at the current zoom.
+    fn fuse_points_visually_coincident(&self, a: DVec3, b: DVec3) -> bool {
+        let Some(graphics) = self.graphics.as_ref() else {
+            return false;
+        };
+        let vp = graphics.view_proj();
+        let screen = graphics.screen_size_pub();
+        let (Some(sa), Some(sb)) = (
+            pick::world_to_screen(&vp, a, screen),
+            pick::world_to_screen(&vp, b, screen),
+        ) else {
+            return false;
+        };
+        let dx = sa.x - sb.x;
+        let dy = sa.y - sb.y;
+        dx * dx + dy * dy <= f64::from(PICK_THRESHOLD_PX * PICK_THRESHOLD_PX * 4.0)
+    }
+
     fn fuse_cursor_near(&self, world: DVec3) -> bool {
         let (Some(graphics), Some(cursor)) = (self.graphics.as_ref(), self.editor.cursor_screen_px)
         else {
@@ -255,27 +298,35 @@ impl<'a> App<'a> {
             );
             return;
         };
-        let Object::Polyline {
-            verts,
-            closed: false,
-            ..
-        } = &before
-        else {
+        let Object::Polyline { closed: false, .. } = &before else {
             userspace_warn!(
                 "Fuse: source object {:?} is no longer a valid open polyline",
                 segment.object_id
             );
             return;
         };
-        if verts.len() < 3 {
-            userspace_warn!(
-                "Fuse: line needs at least 3 vertices to close into a polygon (has {})",
-                verts.len()
-            );
-            return;
-        }
         let mut after = before.clone();
-        if let Object::Polyline { closed, .. } = &mut after {
+        if let Object::Polyline { verts, closed, .. } = &mut after {
+            // A line that already ends on (or visually on) its own start
+            // would close into a polygon with a doubled vertex — weld it.
+            if verts.len() > 2
+                && verts
+                    .first()
+                    .zip(verts.last())
+                    .is_some_and(|(first, last)| {
+                        points_coincident(first.pos, last.pos)
+                            || self.fuse_points_visually_coincident(first.pos, last.pos)
+                    })
+            {
+                verts.pop();
+            }
+            if verts.len() < 3 {
+                userspace_warn!(
+                    "Fuse: line needs at least 3 distinct vertices to close into a polygon (has {})",
+                    verts.len()
+                );
+                return;
+            }
             *closed = true;
         }
         if let Some(project) = self.workspace.active_project_mut() {
@@ -283,13 +334,8 @@ impl<'a> App<'a> {
                 &mut project.pidb.document,
                 Command::Replace { before, after },
             );
-            project.dirty = true;
         }
         self.finish_fuse_state();
-    }
-
-    pub(crate) fn commit_fuse_polygon(&mut self) {
-        self.commit_fuse(false);
     }
 
     fn commit_fuse(&mut self, closed: bool) {
@@ -335,11 +381,11 @@ impl<'a> App<'a> {
             } else {
                 verts
             };
-            if all_verts
+            let coincident_start = all_verts
                 .last()
                 .zip(ordered.first())
-                .is_some_and(|(a, b)| points_coincident(a.pos, b.pos))
-            {
+                .is_some_and(|(a, b)| points_coincident(a.pos, b.pos));
+            if coincident_start || (seg.weld_start && !all_verts.is_empty()) {
                 ordered.remove(0);
             }
             all_verts.extend(ordered);
@@ -369,9 +415,6 @@ impl<'a> App<'a> {
             return;
         };
         let color = crate::model::ObjectColor::Fixed(self.editor.tool_line_color);
-        let fill_color = Some(crate::model::ObjectColor::Fixed(
-            self.editor.tool_fill_color,
-        ));
         let line_weight = self.editor.tool_line_weight;
         let fill = self.editor.tool_hatch.to_fill_style();
 
@@ -393,16 +436,14 @@ impl<'a> App<'a> {
                 closed,
                 color,
                 fill,
-                fill_color,
                 line_weight,
             })];
             for src_id in source_ids {
                 if let Some(obj) = doc.get_object(src_id).cloned() {
-                    commands.push(Command::DeleteObject(obj));
+                    commands.push(Command::delete_object(obj));
                 }
             }
             self.history.execute(doc, Command::Batch(commands));
-            project.dirty = true;
             userspace_log!(
                 "Fuse: created {} {id:?} with {vertex_count} vertices from {} source line(s)",
                 if closed { "polygon" } else { "polyline" },
@@ -421,6 +462,7 @@ impl<'a> App<'a> {
                     reversed: false,
                     start_index: vertex_count - 1,
                     closed: false,
+                    weld_start: false,
                 }];
                 self.editor.fuse_awaiting_endpoint = None;
                 self.editor.fuse_endpoint_markers.clear();
@@ -455,11 +497,14 @@ impl<'a> App<'a> {
     /// If exactly one polyline/polygon is currently selected, pre-fill the fuse
     /// awaiting-endpoint state so the user doesn't have to click the line again.
     pub(crate) fn fuse_init_from_selection(&mut self) {
-        let selected_object_id = self.editor.selected_handles.iter().find_map(|h| match h {
+        let mut selected_object_ids = self.editor.selected_handles.iter().filter_map(|h| match h {
             SceneEntityId::Object(id) => Some(*id),
             _ => None,
         });
-        let Some(object_id) = selected_object_id else {
+        // Exactly one selected object, otherwise iterating the HashSet would
+        // arm an arbitrary line as the fuse source.
+        let (Some(object_id), None) = (selected_object_ids.next(), selected_object_ids.next())
+        else {
             return;
         };
         let markers = match self.active_document().get_object(object_id) {

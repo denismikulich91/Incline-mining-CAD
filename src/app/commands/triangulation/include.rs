@@ -1,13 +1,17 @@
 use super::cuts::{
     SurfaceClipVertex, append_surface_clip_polygon, bary_z, clip_surface_polygon,
     clip_target_triangle_to_reference_xy, point_in_triangle_bary_z,
-    reference_xy_overlap_area_tolerance, triangle_area_3d, triangle_xy_area, triangle_xy_bounds,
+    reference_xy_overlap_area_tolerance, triangle_area_3d, triangle_xy_bounds,
 };
 use super::*;
+use crate::model::geometry::{deduplicate_ring_by, signed_area_xy, triangle_xy_area};
 
 impl<'a> App<'a> {
     /// Create a new topology by replacing the area covered by a pit or stockpile
     /// solid with that solid's mesh.
+    ///
+    /// The heavy include (clip + BVH build) runs on a background thread so the
+    /// UI stays interactive; the result is applied on the next frame.
     pub(crate) fn include_solid_in_topology(
         &mut self,
         topology_id: TriangulationId,
@@ -18,6 +22,8 @@ impl<'a> App<'a> {
             anyhow::bail!("Topology and pit/stockpile solid must be different triangulations");
         }
 
+        // Snapshot the (cheap-to-clone) inputs on the UI thread; the worker
+        // must never touch `self`.
         let topology = self
             .triangulations
             .iter()
@@ -29,31 +35,80 @@ impl<'a> App<'a> {
             .find(|triangulation| triangulation.id == shape_id)
             .ok_or_else(|| anyhow::anyhow!("Pit/stockpile solid triangulation not found"))?;
 
-        let included = include_shape_mesh_in_topology_with_spatial(
-            &topology.mesh,
-            &topology.spatial,
-            &shape.mesh,
-        )?;
-        if included.faces.is_empty() {
-            anyhow::bail!("Combined triangulation produced no faces");
-        }
+        let topology_mesh = topology.mesh.clone();
+        let topology_spatial = topology.spatial.clone();
+        let shape_mesh = shape.mesh.clone();
+        let topology_name = topology.name.clone();
+        let shape_name = shape.name.clone();
 
-        userspace_log!(
-            "Included solid '{}' in topology '{}' (retained {} topology faces, skipped {} closure-cap faces)",
-            shape.name,
-            topology.name,
-            included.retained_topology_faces,
-            included.skipped_cap_faces
+        let compute = move |cancel: &crate::app::jobs::CancelFlag| -> Result<IncludeJobOutput> {
+            let included = include_shape_mesh_in_topology_with_spatial(
+                &topology_mesh,
+                &topology_spatial,
+                &shape_mesh,
+            )?;
+            if cancel.is_cancelled() {
+                anyhow::bail!("Cancelled");
+            }
+            if included.faces.is_empty() {
+                anyhow::bail!("Combined triangulation produced no faces");
+            }
+            let retained = included.retained_topology_faces;
+            let skipped = included.skipped_cap_faces;
+            let edges = triangle_edge_list(&included.faces);
+            // Build the mesh + BVH + edges in the worker too — otherwise the
+            // freeze just moves to the apply step (BVH build is the hidden half).
+            let generated = super::session::build_generated_triangulation(
+                name,
+                included.vertices,
+                included.faces,
+                TriSurfaceType::Surface,
+                |_| edges,
+            )?;
+            Ok(IncludeJobOutput {
+                generated,
+                topology_name,
+                shape_name,
+                retained,
+                skipped,
+            })
+        };
+
+        let apply = move |app: &mut App, result: Result<IncludeJobOutput>| match result {
+            Ok(output) => {
+                userspace_log!(
+                    "Included solid '{}' in topology '{}' (retained {} topology faces, skipped {} closure-cap faces)",
+                    output.shape_name,
+                    output.topology_name,
+                    output.retained,
+                    output.skipped
+                );
+                app.insert_generated_triangulation(output.generated);
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                crate::userspace_warn!("Include failed: {message}");
+            }
+        };
+
+        self.spawn_job(
+            "Including pit/stockpile solid…",
+            crate::app::jobs::JobKey::Triangulation(topology_id),
+            compute,
+            apply,
         );
-        let edges = triangle_edge_list(&included.faces);
-        self.finish_generated_triangulation_with_edges(
-            name,
-            included.vertices,
-            included.faces,
-            TriSurfaceType::Surface,
-            edges,
-        )
+        Ok(())
     }
+}
+
+/// Worker output for a background include job: the built triangulation plus the
+/// data needed for the completion log message.
+struct IncludeJobOutput {
+    generated: crate::model::triangulation::GeneratedTriangulation,
+    topology_name: String,
+    shape_name: String,
+    retained: usize,
+    skipped: usize,
 }
 
 pub(super) struct IncludedShapeMesh {
@@ -77,15 +132,6 @@ fn sorted_u32_edge(a: u32, b: u32) -> [u32; 2] {
     if a <= b { [a, b] } else { [b, a] }
 }
 
-#[cfg(test)]
-pub(super) fn include_shape_mesh_in_topology(
-    topology: &tri00t::Triangulation,
-    shape: &tri00t::Triangulation,
-) -> Result<IncludedShapeMesh> {
-    let topology_spatial = crate::model::spatial::TriangleBvh::build(topology);
-    include_shape_mesh_in_topology_with_spatial(topology, &topology_spatial, shape)
-}
-
 pub(super) fn include_shape_mesh_in_topology_with_spatial(
     topology: &tri00t::Triangulation,
     topology_spatial: &crate::model::spatial::TriangleBvh,
@@ -104,6 +150,8 @@ pub(super) fn include_shape_mesh_in_topology_with_spatial(
     let cap = closure_cap_info(shape_vertices, &shape_faces, topology, topology_spatial)?;
     let xy_area_tolerance = reference_xy_overlap_area_tolerance(topology);
 
+    let diag = std::env::var("PI_INCLUDE_DIAG").is_ok();
+    let stage_start = std::time::Instant::now();
     let skipped_cap_faces = cap.face_mask.iter().filter(|masked| **masked).count();
     let clipped_shape = clip_shape_to_topology(
         shape_vertices,
@@ -114,14 +162,40 @@ pub(super) fn include_shape_mesh_in_topology_with_spatial(
         xy_area_tolerance,
         cap.shape_cut_side,
     )?;
-    let cut_rings = rings_from_boundary_segments(&clipped_shape.topology_segments)?;
+    if diag {
+        eprintln!("include diag: shape clip {:?}", stage_start.elapsed());
+    }
+    let stage_start = std::time::Instant::now();
+    // A large contour flank is lost where the shape cuts through near-coincident
+    // doubled topology sheets (a pushback into a prior excavation): the
+    // per-triangle clip parity-cancels the near-coplanar patches there. Bridge
+    // such gaps by tracing the real boundary against the topology upper
+    // envelope, so the ring closes along the true crest instead of a straight
+    // chord that would slice through the cut interior and leave an overhang.
+    let shape_spatial = crate::model::spatial::TriangleBvh::build(shape);
+    let bridge = |start: tri00t::Vertex, end: tri00t::Vertex| {
+        trace_contact_contour(
+            start,
+            end,
+            shape,
+            &shape_spatial,
+            topology,
+            topology_spatial,
+            cap.shape_cut_side,
+        )
+    };
+    let cut_rings =
+        rings_from_boundary_segments_bridged(&clipped_shape.topology_segments, Some(&bridge))?;
+    if diag {
+        eprintln!("include diag: rings {:?}", stage_start.elapsed());
+    }
     if std::env::var("PI_INCLUDE_DIAG").is_ok() {
         let mut sizes: Vec<usize> = cut_rings.iter().map(|ring| ring.len()).collect();
         sizes.sort_unstable_by(|a, b| b.cmp(a));
         sizes.truncate(12);
         let areas: Vec<f64> = cut_rings
             .iter()
-            .map(|ring| polygon_area_vertices_xy(ring).abs())
+            .map(|ring| signed_area_xy(ring).abs())
             .collect();
         let max_area = areas.iter().copied().fold(0.0f64, f64::max);
         eprintln!(
@@ -144,18 +218,74 @@ pub(super) fn include_shape_mesh_in_topology_with_spatial(
     // overlap. This replaces the earlier per-face geo boolean difference,
     // whose cost was faces-in-ring-bbox × ring vertices and which stalled for
     // hours once a real multi-kilometre contact ring closed.
+    let stage_start = std::time::Instant::now();
     let coverage = build_ring_coverage(&cut_rings)?;
+    if diag {
+        eprintln!("include diag: coverage {:?}", stage_start.elapsed());
+    }
+
+    let stage_start = std::time::Instant::now();
+    let candidate_boundary_edges = topology_boundary_edges(topology);
+    let candidate_count = candidate_boundary_edges.len();
+    let boundary_edges =
+        filter_presence_boundary_edges(candidate_boundary_edges, topology, topology_spatial);
+    if diag {
+        eprintln!(
+            "include diag: boundary scan {:?} ({} boundary edges, {} interior cracks dropped)",
+            stage_start.elapsed(),
+            boundary_edges.len(),
+            candidate_count - boundary_edges.len()
+        );
+    }
+
+    let stage_start = std::time::Instant::now();
+    let shape_coverage =
+        build_shape_cell_coverage(&cut_rings, topology, topology_spatial, &boundary_edges)?;
+    if diag {
+        eprintln!("include diag: shape coverage {:?}", stage_start.elapsed());
+    }
+
+    let stage_start = std::time::Instant::now();
+    let shape_context = ShapeClipContext {
+        topology,
+        topology_spatial,
+        xy_area_tolerance,
+        side: cap.shape_cut_side,
+        emit_surface_pieces: true,
+    };
+    let (shape_surface_vertices, shape_surface_faces) = clip_shape_faces_by_cells(
+        shape_vertices,
+        &shape_faces,
+        &cap.face_mask,
+        &shape_coverage,
+        &shape_context,
+    );
+    if diag {
+        eprintln!(
+            "include diag: shape emit {:?} ({} surface faces)",
+            stage_start.elapsed(),
+            shape_surface_faces.len()
+        );
+    }
+
+    let stage_start = std::time::Instant::now();
     let affected = fragment_topology_faces_by_coverage(topology, &coverage);
+    if diag {
+        eprintln!("include diag: fragment {:?}", stage_start.elapsed());
+    }
+    let stage_start = std::time::Instant::now();
     let mut affected_cursor = 0usize;
 
     let estimated_output_faces = topology
         .face_count()
-        .saturating_add(clipped_shape.faces.len());
+        .saturating_add(clipped_shape.faces.len())
+        .saturating_add(shape_surface_faces.len());
     let mut output_vertices = Vec::with_capacity(
         topology
             .vertex_count()
             .saturating_add(affected.len().saturating_mul(3))
-            .saturating_add(clipped_shape.vertices.len()),
+            .saturating_add(clipped_shape.vertices.len())
+            .saturating_add(shape_surface_vertices.len()),
     );
     let mut output_faces = Vec::with_capacity(estimated_output_faces);
     let mut topology_vertex_remap = vec![u32::MAX; topology_vertices.len()];
@@ -204,6 +334,15 @@ pub(super) fn include_shape_mesh_in_topology_with_spatial(
         &mut output_vertices,
         &mut output_faces,
     );
+    append_mesh(
+        shape_surface_vertices,
+        shape_surface_faces,
+        &mut output_vertices,
+        &mut output_faces,
+    );
+    if diag {
+        eprintln!("include diag: assemble {:?}", stage_start.elapsed());
+    }
 
     Ok(IncludedShapeMesh {
         vertices: output_vertices,
@@ -312,13 +451,7 @@ pub(super) fn build_ring_coverage(rings: &[Vec<tri00t::Vertex>]) -> Result<RingC
     if cdt.num_vertices() != point_count {
         anyhow::bail!("Cut ring CDT dropped vertices unexpectedly during bulk load");
     }
-    for [a, b] in conflicting_edges {
-        cdt.add_constraint_and_split(
-            spade::handles::FixedVertexHandle::from_index(a),
-            spade::handles::FixedVertexHandle::from_index(b),
-            |point| point,
-        );
-    }
+    super::cuts::add_split_constraints(&mut cdt, conflicting_edges, "Cut ring coverage", origin);
 
     let pips: Vec<RingPip> = rings.iter().map(|ring| RingPip::build(ring)).collect();
     let cells: Vec<[glam::DVec2; 3]> = cdt
@@ -522,28 +655,37 @@ pub(super) struct ClosureCapInfo {
     shape_cut_side: TriSurfaceCutSide,
 }
 
-/// Classify the solid as a pit (bulk below the topology; keep its lower
-/// surface, CutTop) or a stockpile (bulk above; keep its upper surface,
-/// CutBottom), and mask the flat closure cap on the removed side so it never
-/// contributes geometry.
+/// Classify the solid as a pit (keep its lower surface, CutTop) or a stockpile
+/// (keep its upper surface, CutBottom), and mask the flat closure cap on the
+/// removed side so it never contributes geometry.
 ///
-/// Classification is by the solid's position relative to the topology, not by
-/// cap shape: real pit designs often have their largest flat area at the
-/// *bottom* (floor and benches) and no flat crest cap at all — a cap-area
-/// heuristic reads that as a stockpile and merges the wrong half. Flat
-/// extreme caps are excluded from the score (they are closure artifacts, and
-/// a wide flat crest cap would otherwise outweigh a small deep floor); every
-/// other face votes with its 3D area times its centroid height above or
-/// below the topology. Only when no non-cap face lies over the topology does
-/// the old cap-area comparison decide.
+/// Classification is primarily **topology-invariant** — it reads the solid's own
+/// structure, not its position relative to the target topology. For open shell
+/// surfaces the free crest/toe rim decides (rim above the surface mean ⇒ pit).
+/// For closed solids the decisive signal is flat-cap asymmetry, split by closure
+/// type. A *frustum* (a real horizontal flat cap at both z extremes) is decided
+/// by batter geometry: the walls widen toward the ground opening, so the *larger*
+/// cap is the closure and the *smaller* is the design surface. A pit's opening
+/// (`z_max`) is wider than its floor (`z_min`) — remove the top, keep the floor
+/// (`CutTop`); a stockpile's base (`z_min`) is wider than its crest (`z_max`) —
+/// remove the base, keep the crest (`CutBottom`). A solid with a flat cap at only
+/// *one* extreme (its closure crest follows terrain, or tents to an apex — ~0
+/// flat area) keeps that sole cap as the design surface. Both branches are
+/// topology-invariant, so they stay correct when the target topology has already
+/// been excavated by a prior include — the previous position-vs-topology score
+/// read the lowered post-excavation reference and flipped a real pit into a
+/// stockpile. When the two caps are nearly equal (a vertical-walled box,
+/// ambiguous from caps alone) the cap signal abstains and falls through.
+///
+/// The position-vs-topology score survives only as the last-resort tiebreaker
+/// (open shell surfaces with no flat caps, or symmetric caps), where it is still
+/// correct against original, un-excavated ground.
 pub(super) fn closure_cap_info(
     vertices: &[tri00t::Vertex],
     faces: &[[usize; 3]],
     topology: &tri00t::Triangulation,
     topology_spatial: &crate::model::spatial::TriangleBvh,
 ) -> Result<ClosureCapInfo> {
-    use rayon::prelude::*;
-
     let mut mask = vec![false; faces.len()];
     if faces.is_empty() || vertices.is_empty() {
         anyhow::bail!("Pit/stockpile solid contains no cap faces");
@@ -584,8 +726,106 @@ pub(super) fn closure_cap_info(
         }
     }
 
-    let topology_vertices = topology.vertices();
-    let height_score: f64 = faces
+    // Decision precedence — topology-invariant signals first, so the result is
+    // unaffected by a target topology already excavated by a prior include.
+    //
+    // 1. Open-rim elevation (open shell surfaces): a free crest/toe rim's
+    //    elevation vs the area-weighted surface mean. `open_rim_above_surface`
+    //    returns `None` for closed solids, so this only fires for genuinely open
+    //    surfaces whose flat extremes are design features (berm skirts, floors),
+    //    not closure caps.
+    //
+    // 2. Flat-cap asymmetry (closed solids), topology-invariant:
+    //    - Frustum (a flat cap at both extremes): battered walls widen toward the
+    //      ground opening, so the *larger* cap is the closure to remove and the
+    //      *smaller* is the design surface. A pit's opening (z_max) > its floor
+    //      (z_min) — remove the top, keep the floor (CutTop). A stockpile's base
+    //      (z_min) > its crest (z_max) — remove the base, keep the crest.
+    //    - Sole flat cap (the other extreme is tilted/tented, ~0 flat area): that
+    //      one cap is the design surface — keep it, cut the other side.
+    //    Either way the result is independent of the target topology, so a second
+    //    pit included into already-excavated ground still reads as a pit.
+    //    Symmetric cap pairs (vertical-walled box helpers) abstain and fall
+    //    through to the position score.
+    //
+    // 3. Position relative to topology (last resort): correct only against
+    //    original, un-excavated ground.
+    let cap_total = min_area + max_area;
+    let cap_asymmetric = cap_total > 1e-10 && (min_area - max_area).abs() > 0.05 * cap_total;
+    let larger_cap = min_area.max(max_area);
+    let smaller_cap = min_area.min(max_area);
+    // A genuine frustum carries a real horizontal flat cap at *both* extremes; a
+    // solid whose closure is tilted (crest follows terrain) or tented contributes
+    // exactly zero flat area at that extreme, so its sole flat cap is the design
+    // surface. `1e-6` of the larger cap separates a real (however small) opening
+    // cap from a tilt/tent's zero contribution.
+    let both_caps_flat = smaller_cap > 1e-6 * larger_cap;
+    let remove_max_cap = if let Some(rim_above_surface) = open_rim_above_surface(vertices, faces) {
+        rim_above_surface
+    } else if cap_asymmetric && both_caps_flat {
+        // Frustum: battered walls widen toward the ground opening, so the larger
+        // cap is the closure to remove (a pit's opening > its floor; a
+        // stockpile's base > its crest).
+        max_area > min_area
+    } else if cap_asymmetric {
+        // Only one extreme carries a flat cap (the other is tilted/tented); that
+        // sole flat cap is the design surface — keep it, cut the other side.
+        min_area > max_area
+    } else {
+        let topology_vertices = topology.vertices();
+        let height_score = topology_height_score(
+            vertices,
+            faces,
+            &is_cap_candidate,
+            topology,
+            topology_spatial,
+            topology_vertices,
+        );
+        if height_score < -1e-9 {
+            true
+        } else if height_score > 1e-9 {
+            false
+        } else if min_area <= 1e-10 && max_area <= 1e-10 {
+            anyhow::bail!(
+                "Pit/stockpile solid has no flat closure cap and does not overlap the topology"
+            );
+        } else {
+            min_area > max_area
+        }
+    };
+    let shape_cut_side = if remove_max_cap {
+        TriSurfaceCutSide::CutTop
+    } else {
+        TriSurfaceCutSide::CutBottom
+    };
+    for (face_index, is_max_cap) in candidates {
+        if is_max_cap == remove_max_cap {
+            mask[face_index] = true;
+        }
+    }
+    Ok(ClosureCapInfo {
+        face_mask: mask,
+        shape_cut_side,
+    })
+}
+
+/// Per-non-cap-face 3D area × (centroid z − topology z), summed in parallel.
+/// Negative ⇒ the solid's bulk is below the topology (pit). Last-resort
+/// classifier only — it reads the current topology reference, so it flips a
+/// real pit to stockpile when the topology has already been excavated by a
+/// prior include. The topology-invariant flat-cap signal in `closure_cap_info`
+/// handles that case; this is reached only when the cap and rim signals are
+/// inconclusive.
+fn topology_height_score(
+    vertices: &[tri00t::Vertex],
+    faces: &[[usize; 3]],
+    is_cap_candidate: &[bool],
+    topology: &tri00t::Triangulation,
+    topology_spatial: &crate::model::spatial::TriangleBvh,
+    topology_vertices: &[tri00t::Vertex],
+) -> f64 {
+    use rayon::prelude::*;
+    faces
         .par_iter()
         .enumerate()
         .fold(
@@ -628,39 +868,7 @@ pub(super) fn closure_cap_info(
             },
         )
         .map(|(_, score)| score)
-        .sum();
-
-    let remove_max_cap = if height_score < -1e-9 {
-        true
-    } else if height_score > 1e-9 {
-        false
-    } else if let Some(rim_above_surface) = open_rim_above_surface(vertices, faces) {
-        // Open surface with no topology overlap to vote on: a pit surface's
-        // open rim (the crest) sits above the surface it bounds, a
-        // stockpile's open rim (the toe) below it.
-        rim_above_surface
-    } else {
-        if min_area <= 1e-10 && max_area <= 1e-10 {
-            anyhow::bail!(
-                "Pit/stockpile solid has no flat closure cap and does not overlap the topology"
-            );
-        }
-        max_area >= min_area
-    };
-    let shape_cut_side = if remove_max_cap {
-        TriSurfaceCutSide::CutTop
-    } else {
-        TriSurfaceCutSide::CutBottom
-    };
-    for (face_index, is_max_cap) in candidates {
-        if is_max_cap == remove_max_cap {
-            mask[face_index] = true;
-        }
-    }
-    Ok(ClosureCapInfo {
-        face_mask: mask,
-        shape_cut_side,
-    })
+        .sum()
 }
 
 /// Whether the mesh's open rim (edges used by exactly one face) sits above
@@ -733,8 +941,16 @@ pub(super) fn triangle_is_flat_z(triangle: [tri00t::Vertex; 3], tolerance: f64) 
     z_max - z_min <= tolerance
 }
 
-pub(super) fn rings_from_boundary_segments(
+/// Given the two dead-ends of an open contour flank, return a polyline (its
+/// own end points snapping back onto the dead-ends) that traces the true cut
+/// boundary across the gap. `None` if it cannot, in which case the caller
+/// falls back to a straight chord.
+pub(super) type GapBridge<'a> =
+    &'a dyn Fn(tri00t::Vertex, tri00t::Vertex) -> Option<Vec<tri00t::Vertex>>;
+
+pub(super) fn rings_from_boundary_segments_bridged(
     segments: &[[tri00t::Vertex; 2]],
+    gap_bridge: Option<GapBridge<'_>>,
 ) -> Result<Vec<Vec<tri00t::Vertex>>> {
     let tolerance_sq = 1e-8;
     let mut grid = BoundaryNodeGrid::new(tolerance_sq);
@@ -748,14 +964,19 @@ pub(super) fn rings_from_boundary_segments(
             *edge_counts.entry(sorted_usize_pair(a, b)).or_insert(0) += 1;
         }
     }
-    let nodes = grid.nodes;
     let mut edges: Vec<(usize, usize)> = edge_counts
         .into_iter()
         .filter(|(_, count)| count % 2 == 1)
         .map(|(edge, _)| edge)
         .collect();
     edges.sort_unstable();
-    stitch_contour_gaps(&nodes, &mut edges, segments);
+    stitch_contour_gaps(&grid.nodes, &mut edges, segments);
+    // Close any large open flank left by the distance-capped stitch — tracing
+    // the real boundary across the gap when a bridger is supplied, otherwise a
+    // straight chord. Adds nodes to `grid`, so it must precede the read-only
+    // ring walk below.
+    bridge_or_close_open_contours(&mut grid, &mut edges, gap_bridge);
+    let nodes = grid.nodes;
 
     let mut adjacency = vec![Vec::<usize>::new(); nodes.len()];
     for (a, b) in &edges {
@@ -801,12 +1022,14 @@ pub(super) fn rings_from_boundary_segments(
         if ring_nodes.last() == Some(&start) {
             ring_nodes.pop();
         }
-        let mut ring = ring_nodes
-            .into_iter()
-            .map(|node_index| nodes[node_index])
-            .collect::<Vec<_>>();
-        deduplicate_ring_xy(&mut ring, tolerance_sq);
-        if closed && ring.len() >= 3 && polygon_area_vertices_xy(&ring).abs() > 1e-8 {
+        let ring = deduplicate_ring_by(
+            ring_nodes
+                .into_iter()
+                .map(|node_index| nodes[node_index])
+                .collect::<Vec<_>>(),
+            |a, b| vertices_close_xy(a, b, tolerance_sq),
+        );
+        if closed && ring.len() >= 3 && signed_area_xy(&ring).abs() > 1e-8 {
             rings.push(ring);
         }
     }
@@ -817,6 +1040,248 @@ pub(super) fn rings_from_boundary_segments(
         );
     }
     Ok(rings)
+}
+
+/// Extract the true cut boundary between two dead-ends of a broken contour
+/// flank by marching squares on the contact against the topology's UPPER
+/// envelope (max-z sheet) — the single-valued reference that stays clean where
+/// the per-triangle clip drops out over near-coincident doubled survey sheets.
+/// The boundary is the zero set of the signed cut depth (topo above design for
+/// a pit / design above topo for a stockpile; a surveyed-out hole reads as deep
+/// inside, matching the pit-floor-fills-holes rule). Marching over a bbox
+/// padded well past the straight chord captures a flank that bulges away from
+/// it; the extracted segments are then walked into the single polyline linking
+/// the two dead-ends. Returns `None` (caller falls back to a chord) if the
+/// field is unusable or no such chain exists.
+pub(super) fn trace_contact_contour(
+    start: tri00t::Vertex,
+    end: tri00t::Vertex,
+    shape: &tri00t::Triangulation,
+    shape_spatial: &crate::model::spatial::TriangleBvh,
+    topology: &tri00t::Triangulation,
+    topology_spatial: &crate::model::spatial::TriangleBvh,
+    side: TriSurfaceCutSide,
+) -> Option<Vec<tri00t::Vertex>> {
+    use rayon::prelude::*;
+    let shape_vertices = shape.vertices();
+    let topology_vertices = topology.vertices();
+    let extreme = |src: &tri00t::Triangulation,
+                   spatial: &crate::model::spatial::TriangleBvh,
+                   verts: &[tri00t::Vertex],
+                   p: glam::DVec2,
+                   want_max: bool|
+     -> Option<f64> {
+        let mut best = if want_max {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+        let mut hit = false;
+        let mut stack = Vec::new();
+        spatial.for_each_xy_bounds_candidate_index_with_stack(p, p, &mut stack, |index| {
+            if let Some(face) = src.face_vertex_indices(index) {
+                let triangle = [verts[face[0]], verts[face[1]], verts[face[2]]];
+                if let Some(z) = point_in_triangle_bary_z(p.x, p.y, triangle) {
+                    hit = true;
+                    best = if want_max { best.max(z) } else { best.min(z) };
+                }
+            }
+        });
+        hit.then_some(best)
+    };
+    let shape_max = !matches!(side, TriSurfaceCutSide::CutTop);
+    let topo_max = matches!(side, TriSurfaceCutSide::CutTop);
+    let contact_z = |p: glam::DVec2| extreme(shape, shape_spatial, shape_vertices, p, shape_max);
+    // Signed cut depth: > 0 inside the cut, < 0 outside, 0 on the boundary. No
+    // shape under the column => outside (there is no cut without the design);
+    // shape present but no topology (surveyed hole) => deep inside.
+    let depth = |p: glam::DVec2| -> f64 {
+        let Some(shape_z) = extreme(shape, shape_spatial, shape_vertices, p, shape_max) else {
+            return -1.0e6;
+        };
+        match extreme(topology, topology_spatial, topology_vertices, p, topo_max) {
+            Some(topo_z) => {
+                if topo_max {
+                    topo_z - shape_z
+                } else {
+                    shape_z - topo_z
+                }
+            }
+            None => 1.0e6,
+        }
+    };
+
+    let start_xy = glam::DVec2::new(start.x, start.y);
+    let end_xy = glam::DVec2::new(end.x, end.y);
+    let span = start_xy.distance(end_xy);
+    if span < 1.0 {
+        return None;
+    }
+    // Pad the dead-end bbox generously: the lost flank can bulge far from the
+    // straight chord (it did in the reported pushback), and marching only sees
+    // what the window covers.
+    let margin = (span * 0.5).max(100.0);
+    let min = glam::DVec2::new(start.x.min(end.x), start.y.min(end.y)) - glam::DVec2::splat(margin);
+    let max = glam::DVec2::new(start.x.max(end.x), start.y.max(end.y)) + glam::DVec2::splat(margin);
+    let extent = max - min;
+    // Resolution fine enough to trace a bench-scale crest, capped for cost.
+    let mut cell = (span / 300.0).clamp(2.0, 8.0);
+    let mut nx = (extent.x / cell).ceil() as usize + 1;
+    let mut ny = (extent.y / cell).ceil() as usize + 1;
+    while nx.saturating_mul(ny) > 500_000 {
+        cell *= 1.5;
+        nx = (extent.x / cell).ceil() as usize + 1;
+        ny = (extent.y / cell).ceil() as usize + 1;
+    }
+    if nx < 2 || ny < 2 {
+        return None;
+    }
+    let corner = |ix: usize, iy: usize| {
+        glam::DVec2::new(
+            min.x + extent.x * (ix as f64) / ((nx - 1) as f64),
+            min.y + extent.y * (iy as f64) / ((ny - 1) as f64),
+        )
+    };
+    // Sample the depth field at every grid corner (BVH point queries dominate;
+    // do them in parallel).
+    let depths: Vec<f64> = (0..nx * ny)
+        .into_par_iter()
+        .map(|k| depth(corner(k % nx, k / nx)))
+        .collect();
+    let at = |ix: usize, iy: usize| depths[iy * nx + ix];
+
+    // Marching squares: per cell, emit the zero-crossing segment(s).
+    let cross = |a: glam::DVec2, da: f64, b: glam::DVec2, db: f64| {
+        let t = (da / (da - db)).clamp(0.0, 1.0);
+        a + (b - a) * t
+    };
+    let mut segments: Vec<[glam::DVec2; 2]> = Vec::new();
+    for iy in 0..ny - 1 {
+        for ix in 0..nx - 1 {
+            let p00 = corner(ix, iy);
+            let p10 = corner(ix + 1, iy);
+            let p11 = corner(ix + 1, iy + 1);
+            let p01 = corner(ix, iy + 1);
+            let d00 = at(ix, iy);
+            let d10 = at(ix + 1, iy);
+            let d11 = at(ix + 1, iy + 1);
+            let d01 = at(ix, iy + 1);
+            // Crossings on the four edges (bottom, right, top, left).
+            let mut pts: Vec<glam::DVec2> = Vec::with_capacity(4);
+            if (d00 > 0.0) != (d10 > 0.0) {
+                pts.push(cross(p00, d00, p10, d10));
+            }
+            if (d10 > 0.0) != (d11 > 0.0) {
+                pts.push(cross(p10, d10, p11, d11));
+            }
+            if (d11 > 0.0) != (d01 > 0.0) {
+                pts.push(cross(p11, d11, p01, d01));
+            }
+            if (d01 > 0.0) != (d00 > 0.0) {
+                pts.push(cross(p01, d01, p00, d00));
+            }
+            match pts.len() {
+                2 => segments.push([pts[0], pts[1]]),
+                4 => {
+                    // Saddle: connect as two segments (pairing is arbitrary at
+                    // this resolution).
+                    segments.push([pts[0], pts[1]]);
+                    segments.push([pts[2], pts[3]]);
+                }
+                _ => {}
+            }
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+
+    // Snap crossing endpoints to nodes and walk the chain that links the node
+    // nearest `start` to the node nearest `end`.
+    let tolerance_sq = (cell * 0.5).powi(2);
+    let mut grid = BoundaryNodeGrid::new(tolerance_sq);
+    let mut edges: Vec<(usize, usize)> = Vec::with_capacity(segments.len());
+    for [a, b] in &segments {
+        let ia = grid.index_for(tri00t::Vertex::new(a.x, a.y, 0.0));
+        let ib = grid.index_for(tri00t::Vertex::new(b.x, b.y, 0.0));
+        if ia != ib {
+            edges.push(sorted_usize_pair(ia, ib));
+        }
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    let nodes = &grid.nodes;
+    let mut adjacency = vec![Vec::<usize>::new(); nodes.len()];
+    for (a, b) in &edges {
+        adjacency[*a].push(*b);
+        adjacency[*b].push(*a);
+    }
+    let nearest = |target: glam::DVec2| -> Option<usize> {
+        nodes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !adjacency[*index].is_empty())
+            .min_by(|(_, a), (_, b)| {
+                let da = glam::DVec2::new(a.x, a.y).distance_squared(target);
+                let db = glam::DVec2::new(b.x, b.y).distance_squared(target);
+                da.total_cmp(&db)
+            })
+            .map(|(index, _)| index)
+    };
+    let source = nearest(start_xy)?;
+    let sink = nearest(end_xy)?;
+    if source == sink {
+        return None;
+    }
+    // Greedy walk preferring the neighbour that most continues the current
+    // heading; robust for the smooth, mostly degree-2 contact chain.
+    let mut path_nodes = vec![source];
+    let mut visited = HashSet::new();
+    visited.insert(source);
+    let mut current = source;
+    let mut heading = glam::DVec2::new(
+        nodes[sink].x - nodes[source].x,
+        nodes[sink].y - nodes[source].y,
+    )
+    .normalize_or_zero();
+    while current != sink {
+        let here = glam::DVec2::new(nodes[current].x, nodes[current].y);
+        let next = adjacency[current]
+            .iter()
+            .copied()
+            .filter(|n| !visited.contains(n))
+            .max_by(|a, b| {
+                let da = glam::DVec2::new(nodes[*a].x, nodes[*a].y) - here;
+                let db = glam::DVec2::new(nodes[*b].x, nodes[*b].y) - here;
+                da.normalize_or_zero()
+                    .dot(heading)
+                    .total_cmp(&db.normalize_or_zero().dot(heading))
+            });
+        let Some(next) = next else {
+            return None; // dead-ended before reaching the sink
+        };
+        let step = glam::DVec2::new(nodes[next].x, nodes[next].y) - here;
+        heading = step.normalize_or_zero();
+        visited.insert(next);
+        path_nodes.push(next);
+        current = next;
+        if path_nodes.len() > nodes.len() {
+            return None;
+        }
+    }
+
+    let path = path_nodes
+        .into_iter()
+        .map(|index| {
+            let p = glam::DVec2::new(nodes[index].x, nodes[index].y);
+            let z = contact_z(p).unwrap_or_else(|| {
+                let t = (start_xy.distance(p) / span).clamp(0.0, 1.0);
+                start.z + (end.z - start.z) * t
+            });
+            tri00t::Vertex::new(p.x, p.y, z)
+        })
+        .collect();
+    Some(path)
 }
 
 /// Bridge small gaps in the contact contour by pairing odd-degree (dead-end)
@@ -892,6 +1357,96 @@ fn stitch_contour_gaps(
     edges.sort_unstable();
 }
 
+/// Close every large open contour component left after the distance-capped
+/// stitch. The stitch bridges numeric near-misses and small sheet-overlap
+/// jumps, but a contact running through a large region of overlapping/doubled
+/// topology sheets (a pushback cutting into a prior excavation) loses a whole
+/// flank — leaving one near-complete loop broken by a single multi-kilometre
+/// gap. Discarding it (only closed cycles survive) silently keeps every
+/// topology face and cuts nothing, so we always close it: `gap_bridge` traces
+/// the real boundary across the gap when it can, otherwise a straight chord
+/// (which tracks the true boundary closely only when the flank is near-linear —
+/// the tracer is what fixes a bulging flank). Only components with exactly two
+/// dead-ends and a substantial share of the contour are closed, so a stray
+/// short arc is never fused shut.
+fn bridge_or_close_open_contours(
+    grid: &mut BoundaryNodeGrid,
+    edges: &mut Vec<(usize, usize)>,
+    gap_bridge: Option<GapBridge<'_>>,
+) {
+    if edges.is_empty() {
+        return;
+    }
+    let node_count = grid.nodes.len();
+    let mut parent: Vec<usize> = (0..node_count).collect();
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        let mut root = x;
+        while parent[root] != root {
+            root = parent[root];
+        }
+        let mut cursor = x;
+        while parent[cursor] != root {
+            let next = parent[cursor];
+            parent[cursor] = root;
+            cursor = next;
+        }
+        root
+    }
+    let mut degree = vec![0usize; node_count];
+    for (a, b) in edges.iter() {
+        let ra = find(&mut parent, *a);
+        let rb = find(&mut parent, *b);
+        if ra != rb {
+            parent[ra] = rb;
+        }
+        degree[*a] += 1;
+        degree[*b] += 1;
+    }
+    let mut component_edges: HashMap<usize, usize> = HashMap::new();
+    for (a, _) in edges.iter() {
+        *component_edges.entry(find(&mut parent, *a)).or_insert(0) += 1;
+    }
+    // Dead-ends (odd degree) grouped by component.
+    let mut component_ends: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (node, &node_degree) in degree.iter().enumerate() {
+        if node_degree % 2 == 1 {
+            let root = find(&mut parent, node);
+            component_ends.entry(root).or_default().push(node);
+        }
+    }
+    let threshold = (edges.len() / 20).max(64);
+    let mut added = false;
+    for (component, ends) in component_ends {
+        if ends.len() != 2 || component_edges.get(&component).copied().unwrap_or(0) < threshold {
+            continue;
+        }
+        let (start, end) = (ends[0], ends[1]);
+        // Prefer a traced boundary; each interior point snaps to a (new) node,
+        // and the path's own end points snap back onto `start`/`end`.
+        if let Some(path) = gap_bridge.and_then(|bridge| bridge(grid.nodes[start], grid.nodes[end]))
+        {
+            let mut previous = start;
+            for point in path {
+                let index = grid.index_for(point);
+                if index != previous {
+                    edges.push(sorted_usize_pair(previous, index));
+                    previous = index;
+                }
+            }
+            if previous != end {
+                edges.push(sorted_usize_pair(previous, end));
+            }
+            added = true;
+            continue;
+        }
+        edges.push(sorted_usize_pair(start, end));
+        added = true;
+    }
+    if added {
+        edges.sort_unstable();
+    }
+}
+
 /// Snaps boundary vertices to node indices through a uniform hash grid so
 /// lookups stay near-constant regardless of how many segments the cut
 /// produced (a linear scan here goes quadratic on dense topologies).
@@ -958,29 +1513,9 @@ pub(super) fn vertices_close_xyz(a: tri00t::Vertex, b: tri00t::Vertex, tolerance
     dx * dx + dy * dy + dz * dz <= tolerance_sq
 }
 
-pub(super) fn deduplicate_ring_xy(ring: &mut Vec<tri00t::Vertex>, tolerance_sq: f64) {
-    ring.dedup_by(|a, b| vertices_close_xy(*a, *b, tolerance_sq));
-    if ring.len() > 1 && vertices_close_xy(ring[0], *ring.last().expect("non-empty"), tolerance_sq)
-    {
-        ring.pop();
-    }
-}
-
-pub(super) fn polygon_area_vertices_xy(ring: &[tri00t::Vertex]) -> f64 {
-    if ring.len() < 3 {
-        return 0.0;
-    }
-    (0..ring.len())
-        .map(|index| {
-            let a = ring[index];
-            let b = ring[(index + 1) % ring.len()];
-            a.x * b.y - b.x * a.y
-        })
-        .sum::<f64>()
-        * 0.5
-}
-
 pub(super) struct ClippedShapeMesh {
+    /// Pieces of xy-degenerate (vertical) shape faces; surface-face geometry
+    /// is produced separately by [`clip_shape_faces_by_cells`].
     vertices: Vec<tri00t::Vertex>,
     faces: Vec<[u32; 3]>,
     topology_segments: Vec<[tri00t::Vertex; 2]>,
@@ -991,13 +1526,21 @@ pub(super) struct ShapeClipContext<'a> {
     topology_spatial: &'a crate::model::spatial::TriangleBvh,
     xy_area_tolerance: f64,
     side: TriSurfaceCutSide,
+    /// Emit clipped surface pieces (one per covering topology triangle).
+    /// Off for the whole-shape contact pass, on for the exact sub-clip of
+    /// coverage-cell pieces the contact ring actually crosses.
+    emit_surface_pieces: bool,
 }
 
 #[derive(Default)]
 pub(super) struct ShapeClipOutput {
+    /// Pieces of xy-degenerate (vertical) shape faces only; surface faces are
+    /// re-emitted later against the coarse cell coverage instead.
     vertices: Vec<tri00t::Vertex>,
     faces: Vec<[u32; 3]>,
     topology_segments: Vec<[tri00t::Vertex; 2]>,
+    /// Whether any surface face had geometry on the retained side.
+    surface_retained: bool,
 }
 
 pub(super) fn clip_shape_to_topology(
@@ -1016,6 +1559,7 @@ pub(super) fn clip_shape_to_topology(
         topology_spatial,
         xy_area_tolerance,
         side,
+        emit_surface_pieces: false,
     };
     let task_count = rayon::current_num_threads().saturating_mul(4).max(1);
     let chunk_size = shape_faces.len().div_ceil(task_count).max(1);
@@ -1039,11 +1583,20 @@ pub(super) fn clip_shape_to_topology(
                     shape_vertices[face[2]],
                 ];
                 if triangle_xy_area(triangle).abs() <= 1.0e-10 {
+                    let vertices_start = output.vertices.len();
+                    let faces_start = output.faces.len();
                     clip_vertical_shape_triangle_to_topology(
                         triangle,
                         &context,
                         &mut output,
                         &mut candidate_stack,
+                    );
+                    collapse_fully_retained_face(
+                        triangle,
+                        vertices_start,
+                        faces_start,
+                        &mut output.vertices,
+                        &mut output.faces,
                     );
                 } else {
                     clip_surface_shape_triangle_to_topology(
@@ -1068,22 +1621,542 @@ pub(super) fn clip_shape_to_topology(
                 .map(|partial| partial.topology_segments.len())
                 .sum(),
         ),
+        surface_retained: false,
     };
     for partial in partials {
         append_shape_clip_output(&mut output, partial);
     }
 
-    if output.faces.is_empty() {
+    if output.faces.is_empty() && !output.surface_retained {
         anyhow::bail!("Pit/stockpile solid has no geometry on the retained side of the topology");
     }
     if output.topology_segments.is_empty() {
         anyhow::bail!("Pit/stockpile solid did not intersect the topology surface");
     }
+
     Ok(ClippedShapeMesh {
         vertices: output.vertices,
         faces: output.faces,
         topology_segments: output.topology_segments,
     })
+}
+
+/// Surface-face geometry of the shape, emitted against the coarse cell
+/// coverage instead of one piece per covering topology triangle (which put
+/// the whole pit floor at LiDAR resolution — millions of slivers for a
+/// few-hundred-face design). Within a cell the footprint membership and
+/// topology presence are uniform, and the shape-vs-topology sign can only
+/// flip across a contact ring edge (a cell constraint), so height samples at
+/// the piece corners decide almost every piece whole; only pieces the contact
+/// actually crosses (stitched ring gaps, snap tolerance) fall back to the
+/// exact per-topology-triangle clip. Fully retained faces collapse back to
+/// their original design tessellation.
+fn clip_shape_faces_by_cells(
+    shape_vertices: &[tri00t::Vertex],
+    shape_faces: &[[usize; 3]],
+    cap_mask: &[bool],
+    coverage: &ShapeCellCoverage,
+    context: &ShapeClipContext<'_>,
+) -> (Vec<tri00t::Vertex>, Vec<[u32; 3]>) {
+    use rayon::prelude::*;
+
+    let retained = |delta: f64| match context.side {
+        TriSurfaceCutSide::CutTop => delta <= 1e-9,
+        TriSurfaceCutSide::CutBottom => delta >= -1e-9,
+    };
+
+    let task_count = rayon::current_num_threads().saturating_mul(4).max(1);
+    let chunk_size = shape_faces.len().div_ceil(task_count).max(1);
+    let partials: Vec<(Vec<tri00t::Vertex>, Vec<[u32; 3]>)> = shape_faces
+        .par_chunks(chunk_size)
+        .enumerate()
+        .map(|(chunk_index, faces)| {
+            let mut vertices = Vec::new();
+            let mut output_faces = Vec::new();
+            let mut cell_stack = Vec::new();
+            let mut topology_stack = Vec::new();
+            let mut candidates: Vec<usize> = Vec::new();
+            let face_index_base = chunk_index * chunk_size;
+
+            for (offset, face) in faces.iter().enumerate() {
+                if cap_mask
+                    .get(face_index_base + offset)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let triangle = [
+                    shape_vertices[face[0]],
+                    shape_vertices[face[1]],
+                    shape_vertices[face[2]],
+                ];
+                if triangle_xy_area(triangle).abs() <= 1.0e-10 {
+                    // Vertical faces have no usable XY footprint; the contact
+                    // pass already emitted their pieces.
+                    continue;
+                }
+                let vertices_start = vertices.len();
+                let faces_start = output_faces.len();
+                let bounds = triangle_xy_bounds(triangle);
+                candidates.clear();
+                coverage
+                    .spatial
+                    .for_each_xy_bounds_candidate_index_with_stack(
+                        bounds.0,
+                        bounds.1,
+                        &mut cell_stack,
+                        |index| candidates.push(index),
+                    );
+                for &index in &candidates {
+                    let piece =
+                        clip_target_triangle_to_reference_xy(triangle, coverage.triangles[index]);
+                    if piece.len() < 3 {
+                        continue;
+                    }
+                    if coverage.covered[index] {
+                        // Inside the cut footprint the shape *is* the design
+                        // surface and replaces the topology unconditionally.
+                        // A local topo dip that drops the topology below the
+                        // shell must not punch a hole through the continuous
+                        // pit/stockpile surface — the shell fills the dip, it
+                        // does not expose it. (Surveyed-out holes — covered
+                        // cells with no topology — are handled identically.)
+                        append_shape_polygon(&piece, &mut vertices, &mut output_faces);
+                        continue;
+                    }
+                    if !coverage.present[index] {
+                        // Outside the footprint with no topology: nothing to
+                        // keep. Don't let the shape hang past the topology's
+                        // rim.
+                        continue;
+                    }
+                    let centroid = piece
+                        .iter()
+                        .fold(glam::DVec3::ZERO, |sum, point| sum + *point)
+                        / piece.len() as f64;
+                    let mut any_retained = false;
+                    let mut any_discarded = false;
+                    for point in piece.iter().chain(std::iter::once(&centroid)) {
+                        let Some(delta) = worst_height_delta(*point, context, &mut topology_stack)
+                        else {
+                            continue;
+                        };
+                        if retained(delta) {
+                            any_retained = true;
+                        } else {
+                            any_discarded = true;
+                        }
+                    }
+                    if !any_retained {
+                        continue;
+                    }
+                    if !any_discarded {
+                        append_shape_polygon(&piece, &mut vertices, &mut output_faces);
+                        continue;
+                    }
+                    // The contact crosses this piece (it can wander off the
+                    // ring edges by the snap tolerance and across stitched
+                    // gaps): resolve it exactly against the topology.
+                    let mut scratch = ShapeClipOutput::default();
+                    for i in 1..piece.len() - 1 {
+                        let sub_triangle = [
+                            tri00t::Vertex::new(piece[0].x, piece[0].y, piece[0].z),
+                            tri00t::Vertex::new(piece[i].x, piece[i].y, piece[i].z),
+                            tri00t::Vertex::new(piece[i + 1].x, piece[i + 1].y, piece[i + 1].z),
+                        ];
+                        if triangle_xy_area(sub_triangle).abs() <= 1.0e-10 {
+                            continue;
+                        }
+                        clip_surface_shape_triangle_to_topology(
+                            sub_triangle,
+                            context,
+                            &mut scratch,
+                            &mut topology_stack,
+                        );
+                    }
+                    let base = vertices.len() as u32;
+                    vertices.extend(scratch.vertices);
+                    output_faces.extend(
+                        scratch
+                            .faces
+                            .into_iter()
+                            .map(|face| [base + face[0], base + face[1], base + face[2]]),
+                    );
+                }
+                collapse_fully_retained_face(
+                    triangle,
+                    vertices_start,
+                    faces_start,
+                    &mut vertices,
+                    &mut output_faces,
+                );
+            }
+            (vertices, output_faces)
+        })
+        .collect();
+
+    let mut vertices = Vec::with_capacity(partials.iter().map(|(v, _)| v.len()).sum());
+    let mut faces = Vec::with_capacity(partials.iter().map(|(_, f)| f.len()).sum());
+    for (partial_vertices, partial_faces) in partials {
+        let base = vertices.len() as u32;
+        vertices.extend(partial_vertices);
+        faces.extend(
+            partial_faces
+                .into_iter()
+                .map(|face| [base + face[0], base + face[1], base + face[2]]),
+        );
+    }
+    (vertices, faces)
+}
+
+/// The shape-vs-topology height difference at `point`, folded to the worst
+/// case across every covering topology sheet for the cut side — a piece
+/// counts as retained only when it is on the retained side of ALL sheets, so
+/// doubled survey sheets don't duplicate it. `None` when no topology covers
+/// the point.
+fn worst_height_delta(
+    point: glam::DVec3,
+    context: &ShapeClipContext<'_>,
+    candidate_stack: &mut Vec<usize>,
+) -> Option<f64> {
+    let xy = glam::DVec2::new(point.x, point.y);
+    let mut worst: Option<f64> = None;
+    context
+        .topology_spatial
+        .for_each_xy_bounds_candidate_index_with_stack(xy, xy, candidate_stack, |topology_index| {
+            let Some(reference) = reference_triangle_for_topology_index(context, topology_index)
+            else {
+                return;
+            };
+            let Some(reference_z) = point_in_triangle_bary_z(point.x, point.y, reference) else {
+                return;
+            };
+            let delta = point.z - reference_z;
+            worst = Some(match worst {
+                None => delta,
+                Some(current) => match context.side {
+                    TriSurfaceCutSide::CutTop => current.max(delta),
+                    TriSurfaceCutSide::CutBottom => current.min(delta),
+                },
+            });
+        });
+    worst
+}
+
+/// Keep only the candidate boundary edges that actually border missing
+/// topology in XY: no covering face a hair to one side of the edge midpoint.
+///
+/// Meshes produced by earlier includes are index-disconnected along fragment
+/// seams, and fragments subdivide shared edges at cell crossings, so the
+/// index parity in [`topology_boundary_edges`] reports every hairline
+/// interior crack and T-junction of the previous contact band as "boundary".
+/// Topology presence does not flip across a zero-width crack, so as CDT
+/// constraints those edges are pure noise — tens of thousands of
+/// near-coincident segments along the old contact ring that drive the
+/// constraint-splitting insert into pathological splitting (the re-include
+/// hang) and spade's internal assert. Probing both sides keeps true rims
+/// (hole and outer) and drops everything interior.
+fn filter_presence_boundary_edges(
+    edges: Vec<[usize; 2]>,
+    topology: &tri00t::Triangulation,
+    topology_spatial: &crate::model::spatial::TriangleBvh,
+) -> Vec<[usize; 2]> {
+    use rayon::prelude::*;
+
+    // Wider than any seam crack (snap tolerances bound those to ~1e-4 m),
+    // far narrower than a real surveyed-out hole.
+    const PROBE_OFFSET: f64 = 1.0e-3;
+
+    let vertices = topology.vertices();
+    edges
+        .into_par_iter()
+        .map_init(Vec::new, |candidate_stack, edge| {
+            let a = vertices[edge[0]];
+            let b = vertices[edge[1]];
+            let direction = glam::DVec2::new(b.x - a.x, b.y - a.y);
+            let length = direction.length();
+            if length <= f64::EPSILON {
+                return None;
+            }
+            let normal = glam::DVec2::new(-direction.y, direction.x) * (PROBE_OFFSET / length);
+            let midpoint = glam::DVec2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+            let mut covered = |probe: glam::DVec2| {
+                let mut hit = false;
+                topology_spatial.for_each_xy_bounds_candidate_index_with_stack(
+                    probe,
+                    probe,
+                    candidate_stack,
+                    |face_index| {
+                        if hit {
+                            return;
+                        }
+                        let Some(face) = topology.face_vertex_indices(face_index) else {
+                            return;
+                        };
+                        let triangle = [vertices[face[0]], vertices[face[1]], vertices[face[2]]];
+                        if point_in_triangle_bary_z(probe.x, probe.y, triangle).is_some() {
+                            hit = true;
+                        }
+                    },
+                );
+                hit
+            };
+            (!(covered(midpoint + normal) && covered(midpoint - normal))).then_some(edge)
+        })
+        .flatten()
+        .collect()
+}
+
+/// Edges used by exactly one topology face: the rims of holes and of the
+/// surface itself.
+fn topology_boundary_edges(topology: &tri00t::Triangulation) -> Vec<[usize; 2]> {
+    use rayon::prelude::*;
+
+    let mut keys: Vec<u64> = Vec::with_capacity(topology.face_count() * 3);
+    for face in topology.face_vertex_indices_iter() {
+        for (a, b) in [(face[0], face[1]), (face[1], face[2]), (face[2], face[0])] {
+            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+            keys.push(((lo as u64) << 32) | hi as u64);
+        }
+    }
+    keys.par_sort_unstable();
+
+    let mut edges = Vec::new();
+    let mut index = 0;
+    while index < keys.len() {
+        let key = keys[index];
+        let mut run = 1;
+        while index + run < keys.len() && keys[index + run] == key {
+            run += 1;
+        }
+        if run == 1 {
+            edges.push([(key >> 32) as usize, (key & 0xffff_ffff) as usize]);
+        }
+        index += run;
+    }
+    edges
+}
+
+/// Partition the plane by the topology's boundary edges (same CDT scheme as
+/// [`build_ring_coverage`]) and classify each cell by whether the topology
+/// covers it — presence only changes across a boundary edge, so a single
+/// point query per cell is exact.
+/// The plane partitioned by a CDT constrained on BOTH discontinuity sets the
+/// shape emission cares about: the contact ring edges (where the shape crosses
+/// the topology, so the retained side flips) and the topology boundary edges
+/// (hole rims and the outer rim, where topology presence flips). Each cell is
+/// therefore uniform in footprint membership and in topology presence, and
+/// the shape-vs-topology height sign is constant per shape face within it.
+pub(super) struct ShapeCellCoverage {
+    triangles: Vec<[tri00t::Vertex; 3]>,
+    /// Inside the cut footprint (inside any contact ring).
+    covered: Vec<bool>,
+    /// Topology exists under the cell.
+    present: Vec<bool>,
+    spatial: crate::model::spatial::TriangleBvh,
+}
+
+fn build_shape_cell_coverage(
+    rings: &[Vec<tri00t::Vertex>],
+    topology: &tri00t::Triangulation,
+    topology_spatial: &crate::model::spatial::TriangleBvh,
+    boundary_edges: &[[usize; 2]],
+) -> Result<ShapeCellCoverage> {
+    use rayon::prelude::*;
+    use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation as _};
+
+    let topology_vertices = topology.vertices();
+    let mut min = glam::DVec2::splat(f64::INFINITY);
+    let mut max = glam::DVec2::splat(f64::NEG_INFINITY);
+    for edge in boundary_edges {
+        for &vertex_index in edge {
+            let vertex = topology_vertices[vertex_index];
+            if !vertex.x.is_finite() || !vertex.y.is_finite() {
+                anyhow::bail!("Topology boundary contains non-finite coordinates");
+            }
+            min = min.min(glam::DVec2::new(vertex.x, vertex.y));
+            max = max.max(glam::DVec2::new(vertex.x, vertex.y));
+        }
+    }
+    for ring in rings {
+        for vertex in ring {
+            min = min.min(glam::DVec2::new(vertex.x, vertex.y));
+            max = max.max(glam::DVec2::new(vertex.x, vertex.y));
+        }
+    }
+    if !min.x.is_finite() {
+        anyhow::bail!("Shape cell coverage has no constraint geometry");
+    }
+    let origin = min;
+    let extent = max - min;
+
+    let normalized = |value: f64| if value == 0.0 { 0.0 } else { value };
+    let padding = super::cuts::ENVELOPE_PADDING;
+    let mut points: Vec<Point2<f64>> = Vec::new();
+    for (corner_x, corner_y) in [
+        (-padding, -padding),
+        (extent.x + padding, -padding),
+        (extent.x + padding, extent.y + padding),
+        (-padding, extent.y + padding),
+    ] {
+        points.push(Point2::new(corner_x, corner_y));
+    }
+    let mut point_indices: HashMap<(u64, u64), usize> = HashMap::new();
+    let mut point_for = |vertex: tri00t::Vertex, points: &mut Vec<Point2<f64>>| {
+        let local_x = normalized(vertex.x - origin.x);
+        let local_y = normalized(vertex.y - origin.y);
+        *point_indices
+            .entry((local_x.to_bits(), local_y.to_bits()))
+            .or_insert_with(|| {
+                points.push(Point2::new(local_x, local_y));
+                points.len() - 1
+            })
+    };
+    let mut edges: HashSet<(usize, usize)> = HashSet::new();
+    for edge in boundary_edges {
+        let a = point_for(topology_vertices[edge[0]], &mut points);
+        let b = point_for(topology_vertices[edge[1]], &mut points);
+        if a != b {
+            edges.insert(sorted_usize_pair(a, b));
+        }
+    }
+    for ring in rings {
+        for index in 0..ring.len() {
+            let a = point_for(ring[index], &mut points);
+            let b = point_for(ring[(index + 1) % ring.len()], &mut points);
+            if a != b {
+                edges.insert(sorted_usize_pair(a, b));
+            }
+        }
+    }
+    let mut edge_list: Vec<[usize; 2]> = edges.into_iter().map(|(a, b)| [a, b]).collect();
+    edge_list.sort_unstable();
+
+    let point_count = points.len();
+    let mut conflicting_edges: Vec<[usize; 2]> = Vec::new();
+    let mut cdt: ConstrainedDelaunayTriangulation<Point2<f64>> =
+        ConstrainedDelaunayTriangulation::try_bulk_load_cdt(points, edge_list, |edge| {
+            conflicting_edges.push(edge)
+        })
+        .map_err(|error| anyhow::anyhow!("Boundary CDT bulk load failed: {error:?}"))?;
+    if cdt.num_vertices() != point_count {
+        anyhow::bail!("Boundary CDT dropped vertices unexpectedly during bulk load");
+    }
+    super::cuts::add_split_constraints(&mut cdt, conflicting_edges, "Shape cell coverage", origin);
+
+    let cells: Vec<[glam::DVec2; 3]> = cdt
+        .inner_faces()
+        .map(|face| {
+            face.vertices().map(|vertex| {
+                let position = vertex.position();
+                glam::DVec2::new(position.x + origin.x, position.y + origin.y)
+            })
+        })
+        .collect();
+    let pips: Vec<RingPip> = rings.iter().map(|ring| RingPip::build(ring)).collect();
+    let classified: Vec<([tri00t::Vertex; 3], bool, bool)> = cells
+        .par_iter()
+        .map_init(Vec::new, |candidate_stack, corners| {
+            let cell = corners.map(|corner| tri00t::Vertex::new(corner.x, corner.y, 0.0));
+            if triangle_xy_area(cell).abs() <= 1e-12 {
+                return None;
+            }
+            let centroid = (corners[0] + corners[1] + corners[2]) / 3.0;
+            let covered = pips.iter().any(|pip| pip.contains(centroid));
+            let mut present = false;
+            topology_spatial.for_each_xy_bounds_candidate_index_with_stack(
+                centroid,
+                centroid,
+                candidate_stack,
+                |face_index| {
+                    if present {
+                        return;
+                    }
+                    let Some(face) = topology.face_vertex_indices(face_index) else {
+                        return;
+                    };
+                    let triangle = [
+                        topology_vertices[face[0]],
+                        topology_vertices[face[1]],
+                        topology_vertices[face[2]],
+                    ];
+                    if point_in_triangle_bary_z(centroid.x, centroid.y, triangle).is_some() {
+                        present = true;
+                    }
+                },
+            );
+            Some((cell, covered, present))
+        })
+        .filter_map(|classified_cell| classified_cell)
+        .collect();
+
+    let mut vertices = Vec::with_capacity(classified.len() * 3);
+    let mut faces = Vec::with_capacity(classified.len());
+    let mut triangles = Vec::with_capacity(classified.len());
+    let mut covered = Vec::with_capacity(classified.len());
+    let mut present = Vec::with_capacity(classified.len());
+    for (cell, is_covered, is_present) in classified {
+        let base = vertices.len() as u32;
+        vertices.extend_from_slice(&cell);
+        faces.push([base, base + 1, base + 2]);
+        triangles.push(cell);
+        covered.push(is_covered);
+        present.push(is_present);
+    }
+    let mesh = tri00t::Triangulation::from_vertices_and_faces(vertices, faces);
+    let spatial = crate::model::spatial::TriangleBvh::build(&mesh);
+    Ok(ShapeCellCoverage {
+        triangles,
+        covered,
+        present,
+        spatial,
+    })
+}
+
+/// If the clip kept the shape face in its entirety, replace the per-topology-
+/// triangle fragments with the original face. The clip emits one piece per
+/// covering topology triangle, so a face wholly on the retained side comes
+/// back as thousands of coplanar slivers that tile it exactly; detecting that
+/// by area lets interior floor/bench/wall faces keep their design tessellation
+/// and only faces crossing the contact ring (or a topology hole rim) stay
+/// fragmented.
+fn collapse_fully_retained_face(
+    triangle: [tri00t::Vertex; 3],
+    vertices_start: usize,
+    faces_start: usize,
+    vertices: &mut Vec<tri00t::Vertex>,
+    faces: &mut Vec<[u32; 3]>,
+) {
+    if faces.len() == faces_start {
+        return;
+    }
+    let face_area = triangle_area_3d(triangle);
+    if face_area <= 1.0e-12 {
+        return;
+    }
+    let pieces_area: f64 = faces[faces_start..]
+        .iter()
+        .map(|face| {
+            triangle_area_3d([
+                vertices[face[0] as usize],
+                vertices[face[1] as usize],
+                vertices[face[2] as usize],
+            ])
+        })
+        .sum();
+    // Degenerate slivers are dropped at append time, so a fully retained face
+    // can come up marginally short; a genuine cut at the contact ring removes
+    // macroscopic area. Overlapping-sheet topologies emit doubled pieces and
+    // overshoot instead, which also fails the check and stays fragmented.
+    if (pieces_area - face_area).abs() > face_area * 1.0e-7 {
+        return;
+    }
+    vertices.truncate(vertices_start);
+    faces.truncate(faces_start);
+    let base = vertices_start as u32;
+    vertices.extend(triangle);
+    faces.push([base, base + 1, base + 2]);
 }
 
 fn append_shape_clip_output(output: &mut ShapeClipOutput, partial: ShapeClipOutput) {
@@ -1096,6 +2169,7 @@ fn append_shape_clip_output(output: &mut ShapeClipOutput, partial: ShapeClipOutp
             .map(|face| [base + face[0], base + face[1], base + face[2]]),
     );
     output.topology_segments.extend(partial.topology_segments);
+    output.surface_retained |= partial.surface_retained;
 }
 
 fn reference_triangle_for_topology_index(
@@ -1144,9 +2218,44 @@ pub(super) fn clip_surface_shape_triangle_to_topology(
                     .collect::<Vec<_>>();
                 let clipped = clip_surface_polygon(polygon, context.side);
                 collect_topology_segments(&clipped, &mut output.topology_segments);
-                append_surface_clip_polygon(&clipped, &mut output.vertices, &mut output.faces);
+                // In the contact pass geometry is not emitted: one piece per
+                // covering topology triangle would put the whole pit floor at
+                // LiDAR resolution. Surface faces are re-emitted against the
+                // coarse cell coverage once the contact rings are known.
+                if context.emit_surface_pieces {
+                    append_surface_clip_polygon(&clipped, &mut output.vertices, &mut output.faces);
+                } else if clipped.len() >= 3 {
+                    output.surface_retained = true;
+                }
             },
         );
+}
+
+fn append_shape_polygon(
+    polygon: &[glam::DVec3],
+    vertices: &mut Vec<tri00t::Vertex>,
+    faces: &mut Vec<[u32; 3]>,
+) {
+    if polygon.len() < 3 {
+        return;
+    }
+    let base = vertices.len() as u32;
+    vertices.extend(
+        polygon
+            .iter()
+            .map(|point| tri00t::Vertex::new(point.x, point.y, point.z)),
+    );
+    for i in 1..polygon.len() - 1 {
+        let face = [base, base + i as u32, base + i as u32 + 1];
+        let a = vertices[face[0] as usize];
+        let b = vertices[face[1] as usize];
+        let c = vertices[face[2] as usize];
+        let ab = glam::DVec3::new(b.x - a.x, b.y - a.y, b.z - a.z);
+        let ac = glam::DVec3::new(c.x - a.x, c.y - a.y, c.z - a.z);
+        if ab.cross(ac).length_squared() > 1e-20 {
+            faces.push(face);
+        }
+    }
 }
 
 pub(super) fn clip_vertical_shape_triangle_to_topology(
@@ -1350,6 +2459,19 @@ pub(super) fn collect_topology_segments(
     if polygon.len() < 2 {
         return;
     }
+    // A polygon lying entirely ON the topology (a coplanar contact patch —
+    // e.g. a berm skirt at exactly a previously included floor RL) is a tie:
+    // the shape neither cuts nor clears the surface there, so it contributes
+    // no contact boundary. Emitting its edges would leave the boundary to
+    // parity cancellation between floating-point-noise copies of the same
+    // segments, which produces near-degenerate cut rings; the real boundary
+    // is emitted by the neighbouring polygons that do cross the surface.
+    if polygon
+        .iter()
+        .all(|vertex| vertex.height_delta.abs() <= 1e-8)
+    {
+        return;
+    }
     for index in 0..polygon.len() {
         let a = polygon[index];
         let b = polygon[(index + 1) % polygon.len()];
@@ -1379,447 +2501,4 @@ pub(super) fn append_mesh(
             .into_iter()
             .map(|face| [base + face[0], base + face[1], base + face[2]]),
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn grid_topology(cells: usize, extent: f64) -> tri00t::Triangulation {
-        let step = extent / cells as f64;
-        let side = cells + 1;
-        let mut vertices = Vec::with_capacity(side * side);
-        for row in 0..side {
-            for col in 0..side {
-                vertices.push(tri00t::Vertex::new(
-                    col as f64 * step,
-                    row as f64 * step,
-                    0.0,
-                ));
-            }
-        }
-        let mut faces = Vec::with_capacity(cells * cells * 2);
-        for row in 0..cells {
-            for col in 0..cells {
-                let a = (row * side + col) as u32;
-                let b = a + 1;
-                let c = a + side as u32;
-                let d = c + 1;
-                faces.push([a, b, d]);
-                faces.push([a, d, c]);
-            }
-        }
-        tri00t::Triangulation::from_vertices_and_faces(vertices, faces)
-    }
-
-    /// Closed box solid: flat cap at `z_top`, flat floor at `z_floor`,
-    /// vertical walls — the shape of a rough pit design.
-    fn box_pit(min: [f64; 2], max: [f64; 2], z_floor: f64, z_top: f64) -> tri00t::Triangulation {
-        let corner = |x: f64, y: f64, z: f64| tri00t::Vertex::new(x, y, z);
-        let vertices = vec![
-            corner(min[0], min[1], z_floor),
-            corner(max[0], min[1], z_floor),
-            corner(max[0], max[1], z_floor),
-            corner(min[0], max[1], z_floor),
-            corner(min[0], min[1], z_top),
-            corner(max[0], min[1], z_top),
-            corner(max[0], max[1], z_top),
-            corner(min[0], max[1], z_top),
-        ];
-        let faces = vec![
-            // floor + cap
-            [0, 2, 1],
-            [0, 3, 2],
-            [4, 5, 6],
-            [4, 6, 7],
-            // walls
-            [0, 1, 5],
-            [0, 5, 4],
-            [1, 2, 6],
-            [1, 6, 5],
-            [2, 3, 7],
-            [2, 7, 6],
-            [3, 0, 4],
-            [3, 4, 7],
-        ];
-        tri00t::Triangulation::from_vertices_and_faces(vertices, faces)
-    }
-
-    fn kept_xy_area(vertices: &[tri00t::Vertex], faces: &[[u32; 3]]) -> f64 {
-        faces
-            .iter()
-            .map(|face| {
-                let triangle = [
-                    vertices[face[0] as usize],
-                    vertices[face[1] as usize],
-                    vertices[face[2] as usize],
-                ];
-                triangle_xy_area(triangle).abs()
-            })
-            .sum()
-    }
-
-    #[test]
-    fn include_box_pit_replaces_topology_inside_footprint() {
-        // Flat topology at z=0 over [0,20]^2; box pit x/y:[5.3,10.3] with the
-        // floor at z=-5 (below the topology) and the closure cap at z=2.
-        let topology = grid_topology(20, 20.0);
-        let pit = box_pit([5.3, 5.3], [10.3, 10.3], -5.0, 2.0);
-
-        let included = include_shape_mesh_in_topology(&topology, &pit).expect("include succeeds");
-
-        assert_eq!(included.skipped_cap_faces, 2, "top cap should be skipped");
-        assert!(included.retained_topology_faces > 0);
-
-        // The pit floor replaces the footprint exactly, so the XY-projected
-        // area is unchanged: (400 - 25) retained topology + 25 floor. The
-        // vertical walls contribute no XY area.
-        let area = kept_xy_area(&included.vertices, &included.faces);
-        assert!(
-            (area - 400.0).abs() < 1e-6,
-            "expected XY area 400, got {area}"
-        );
-
-        // The floor must survive at its own depth, and no topology-level
-        // geometry may remain strictly inside the footprint.
-        assert!(
-            included.vertices.iter().any(|vertex| vertex.z == -5.0),
-            "pit floor missing from output"
-        );
-        for vertex in &included.vertices {
-            let strictly_inside = vertex.x > 5.3 + 1e-6
-                && vertex.x < 10.3 - 1e-6
-                && vertex.y > 5.3 + 1e-6
-                && vertex.y < 10.3 - 1e-6;
-            assert!(
-                !(strictly_inside && vertex.z == 0.0),
-                "topology vertex ({}, {}) left inside the pit footprint",
-                vertex.x,
-                vertex.y
-            );
-        }
-    }
-
-    /// The reported misclassification: a pit whose only flat extreme cap is
-    /// its *floor* (the crest closure follows terrain, so it is not flat).
-    /// The old cap-area heuristic read the flat floor as a stockpile's bottom
-    /// closure and merged the upper surface; position relative to the
-    /// topology must classify it as a pit.
-    #[test]
-    fn include_pit_with_flat_floor_and_uneven_crest_classifies_as_pit() {
-        let topology = grid_topology(20, 20.0);
-        // Box pit with the closure cap tilted (z from 1 to 2, never flat) and
-        // a flat floor at z=-5 — the floor is the largest flat area.
-        let corner = |x: f64, y: f64, z: f64| tri00t::Vertex::new(x, y, z);
-        let vertices = vec![
-            corner(5.3, 5.3, -5.0),
-            corner(10.3, 5.3, -5.0),
-            corner(10.3, 10.3, -5.0),
-            corner(5.3, 10.3, -5.0),
-            corner(5.3, 5.3, 1.0),
-            corner(10.3, 5.3, 1.5),
-            corner(10.3, 10.3, 2.0),
-            corner(5.3, 10.3, 1.5),
-        ];
-        let faces = vec![
-            [0, 2, 1],
-            [0, 3, 2],
-            [4, 5, 6],
-            [4, 6, 7],
-            [0, 1, 5],
-            [0, 5, 4],
-            [1, 2, 6],
-            [1, 6, 5],
-            [2, 3, 7],
-            [2, 7, 6],
-            [3, 0, 4],
-            [3, 4, 7],
-        ];
-        let pit = tri00t::Triangulation::from_vertices_and_faces(vertices, faces);
-
-        let included = include_shape_mesh_in_topology(&topology, &pit).expect("include succeeds");
-
-        assert!(
-            included.vertices.iter().any(|vertex| vertex.z == -5.0),
-            "pit floor missing from output — solid was treated as a stockpile"
-        );
-        for vertex in &included.vertices {
-            let strictly_inside = vertex.x > 5.3 + 1e-6
-                && vertex.x < 10.3 - 1e-6
-                && vertex.y > 5.3 + 1e-6
-                && vertex.y < 10.3 - 1e-6;
-            assert!(
-                !(strictly_inside && vertex.z == 0.0),
-                "topology vertex ({}, {}) left inside the pit footprint",
-                vertex.x,
-                vertex.y
-            );
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn diag_pit_00t_structure() {
-        let home = std::env::var("HOME").unwrap();
-        let shape =
-            crate::model::formats::read_mesh(format!("{home}/Downloads/pit.00t")).expect("loads");
-        let vertices = shape.vertices();
-        let faces: Vec<[usize; 3]> = shape.face_vertex_indices_iter().collect();
-        let mut z_min = f64::INFINITY;
-        let mut z_max = f64::NEG_INFINITY;
-        for v in vertices {
-            z_min = z_min.min(v.z);
-            z_max = z_max.max(v.z);
-        }
-        let z_tolerance = ((z_max - z_min).abs() * 1e-8).max(1e-6);
-        eprintln!(
-            "{} verts, {} faces, z [{z_min}, {z_max}], tol {z_tolerance}",
-            vertices.len(),
-            faces.len()
-        );
-
-        let mut flat = 0usize;
-        let mut flat_at_min = (0usize, 0.0f64);
-        let mut flat_at_max = (0usize, 0.0f64);
-        let mut vertical = 0usize;
-        let mut other = 0usize;
-        let mut flat_z_samples: Vec<f64> = Vec::new();
-        for face in &faces {
-            let t = [vertices[face[0]], vertices[face[1]], vertices[face[2]]];
-            let xy_area = triangle_xy_area(t).abs();
-            if triangle_is_flat_z(t, z_tolerance) {
-                flat += 1;
-                let z = (t[0].z + t[1].z + t[2].z) / 3.0;
-                flat_z_samples.push(z);
-                if (z - z_min).abs() <= z_tolerance {
-                    flat_at_min.0 += 1;
-                    flat_at_min.1 += xy_area;
-                } else if (z - z_max).abs() <= z_tolerance {
-                    flat_at_max.0 += 1;
-                    flat_at_max.1 += xy_area;
-                }
-            } else if xy_area <= 1e-10 {
-                vertical += 1;
-            } else {
-                other += 1;
-            }
-        }
-        flat_z_samples.sort_by(f64::total_cmp);
-        flat_z_samples.dedup_by(|a, b| (*a - *b).abs() < 0.5);
-        eprintln!(
-            "flat {flat} (at z_min: {flat_at_min:?}, at z_max: {flat_at_max:?}), vertical {vertical}, sloped {other}"
-        );
-        eprintln!("distinct flat z levels: {flat_z_samples:?}");
-
-        // Boundary (open) edges: count edges used by only one face.
-        let mut edge_counts: HashMap<(usize, usize), usize> = HashMap::new();
-        for face in &faces {
-            for i in 0..3 {
-                let a = face[i];
-                let b = face[(i + 1) % 3];
-                *edge_counts.entry(sorted_usize_pair(a, b)).or_insert(0usize) += 1;
-            }
-        }
-        let open_edges = edge_counts.values().filter(|c| **c == 1).count();
-        let over_shared = edge_counts.values().filter(|c| **c > 2).count();
-        eprintln!(
-            "edges: {} total, {open_edges} open (boundary), {over_shared} shared by >2 faces",
-            edge_counts.len()
-        );
-
-        // Z histogram of face centroids weighted by 3D area.
-        let mut hist = [0.0f64; 24];
-        for face in &faces {
-            let t = [vertices[face[0]], vertices[face[1]], vertices[face[2]]];
-            let z = (t[0].z + t[1].z + t[2].z) / 3.0;
-            let bin = (((z - z_min) / (z_max - z_min)) * 23.0).clamp(0.0, 23.0) as usize;
-            hist[bin] += triangle_area_3d(t);
-        }
-        for (bin, area) in hist.iter().enumerate() {
-            if *area > 0.0 {
-                eprintln!(
-                    "  z {:.0}..{:.0}: area {:.0}",
-                    z_min + (z_max - z_min) * bin as f64 / 24.0,
-                    z_min + (z_max - z_min) * (bin as f64 + 1.0) / 24.0,
-                    area
-                );
-            }
-        }
-    }
-
-    /// End-to-end Include Solid on the real reported data: the pit solid must
-    /// classify as a pit (excavate below the topo), not a stockpile.
-    #[test]
-    #[ignore]
-    fn diag_real_pit_include() {
-        let home = std::env::var("HOME").unwrap();
-        let topo_path = format!("{home}/Downloads/NW_Surface.obj");
-        let topology = crate::model::formats::read_mesh(&topo_path).expect("topo loads");
-        let start = std::time::Instant::now();
-        let spatial = crate::model::spatial::TriangleBvh::build(&topology);
-        eprintln!("BVH build: {:.2?}", start.elapsed());
-        for name in ["pit.00t", "20250520_ob35_604rl_osa.00t"] {
-            let path = format!("{home}/Downloads/{name}");
-            let shape = crate::model::formats::read_mesh(&path).expect("shape loads");
-            let sb = shape.bounds();
-            eprintln!(
-                "{name}: xy [{:.1},{:.1}]x[{:.1},{:.1}] z [{:.1},{:.1}]",
-                sb.min.x, sb.max.x, sb.min.y, sb.max.y, sb.min.z, sb.max.z
-            );
-            let vertices = shape.vertices();
-            let faces: Vec<[usize; 3]> = shape.face_vertex_indices_iter().collect();
-            let start = std::time::Instant::now();
-            let cap = match closure_cap_info(vertices, &faces, &topology, &spatial) {
-                Ok(cap) => cap,
-                Err(error) => {
-                    eprintln!("  closure_cap_info failed: {error}");
-                    continue;
-                }
-            };
-            eprintln!(
-                "  classified in {:.2?}: cut side {:?} ({} cap faces masked)",
-                start.elapsed(),
-                cap.shape_cut_side,
-                cap.face_mask.iter().filter(|m| **m).count()
-            );
-            let start = std::time::Instant::now();
-            match include_shape_mesh_in_topology_with_spatial(&topology, &spatial, &shape) {
-                Ok(included) => {
-                    let shape_z_min = sb.min.z;
-                    let deep = included
-                        .vertices
-                        .iter()
-                        .filter(|v| v.z < shape_z_min + 1.0)
-                        .count();
-                    eprintln!(
-                        "  include in {:.2?}: {} faces ({} retained topo, {} caps skipped), {} verts near pit floor",
-                        start.elapsed(),
-                        included.faces.len(),
-                        included.retained_topology_faces,
-                        included.skipped_cap_faces,
-                        deep
-                    );
-                }
-                Err(error) => eprintln!("  include failed: {error}"),
-            }
-        }
-    }
-
-    /// Reproduces the hang reported on a 9.4M-face topology: without the
-    /// ring-bounds early-out every topology face ran a geo boolean difference.
-    /// Run with `cargo test --release -- --ignored` when NW_Surface.obj is
-    /// present locally.
-    #[test]
-    #[ignore]
-    fn include_box_pit_in_large_local_topo_completes() {
-        let path = std::env::var("PROINSPECTOR_LARGE_TOPO").unwrap_or_else(|_| {
-            format!(
-                "{}/Downloads/NW_Surface.obj",
-                std::env::var("HOME").unwrap()
-            )
-        });
-        let topology = crate::model::formats::read_mesh(&path).expect("large topo loads");
-        eprintln!(
-            "topology: {} vertices, {} faces",
-            topology.vertex_count(),
-            topology.face_count()
-        );
-
-        // Place a 200x200 m box pit at the centre of the topo's bounds.
-        let vertices = topology.vertices();
-        let (mut min_x, mut min_y, mut max_x, mut max_y) = (
-            f64::INFINITY,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::NEG_INFINITY,
-        );
-        let (mut min_z, mut max_z) = (f64::INFINITY, f64::NEG_INFINITY);
-        for vertex in vertices {
-            min_x = min_x.min(vertex.x);
-            max_x = max_x.max(vertex.x);
-            min_y = min_y.min(vertex.y);
-            max_y = max_y.max(vertex.y);
-            min_z = min_z.min(vertex.z);
-            max_z = max_z.max(vertex.z);
-        }
-        // Offset off the topo's 1 m grid so the walls don't coincide exactly
-        // with shared triangle edges (contact segments emitted by both
-        // neighbours cancel as duplicates on exact alignment).
-        let cx = (min_x + max_x) / 2.0 + 0.37;
-        let cy = (min_y + max_y) / 2.0 + 0.23;
-        let pit = box_pit(
-            [cx - 100.0, cy - 100.0],
-            [cx + 100.0, cy + 100.0],
-            min_z - 50.0,
-            max_z + 50.0,
-        );
-
-        let start = std::time::Instant::now();
-        let included = include_shape_mesh_in_topology(&topology, &pit).expect("include succeeds");
-        eprintln!(
-            "included in {:.2?}: {} faces ({} retained topology)",
-            start.elapsed(),
-            included.faces.len(),
-            included.retained_topology_faces
-        );
-        // The pit floor must survive, and the footprint must actually have
-        // been excavated (an unclosed cut ring degrades into a silent no-op
-        // where every topology face is retained).
-        let floor_z = min_z - 50.0;
-        assert!(
-            included.vertices.iter().any(|vertex| vertex.z == floor_z),
-            "pit floor missing from output"
-        );
-        assert!(
-            included.retained_topology_faces < topology.face_count(),
-            "no topology faces were removed — cut ring did not close"
-        );
-    }
-
-    /// Topologies with overlapping surface sheets (resurveys, tile overlap)
-    /// produce one wall-contact contour per sheet at the same XY but
-    /// different z. XY-only node snapping welded the contours into one
-    /// tangled graph in which no ring closed; 3D snapping keeps them apart so
-    /// the complete contour closes and the partial sheet's open chain is
-    /// discarded.
-    #[test]
-    fn include_box_pit_closes_ring_despite_partial_overlapping_sheet() {
-        let topology = grid_topology(20, 20.0);
-        let mut vertices = topology.vertices().to_vec();
-        let mut faces: Vec<[u32; 3]> = topology
-            .face_vertex_indices_iter()
-            .map(|face| [face[0] as u32, face[1] as u32, face[2] as u32])
-            .collect();
-        // Second sheet 0.5 above the main surface, covering only y:[0,8] —
-        // it crosses the pit's south wall but ends inside the footprint, so
-        // its contact contour cannot close.
-        let base = vertices.len() as u32;
-        vertices.push(tri00t::Vertex::new(0.0, 0.0, 0.5));
-        vertices.push(tri00t::Vertex::new(20.0, 0.0, 0.5));
-        vertices.push(tri00t::Vertex::new(20.0, 8.0, 0.5));
-        vertices.push(tri00t::Vertex::new(0.0, 8.0, 0.5));
-        faces.push([base, base + 1, base + 2]);
-        faces.push([base, base + 2, base + 3]);
-        let topology = tri00t::Triangulation::from_vertices_and_faces(vertices, faces);
-        let pit = box_pit([5.3, 5.3], [10.3, 10.3], -5.0, 2.0);
-
-        let included = include_shape_mesh_in_topology(&topology, &pit).expect("include succeeds");
-
-        assert!(
-            included.vertices.iter().any(|vertex| vertex.z == -5.0),
-            "pit floor missing from output"
-        );
-        for vertex in &included.vertices {
-            let strictly_inside = vertex.x > 5.3 + 1e-6
-                && vertex.x < 10.3 - 1e-6
-                && vertex.y > 5.3 + 1e-6
-                && vertex.y < 10.3 - 1e-6;
-            assert!(
-                !(strictly_inside && vertex.z == 0.0),
-                "main-sheet vertex ({}, {}) left inside the pit footprint",
-                vertex.x,
-                vertex.y
-            );
-        }
-    }
 }

@@ -14,6 +14,7 @@ impl<'a> Graphics<'a> {
         document: &mut Document,
         triangulations: &[OpenTriangulation],
         block_models: &[crate::model::block_model::OpenBlockModel],
+        point_clouds: &[crate::model::point_cloud::OpenPointCloud],
         project: &UiProjectView,
     ) -> Result<UiFrameOutput, RenderSurfaceError> {
         self.vertical_exaggeration = editor.vertical_exaggeration.clamp(0.1, 20.0);
@@ -21,6 +22,7 @@ impl<'a> Graphics<'a> {
             document,
             triangulations,
             block_models,
+            point_clouds,
             &editor.hidden_handles,
         );
         self.include_pending_stroke_in_depth(editor);
@@ -54,6 +56,7 @@ impl<'a> Graphics<'a> {
             triangulations,
             editor,
             &self.surface_style_bind_group_layout,
+            &self.surface_chunk_bind_group_layout,
             &self.edge_style_bind_group_layout,
         );
         self.block_model_gpu.sync(
@@ -67,14 +70,33 @@ impl<'a> Graphics<'a> {
             &self.block_model_volume_bind_group_layout,
             &self.edge_style_bind_group_layout,
         );
+        self.point_cloud_gpu.sync(
+            &self.device,
+            &self.queue,
+            self.scene_origin,
+            scale_factor,
+            point_clouds,
+            &self.edge_style_bind_group_layout,
+        );
         let needs_geometry_rebuild = self.geometry_dirty
             || self.cached_document_revision != document.revision()
             || (self.cached_scale_factor - scale_factor).abs() > f32::EPSILON;
 
         if needs_geometry_rebuild {
+            // Reconcile the static stroke chunks first so the stream rebuild
+            // below knows which objects they own and can skip them.
+            self.static_strokes.sync(
+                &self.device,
+                &self.queue,
+                document,
+                editor,
+                self.scene_origin,
+                scale_factor,
+            );
             rebuild_document_scene(DocumentSceneBuildInput {
                 editor,
                 document,
+                static_ids: self.static_strokes.claimed(),
                 text_system: &mut self.text_system,
                 lyon_buffer: &mut self.lyon_buffer,
                 stroke_vertex_buf: &mut self.stroke_vertex_buf,
@@ -108,6 +130,12 @@ impl<'a> Graphics<'a> {
                 scene_origin: self.scene_origin,
                 scale_factor,
             });
+            Self::clamp_stream_geometry(
+                &self.device,
+                &mut self.dynamic_vertex_buf,
+                &mut self.dynamic_index_buf,
+                "Dynamic Scene Buffer",
+            );
             if !self.dynamic_vertex_buf.is_empty() {
                 Self::ensure_stream_capacity(
                     &self.device,
@@ -143,9 +171,14 @@ impl<'a> Graphics<'a> {
         }
 
         let measurement_state = (
-            editor.active_tool == crate::ui::state::ActiveTool::MeasureDistance,
+            matches!(
+                editor.active_tool,
+                crate::ui::state::ActiveTool::MeasureDistance
+                    | crate::ui::state::ActiveTool::MeasureBermAngle
+            ),
             editor.measurement_start,
             editor.measurement_end,
+            editor.berm_angle_points.clone(),
         );
         if measurement_state != self.cached_measurement_state {
             self.cached_measurement_state = measurement_state;
@@ -170,6 +203,12 @@ impl<'a> Graphics<'a> {
                 scale_factor,
             });
 
+            Self::clamp_stream_geometry(
+                &self.device,
+                &mut self.overlay_vertex_buf,
+                &mut self.overlay_index_buf,
+                "Editor Overlay Buffer",
+            );
             if !self.overlay_vertex_buf.is_empty() {
                 Self::ensure_stream_capacity(
                     &self.device,
@@ -241,7 +280,14 @@ impl<'a> Graphics<'a> {
             }
         }
 
-        self.render_scene_pass(&mut encoder, &view, editor, triangulations, block_models);
+        self.render_scene_pass(
+            &mut encoder,
+            &view,
+            editor,
+            triangulations,
+            block_models,
+            point_clouds,
+        );
 
         self.update_tool_projections(editor, document);
 

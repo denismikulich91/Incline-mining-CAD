@@ -3,13 +3,15 @@
 use glam::DVec3;
 
 use crate::model::{
-    Document, Object, SceneEntityId, block_model::OpenBlockModel, triangulation::OpenTriangulation,
+    Document, Object, SceneEntityId, block_model::OpenBlockModel, point_cloud::OpenPointCloud,
+    triangulation::OpenTriangulation,
 };
 
 pub(crate) fn scene_bounds(
     document: &Document,
     triangulations: &[OpenTriangulation],
     block_models: &[OpenBlockModel],
+    point_clouds: &[OpenPointCloud],
     hidden: &std::collections::HashSet<SceneEntityId>,
 ) -> Option<(DVec3, DVec3)> {
     let mut min = DVec3::splat(f64::MAX);
@@ -66,6 +68,16 @@ pub(crate) fn scene_bounds(
             max = max.max(block_max);
             any = true;
         }
+    }
+
+    for point_cloud in point_clouds
+        .iter()
+        .filter(|point_cloud| point_cloud.visible)
+    {
+        let (cloud_min, cloud_max) = point_cloud.bounds;
+        min = min.min(cloud_min);
+        max = max.max(cloud_max);
+        any = true;
     }
 
     any.then_some((min, max))

@@ -1,9 +1,10 @@
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::Cursor,
+    io::{Cursor, Write},
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use anyhow::{Context, Result, bail};
@@ -18,9 +19,7 @@ use dxf::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    model::{
-        Document, FillStyle, LayerId, Object, ObjectColor, PolyVertex, geometry::geometric_offset,
-    },
+    model::{Document, FillStyle, Layer, LayerId, Object, ObjectColor, ObjectId, PolyVertex},
     rendering::color::{COLOR_TABLE, linear_to_srgb_byte},
     userspace_log,
 };
@@ -46,40 +45,288 @@ pub(crate) struct OpenProject {
     pub(crate) runtime_id: u32,
     pub(crate) path: Option<PathBuf>,
     pub(crate) pidb: PidbFile,
-    pub(crate) dirty: bool,
     /// Layers currently present in the shared scene. The PIDB remains the
     /// source of truth even while a layer is unloaded.
     pub(crate) loaded_layers: HashSet<LayerId>,
-    dirty_layers_cache: RefCell<Option<(u64, HashSet<LayerId>)>>,
+    dirty_layers_cache: RefCell<Option<DirtyLayersCache>>,
+    /// Parsed-and-serialized snapshot of the on-disk file, keyed by its
+    /// modification time. The disk contents only change when we save, so this
+    /// spares `dirty_layers()` from re-reading and re-serializing the file on
+    /// every in-memory edit (it runs per render frame).
+    disk_snapshot_cache: RefCell<Option<DiskSnapshot>>,
+    /// Serialized view of the in-memory document, updated incrementally via
+    /// per-object revisions so a revision bump (e.g. every frame of a vertex
+    /// drag) only re-serializes the objects that edit actually touched.
+    memory_snapshot_cache: RefCell<MemorySnapshot>,
+}
+
+/// Cached `dirty_layers()` result, valid for one (document revision, on-disk
+/// mtime) pair.
+#[derive(Clone, Debug)]
+struct DirtyLayersCache {
+    revision: u64,
+    mtime: Option<SystemTime>,
+    layers: HashSet<LayerId>,
+}
+
+/// Normalized (namespace-0, parsed-then-serialized) view of an on-disk PIDB,
+/// grouped by local layer id, used to diff against in-memory state.
+#[derive(Clone, Debug)]
+struct DiskSnapshot {
+    mtime: Option<std::time::SystemTime>,
+    layers: HashMap<LayerId, String>,
+    objects: HashMap<LayerId, BTreeMap<u64, String>>,
+}
+
+/// Namespace-0 serialization of the in-memory document, mirroring
+/// `DiskSnapshot`'s shape. Kept in sync incrementally: only objects whose
+/// per-object revision moved since the last sync are re-serialized, so
+/// interactive edits on large documents don't pay a full-document clone and
+/// JSON pass per frame.
+#[derive(Clone, Debug, Default)]
+struct MemorySnapshot {
+    /// Per runtime object id: the revision its cached JSON reflects and the
+    /// local-layer bucket it was filed under (to relocate on layer moves).
+    object_state: HashMap<ObjectId, (u64, LayerId)>,
+    layers: HashMap<LayerId, String>,
+    objects: HashMap<LayerId, BTreeMap<u64, String>>,
+}
+
+impl MemorySnapshot {
+    fn sync(&mut self, document: &Document) {
+        const LOCAL_MASK: u64 = u32::MAX as u64;
+
+        // Layers are few — reserialize them all at their local ids.
+        self.layers = document
+            .layers()
+            .iter()
+            .map(|layer| {
+                let local_id = LayerId(layer.id.0 & LOCAL_MASK);
+                let mut portable = layer.clone();
+                portable.id = local_id;
+                (
+                    local_id,
+                    serde_json::to_string(&portable).unwrap_or_default(),
+                )
+            })
+            .collect();
+
+        let mut seen = HashSet::with_capacity(document.objects().len());
+        for object in document.objects() {
+            let id = object.id();
+            seen.insert(id);
+            let revision = document.object_revision(id);
+            let local_layer = LayerId(object.layer().0 & LOCAL_MASK);
+            if let Some(&(cached_revision, cached_layer)) = self.object_state.get(&id) {
+                if cached_revision == revision && cached_layer == local_layer {
+                    continue;
+                }
+                if cached_layer != local_layer
+                    && let Some(bucket) = self.objects.get_mut(&cached_layer)
+                {
+                    bucket.remove(&(id.0 & LOCAL_MASK));
+                }
+            }
+            let local_id = ObjectId(id.0 & LOCAL_MASK);
+            let portable = object.with_id_and_layer(local_id, local_layer);
+            self.objects.entry(local_layer).or_default().insert(
+                local_id.0,
+                serde_json::to_string(&portable).unwrap_or_default(),
+            );
+            self.object_state.insert(id, (revision, local_layer));
+        }
+
+        // Drop entries for objects deleted since the last sync.
+        if self.object_state.len() != seen.len() {
+            let stale: Vec<ObjectId> = self
+                .object_state
+                .keys()
+                .filter(|id| !seen.contains(*id))
+                .copied()
+                .collect();
+            for id in stale {
+                if let Some((_, layer)) = self.object_state.remove(&id)
+                    && let Some(bucket) = self.objects.get_mut(&layer)
+                {
+                    bucket.remove(&(id.0 & LOCAL_MASK));
+                    if bucket.is_empty() {
+                        self.objects.remove(&layer);
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl OpenProject {
     pub(crate) fn dirty_layers(&self) -> HashSet<LayerId> {
         let revision = self.pidb.document.revision();
-        if let Some((cached_revision, layers)) = self.dirty_layers_cache.borrow().as_ref()
-            && *cached_revision == revision
-        {
-            return layers.clone();
-        }
-        let layers = self
+        // The disk mtime is part of the cache key: an external rewrite of the
+        // file must invalidate the result even though the in-memory revision
+        // is untouched.
+        let mtime = self
             .path
             .as_ref()
-            .map(|path| dirty_layers_from_disk(&self.pidb, path))
-            .unwrap_or_else(|| {
-                self.pidb
-                    .document
-                    .layers()
-                    .iter()
-                    .map(|layer| layer.id)
-                    .collect()
-            });
-        *self.dirty_layers_cache.borrow_mut() = Some((revision, layers.clone()));
+            .and_then(|path| fs::metadata(path).and_then(|m| m.modified()).ok());
+        if let Some(cache) = self.dirty_layers_cache.borrow().as_ref()
+            && cache.revision == revision
+            && cache.mtime == mtime
+        {
+            return cache.layers.clone();
+        }
+        let layers = match self.path.as_ref() {
+            Some(path) => self.dirty_layers_against_disk(path, mtime),
+            None => self
+                .pidb
+                .document
+                .layers()
+                .iter()
+                .map(|layer| layer.id)
+                .collect(),
+        };
+        *self.dirty_layers_cache.borrow_mut() = Some(DirtyLayersCache {
+            revision,
+            mtime,
+            layers: layers.clone(),
+        });
         layers
+    }
+
+    /// Diff the in-memory document against the on-disk file, reusing a cached
+    /// disk snapshot (refreshed only when the file's mtime changes) so an
+    /// in-memory edit doesn't re-read or re-parse the file.
+    fn dirty_layers_against_disk(
+        &self,
+        path: &Path,
+        mtime: Option<SystemTime>,
+    ) -> HashSet<LayerId> {
+        let snapshot_matches = self
+            .disk_snapshot_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.mtime == mtime);
+        if !snapshot_matches {
+            match DiskSnapshot::load(path, mtime) {
+                Some(snapshot) => *self.disk_snapshot_cache.borrow_mut() = Some(snapshot),
+                // File missing/unreadable: every layer is unsaved.
+                None => {
+                    return self
+                        .pidb
+                        .document
+                        .layers()
+                        .iter()
+                        .map(|layer| layer.id)
+                        .collect();
+                }
+            }
+        }
+        let cache = self.disk_snapshot_cache.borrow();
+        let disk = cache.as_ref().expect("snapshot populated above");
+
+        // Bring the incrementally maintained namespace-0 memory snapshot up to
+        // date; only objects touched since the last sync are re-serialized.
+        let mut memory_cache = self.memory_snapshot_cache.borrow_mut();
+        memory_cache.sync(&self.pidb.document);
+        let memory = &*memory_cache;
+        let empty_objects = BTreeMap::new();
+
+        self.pidb
+            .document
+            .layers()
+            .iter()
+            .filter_map(|runtime_layer| {
+                let local_id = LayerId(runtime_layer.id.0 & u64::from(u32::MAX));
+                let memory_layer = memory.layers.get(&local_id);
+                let disk_layer = disk.layers.get(&local_id);
+                let memory_objects = memory.objects.get(&local_id).unwrap_or(&empty_objects);
+                let disk_objects = disk.objects.get(&local_id).unwrap_or(&empty_objects);
+                layer_differs(
+                    memory_layer.map(String::as_str),
+                    disk_layer.map(String::as_str),
+                    memory_objects,
+                    disk_objects,
+                )
+                .then_some(runtime_layer.id)
+            })
+            .collect()
     }
 
     pub(crate) fn invalidate_dirty_layers(&self) {
         *self.dirty_layers_cache.borrow_mut() = None;
     }
+
+    pub(crate) fn invalidate_disk_snapshot(&self) {
+        self.invalidate_dirty_layers();
+        *self.disk_snapshot_cache.borrow_mut() = None;
+    }
+
+    pub(crate) fn has_unsaved_changes(&self) -> bool {
+        !self.dirty_layers().is_empty()
+    }
+}
+
+impl DiskSnapshot {
+    fn load(path: &Path, mtime: Option<std::time::SystemTime>) -> Option<Self> {
+        let disk = load(path).ok()?;
+        let objects = objects_by_layer(disk.document.objects());
+        let layers = disk
+            .document
+            .layers()
+            .iter()
+            .map(|layer| {
+                let local_id = LayerId(layer.id.0 & u64::from(u32::MAX));
+                (local_id, serde_json::to_string(layer).unwrap_or_default())
+            })
+            .collect();
+        Some(DiskSnapshot {
+            mtime,
+            layers,
+            objects,
+        })
+    }
+}
+
+/// Re-serialize a JSON string after parsing it into `T`, so its float fields
+/// take the same bit patterns the disk side got when it was parsed from the
+/// file. serde_json's float parser can land a value 1 ULP off its serialized
+/// form, and object/layer floats are `f32`, so a value serialized straight from
+/// memory can differ textually from the round-tripped disk copy even when
+/// nothing was edited.
+fn normalized_json<T: Serialize + serde::de::DeserializeOwned>(json: &str) -> String {
+    serde_json::from_str::<T>(json)
+        .ok()
+        .and_then(|value| serde_json::to_string(&value).ok())
+        .unwrap_or_else(|| json.to_owned())
+}
+
+/// True if a layer's in-memory state diverges from disk. Both sides are
+/// serialized JSON. A direct string compare is tried first (unchanged layers —
+/// the common case every frame — cost one serialization pass); only on a
+/// mismatch are the memory strings normalised through the same typed parse the
+/// disk side went through, so a 1-ULP float-parser artefact isn't mistaken for
+/// an edit.
+fn layer_differs(
+    memory_layer: Option<&str>,
+    disk_layer: Option<&str>,
+    memory_objects: &BTreeMap<u64, String>,
+    disk_objects: &BTreeMap<u64, String>,
+) -> bool {
+    if memory_layer == disk_layer && memory_objects == disk_objects {
+        return false;
+    }
+    let layer_matches =
+        memory_layer.map(normalized_json::<Layer>) == disk_layer.map(normalized_json::<Layer>);
+    if !layer_matches {
+        return true;
+    }
+    if memory_objects.len() != disk_objects.len() {
+        return true;
+    }
+    memory_objects.iter().any(|(id, memory_json)| {
+        disk_objects.get(id).is_none_or(|disk_json| {
+            normalized_json::<Object>(memory_json) != normalized_json::<Object>(disk_json)
+        })
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -118,12 +365,6 @@ impl Workspace {
 
     pub(crate) fn has_active_project(&self) -> bool {
         self.active_index.is_some_and(|i| i < self.projects.len())
-    }
-
-    pub(crate) fn mark_dirty(&mut self) {
-        if let Some(p) = self.active_project_mut() {
-            p.dirty = true;
-        }
     }
 
     /// Add a project and make it active. If a project with the same path is
@@ -263,86 +504,6 @@ pub(crate) fn load(path: impl AsRef<Path>) -> Result<PidbFile> {
     Ok(pidb)
 }
 
-/// True if `pidb`'s visible contents differ from the file saved at `path`.
-///
-/// Compares layers and objects by id (order-insensitive) after normalising the
-/// runtime namespace, and ignores bookkeeping that doesn't change the document
-/// the user sees (id counters, revision). Used to recompute a project's dirty
-/// flag after discarding a layer's edits, so the `*` indicator clears when the
-/// in-memory state matches disk again.
-pub(crate) fn differs_from_disk(pidb: &PidbFile, path: impl AsRef<Path>) -> bool {
-    let Ok(disk) = load(path) else {
-        return true;
-    };
-    fn signature(
-        pidb: &PidbFile,
-    ) -> (
-        std::collections::BTreeMap<u64, String>,
-        std::collections::BTreeMap<u64, String>,
-        String,
-    ) {
-        let mut pidb = pidb.clone();
-        pidb.document.apply_runtime_namespace(0);
-        let layers = pidb
-            .document
-            .layers()
-            .iter()
-            .map(|l| (l.id.0, serde_json::to_string(l).unwrap_or_default()))
-            .collect();
-        let objects = pidb
-            .document
-            .objects()
-            .iter()
-            .map(|o| (o.id().0, serde_json::to_string(o).unwrap_or_default()))
-            .collect();
-        (layers, objects, pidb.metadata.name.clone())
-    }
-    signature(pidb) != signature(&disk)
-}
-
-/// Return all runtime layer ids whose layer metadata or objects differ from disk.
-pub(crate) fn dirty_layers_from_disk(pidb: &PidbFile, path: impl AsRef<Path>) -> HashSet<LayerId> {
-    let Ok(disk) = load(path) else {
-        return pidb
-            .document
-            .layers()
-            .iter()
-            .map(|layer| layer.id)
-            .collect();
-    };
-    let mut portable = pidb.clone();
-    portable.document.apply_runtime_namespace(0);
-    // serde_json's float parser has edge cases where certain f64 values parse to a
-    // different bit pattern than their serialized form (off by 1 ULP). Normalising the
-    // in-memory objects through the same JSON round-trip that save() uses ensures the
-    // comparison uses the same float representation as the disk side.
-    if let Ok(json) = serde_json::to_string(&portable)
-        && let Ok(normalised) = serde_json::from_str::<PidbFile>(&json)
-    {
-        portable = normalised;
-    }
-
-    // Pre-group objects by layer once (O(L+O)) instead of re-scanning all objects per layer
-    // (O(L×O)).
-    let memory_by_layer = objects_by_layer(portable.document.objects());
-    let disk_by_layer = objects_by_layer(disk.document.objects());
-
-    pidb.document
-        .layers()
-        .iter()
-        .filter_map(|runtime_layer| {
-            let local_id = LayerId(runtime_layer.id.0 & u64::from(u32::MAX));
-            let memory_layer = portable.document.layer(local_id);
-            let disk_layer = disk.document.layer(local_id);
-            let empty = std::collections::BTreeMap::new();
-            let memory_objects = memory_by_layer.get(&local_id).unwrap_or(&empty);
-            let disk_objects = disk_by_layer.get(&local_id).unwrap_or(&empty);
-            (memory_layer != disk_layer || memory_objects != disk_objects)
-                .then_some(runtime_layer.id)
-        })
-        .collect()
-}
-
 fn objects_by_layer(
     objects: &[crate::model::Object],
 ) -> HashMap<LayerId, std::collections::BTreeMap<u64, String>> {
@@ -382,6 +543,8 @@ pub(crate) fn save_layer(path: impl AsRef<Path>, pidb: &PidbFile, layer_id: Laye
         .cloned()
         .collect();
 
+    // "Incremental" only in what it preserves: the whole file is re-parsed
+    // and re-serialized, so this save is O(file size).
     let mut disk = load(path)?;
     let old_object_ids: Vec<_> = disk
         .document
@@ -393,8 +556,12 @@ pub(crate) fn save_layer(path: impl AsRef<Path>, pidb: &PidbFile, layer_id: Laye
     for object_id in old_object_ids {
         disk.document.remove_object(object_id);
     }
-    disk.document.delete_layer(local_layer_id);
-    disk.document.append_layer_snapshot(&layer, objects.iter());
+    // Replace the layer in place so saving does not move it to the end of the
+    // on-disk layer list.
+    disk.document.upsert_layer(&layer);
+    for object in &objects {
+        disk.document.insert_object(object.clone());
+    }
     save(path, &disk)
 }
 
@@ -405,7 +572,18 @@ pub(crate) fn save(path: impl AsRef<Path>, pidb: &PidbFile) -> Result<()> {
     let mut portable = pidb.clone();
     portable.document.apply_runtime_namespace(0);
     let json = serde_json::to_string_pretty(&portable)?;
-    fs::write(path, json).with_context(|| format!("write {}", path.display()))
+    // Write-then-rename so a crash or full disk mid-write cannot destroy the
+    // previous copy of the project.
+    let tmp_path = path.with_extension("pidb.tmp");
+    {
+        let mut file = fs::File::create(&tmp_path)
+            .with_context(|| format!("create {}", tmp_path.display()))?;
+        file.write_all(json.as_bytes())
+            .with_context(|| format!("write {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", tmp_path.display()))?;
+    }
+    fs::rename(&tmp_path, path).with_context(|| format!("write {}", path.display()))
 }
 
 pub(crate) fn validate(pidb: &mut PidbFile) -> Result<()> {
@@ -416,6 +594,7 @@ pub(crate) fn validate(pidb: &mut PidbFile) -> Result<()> {
             PIDB_FORMAT_VERSION
         );
     }
+    pidb.document.rebuild_object_index();
     Ok(())
 }
 
@@ -493,18 +672,26 @@ fn export_layers_to_dxf(
         });
     }
 
+    // Resolved lazily on the first road: junction pads, seam blending and arc
+    // tessellation come from the same network resolve the editor draws from.
+    let mut road_network: Option<crate::model::road_network::ResolvedNetwork> = None;
     for object in pidb.document.objects() {
         if only_layer.is_some_and(|id| id != object.layer()) {
             continue;
         }
-        add_object_to_drawing(&pidb.document, object, &mut drawing);
+        add_object_to_drawing(&pidb.document, object, &mut road_network, &mut drawing);
     }
     drawing
         .save_file(path.as_ref())
         .with_context(|| format!("write {}", path.as_ref().display()))
 }
 
-fn add_object_to_drawing(document: &Document, object: &Object, drawing: &mut Drawing) {
+fn add_object_to_drawing(
+    document: &Document,
+    object: &Object,
+    road_network: &mut Option<crate::model::road_network::ResolvedNetwork>,
+    drawing: &mut Drawing,
+) {
     let Some(layer) = document.layer(object.layer()) else {
         return;
     };
@@ -577,37 +764,31 @@ fn add_object_to_drawing(document: &Document, object: &Object, drawing: &mut Dra
             entity.common.color = dxf_color;
             drawing.add_entity(entity);
         }
-        Object::Road {
-            centerline,
-            width,
-            camber_degrees,
-            shape,
-            ..
-        } => {
-            if centerline.len() < 2 {
-                return;
+        Object::Road { id, .. } => {
+            use crate::model::road_network::{self, RoadKey};
+            let network = road_network.get_or_insert_with(|| road_network::resolve(document, None));
+            for edge in network.edges_for(RoadKey::Object(*id)) {
+                emit_road_points(&edge.center, &layer_name, dxf_color.clone(), drawing);
+                emit_road_points(&edge.left, &layer_name, dxf_color.clone(), drawing);
+                emit_road_points(&edge.right, &layer_name, dxf_color.clone(), drawing);
+                if edge.start_cap
+                    && let (Some(&l), Some(&r)) = (edge.left.first(), edge.right.first())
+                {
+                    emit_road_points(&[l, r], &layer_name, dxf_color.clone(), drawing);
+                }
+                if edge.end_cap
+                    && let (Some(&l), Some(&r)) = (edge.left.last(), edge.right.last())
+                {
+                    emit_road_points(&[l, r], &layer_name, dxf_color.clone(), drawing);
+                }
             }
-            let half_width = width / 2.0;
-            let (left_z, right_z) = shape.z_offsets(*width, *camber_degrees);
-            let cl_pts: Vec<glam::DVec3> = centerline.iter().map(|v| v.pos).collect();
-            // Centerline
-            emit_road_verts(centerline.clone(), &layer_name, dxf_color.clone(), drawing);
-            // Left edge
-            let left_pts = geometric_offset(&cl_pts, false, half_width, 0.0);
-            let left_verts: Vec<PolyVertex> = left_pts
-                .iter()
-                .map(|&p| PolyVertex::straight(glam::DVec3::new(p.x, p.y, p.z + left_z)))
-                .collect();
-            emit_road_verts(left_verts, &layer_name, dxf_color.clone(), drawing);
-            // Right edge
-            let right_pts = geometric_offset(&cl_pts, false, -half_width, 0.0);
-            let right_verts: Vec<PolyVertex> = right_pts
-                .iter()
-                .map(|&p| PolyVertex::straight(glam::DVec3::new(p.x, p.y, p.z + right_z)))
-                .collect();
-            emit_road_verts(right_verts, &layer_name, dxf_color, drawing);
         }
     }
+}
+
+fn emit_road_points(points: &[glam::DVec3], layer_name: &str, color: Color, drawing: &mut Drawing) {
+    let verts: Vec<PolyVertex> = points.iter().copied().map(PolyVertex::straight).collect();
+    emit_road_verts(verts, layer_name, color, drawing);
 }
 
 fn emit_road_verts(verts: Vec<PolyVertex>, layer_name: &str, color: Color, drawing: &mut Drawing) {
@@ -734,6 +915,7 @@ pub(crate) fn pidb_from_dgd_isis(path: impl AsRef<Path>) -> Result<PidbFile> {
         &design.texts,
         &index_entries,
         &design.layer_names,
+        design.palette.as_ref(),
     );
     Ok(PidbFile {
         format_version: PIDB_FORMAT_VERSION,
@@ -744,11 +926,90 @@ pub(crate) fn pidb_from_dgd_isis(path: impl AsRef<Path>) -> Result<PidbFile> {
     })
 }
 
+pub(crate) fn pidb_from_duf(path: impl AsRef<Path>) -> Result<PidbFile> {
+    let path = path.as_ref();
+    let duf = crate::model::formats::duf::read_duf(path)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+    let document = document_from_duf_design(&duf);
+    if duf.skipped.unsupported_mesh_entities > 0 || !duf.polyfaces.is_empty() {
+        userspace_log!(
+            "Ignored {} DUF mesh entit{} while importing {} as PIDB",
+            duf.polyfaces
+                .len()
+                .max(duf.skipped.unsupported_mesh_entities),
+            if duf
+                .polyfaces
+                .len()
+                .max(duf.skipped.unsupported_mesh_entities)
+                == 1
+            {
+                "y"
+            } else {
+                "ies"
+            },
+            path.display()
+        );
+    }
+    Ok(PidbFile {
+        format_version: PIDB_FORMAT_VERSION,
+        document,
+        metadata: PidbMetadata {
+            name: project_name(Some(path), "Imported.pidb"),
+        },
+    })
+}
+
+fn document_from_duf_design(duf: &crate::model::formats::duf::DufData) -> Document {
+    let mut doc = Document::new();
+    let mut layer_ids: HashMap<String, LayerId> = HashMap::new();
+
+    let mut layer_id_for = |doc: &mut Document, name: &str| {
+        *layer_ids.entry(name.to_owned()).or_insert_with(|| {
+            doc.add_layer(name.to_owned(), None, [1.0, 1.0, 1.0, 1.0], true, 0.0)
+        })
+    };
+
+    for point in &duf.points {
+        let layer = layer_id_for(&mut doc, &point.layer_name);
+        doc.add_object(|id| Object::Point {
+            id,
+            layer,
+            pos: point.position,
+            color: ObjectColor::ByLayer,
+        });
+    }
+
+    for polyline in &duf.polylines {
+        if polyline.vertices.len() < 2 {
+            continue;
+        }
+        let layer = layer_id_for(&mut doc, &polyline.layer_name);
+        let verts = polyline
+            .vertices
+            .iter()
+            .copied()
+            .map(PolyVertex::straight)
+            .collect();
+        doc.add_object(|id| Object::Polyline {
+            id,
+            layer,
+            verts,
+            closed: false,
+            color: ObjectColor::ByLayer,
+            fill: FillStyle::Clear,
+            line_weight: 1.0,
+        });
+    }
+
+    doc
+}
+
 fn document_from_dgd_points(
     points: &[crate::model::formats::isis::DesignPoint],
     texts: &[crate::model::formats::isis::DesignText],
     index_entries: &[crate::model::formats::isis::DesignIndexEntry],
     _embedded_layer_names: &[String],
+    palette: Option<&crate::model::formats::isis::DgdColorTable>,
 ) -> Document {
     use crate::model::formats::isis::{DGD_COORD_RECORD_LEN, DesignGeometryKind};
     use glam::DVec3;
@@ -783,13 +1044,14 @@ fn document_from_dgd_points(
         geometry_kind: DesignGeometryKind,
         closed: bool,
         color_index: Option<u8>,
+        palette: Option<&crate::model::formats::isis::DgdColorTable>,
         verts: &mut Vec<PolyVertex>,
     ) {
         let Some(layer_id) = layer_id else {
             verts.clear();
             return;
         };
-        let color = dgd_object_color(color_index);
+        let color = dgd_object_color(color_index, palette);
         if geometry_kind == DesignGeometryKind::Point {
             for vertex in verts.drain(..) {
                 add_dgd_point(doc, layer_id, vertex.pos, color);
@@ -815,6 +1077,7 @@ fn document_from_dgd_points(
                 current_geometry,
                 current_closed,
                 current_color_index,
+                palette,
                 &mut current_verts,
             );
             current_closed = point.closed;
@@ -850,6 +1113,7 @@ fn document_from_dgd_points(
         current_geometry,
         current_closed,
         current_color_index,
+        palette,
         &mut current_verts,
     );
 
@@ -867,19 +1131,29 @@ fn document_from_dgd_points(
             content: text.content.clone(),
             height: text.height,
             rotation: text.rotation_degrees.to_radians(),
-            color: dgd_object_color(text.color_index),
+            color: dgd_object_color(text.color_index, palette),
         });
     }
 
     doc
 }
 
-/// Resolve a Vulcan object colour index to an [`ObjectColor`], falling back to
-/// `ByLayer` for blank or not-yet-mapped indices (see
-/// [`crate::rendering::color::vulcan_color_to_linear_rgba`]).
-fn dgd_object_color(color_index: Option<u8>) -> ObjectColor {
-    color_index
-        .and_then(crate::rendering::color::vulcan_color_to_linear_rgba)
+/// Resolve a Vulcan object colour index to an [`ObjectColor`]. The database's
+/// embedded `dig$colour256` palette takes precedence; indices it does not
+/// define fall back to the built-in default palette
+/// ([`crate::rendering::color::vulcan_color_to_linear_rgba`]), and a blank or
+/// unmapped index resolves to `ByLayer`.
+fn dgd_object_color(
+    color_index: Option<u8>,
+    palette: Option<&crate::model::formats::isis::DgdColorTable>,
+) -> ObjectColor {
+    let Some(index) = color_index else {
+        return ObjectColor::ByLayer;
+    };
+    palette
+        .and_then(|palette| palette.rgb(index))
+        .map(crate::rendering::color::rgb_bytes_to_linear_rgba)
+        .or_else(|| crate::rendering::color::vulcan_color_to_linear_rgba(index))
         .map_or(ObjectColor::ByLayer, ObjectColor::Fixed)
 }
 
@@ -906,7 +1180,6 @@ fn add_dgd_polyline(
         closed,
         color,
         fill: FillStyle::Clear,
-        fill_color: None,
         line_weight: 1.0,
     });
 }
@@ -982,295 +1255,15 @@ fn is_dgd_point_collection_layer_name(name: &str) -> bool {
         || upper.ends_with("POINTS")
 }
 
-pub(crate) fn open_project(
-    path: Option<PathBuf>,
-    mut pidb: PidbFile,
-    dirty: bool,
-) -> Result<OpenProject> {
+pub(crate) fn open_project(path: Option<PathBuf>, mut pidb: PidbFile) -> Result<OpenProject> {
     validate(&mut pidb)?;
     Ok(OpenProject {
         runtime_id: 0,
         path,
         pidb,
-        dirty,
         loaded_layers: HashSet::new(),
         dirty_layers_cache: RefCell::new(None),
+        disk_snapshot_cache: RefCell::new(None),
+        memory_snapshot_cache: RefCell::new(MemorySnapshot::default()),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::formats::isis::{DesignGeometryKind, DesignIndexEntry, DesignPoint};
-
-    fn point(name: &str, seg_type: u8, x: f64) -> DesignPoint {
-        point_at(name, seg_type, x as usize, x, DesignGeometryKind::Unknown)
-    }
-
-    fn line_point(name: &str, seg_type: u8, offset: usize, x: f64) -> DesignPoint {
-        point_at(name, seg_type, offset, x, DesignGeometryKind::Line)
-    }
-
-    fn point_at(
-        name: &str,
-        seg_type: u8,
-        offset: usize,
-        x: f64,
-        geometry_kind: DesignGeometryKind,
-    ) -> DesignPoint {
-        DesignPoint {
-            offset,
-            name: name.to_owned(),
-            secondary_name: String::new(),
-            layer_name: None,
-            closed: false,
-            color_index: None,
-            seg_type,
-            geometry_kind,
-            x,
-            y: 1000.0,
-            z: 10.0,
-        }
-    }
-
-    #[test]
-    fn dgd_import_from_env_path() {
-        let Ok(path) = std::env::var("INCLINE_TEST_DGD_IMPORT") else {
-            return;
-        };
-        let pidb = pidb_from_dgd_isis(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-        let fixed_color = pidb
-            .document
-            .objects()
-            .iter()
-            .filter(|object| matches!(object.color(), ObjectColor::Fixed(_)))
-            .count();
-        println!(
-            "{path}: {} layers, {} objects ({fixed_color} with a fixed Vulcan colour)",
-            pidb.document.layers().len(),
-            pidb.document.objects().len()
-        );
-        for layer in pidb.document.layers() {
-            println!("  layer: {}", layer.name);
-        }
-        if let Ok(expected_count) = std::env::var("INCLINE_TEST_DGD_IMPORT_LAYER_COUNT") {
-            let expected_count: usize = expected_count.parse().unwrap();
-            assert_eq!(pidb.document.layers().len(), expected_count);
-        }
-        if let Ok(expected_name) = std::env::var("INCLINE_TEST_DGD_IMPORT_LAYER_NAME") {
-            assert!(
-                pidb.document
-                    .layers()
-                    .iter()
-                    .any(|layer| layer.name == expected_name),
-                "{expected_name:?} was not found in {path}"
-            );
-        }
-    }
-
-    #[test]
-    fn dgd_import_builds_segments_in_file_order_not_by_point_name() {
-        let points = vec![
-            line_point("POINT_1", 0, 0, 0.0),
-            line_point("POINT_2", 1, 117, 1.0),
-            line_point("POINT_1", 0, 234, 10.0),
-            line_point("POINT_2", 1, 351, 11.0),
-        ];
-
-        let doc = document_from_dgd_points(&points, &[], &[], &[]);
-
-        assert_eq!(doc.layers().len(), 1);
-        assert_eq!(doc.layers()[0].name, "DGD Import");
-        assert_eq!(doc.objects().len(), 2);
-        for object in doc.objects() {
-            let Object::Polyline { verts, .. } = object else {
-                panic!("expected polyline, got {object:?}");
-            };
-            assert_eq!(verts.len(), 2);
-        }
-    }
-
-    #[test]
-    fn dgd_import_keeps_meaningful_segment_header_names_as_layers() {
-        let points = vec![
-            line_point("DRILLHOLES", 0, 0, 0.0),
-            line_point("DRILLHOLES", 1, 117, 1.0),
-            point("1:1250", 0, 10.0),
-        ];
-
-        let doc = document_from_dgd_points(&points, &[], &[], &[]);
-
-        let layer_names: Vec<&str> = doc
-            .layers()
-            .iter()
-            .map(|layer| layer.name.as_str())
-            .collect();
-        assert_eq!(layer_names, vec!["DRILLHOLES", "DGD Import"]);
-        assert!(matches!(doc.objects()[0], Object::Polyline { .. }));
-        assert!(matches!(doc.objects()[1], Object::Point { .. }));
-    }
-
-    #[test]
-    fn dgd_import_uses_secondary_record_name_when_primary_is_generated() {
-        let points = vec![DesignPoint {
-            offset: 100,
-            name: "POINT_1".to_owned(),
-            secondary_name: "ORE_OUTLINE".to_owned(),
-            layer_name: None,
-            closed: false,
-            color_index: None,
-            seg_type: 0,
-            geometry_kind: DesignGeometryKind::Unknown,
-            x: 100.0,
-            y: 1000.0,
-            z: 10.0,
-        }];
-
-        let doc = document_from_dgd_points(&points, &[], &[], &[]);
-
-        assert_eq!(doc.layers()[0].name, "ORE_OUTLINE");
-    }
-
-    #[test]
-    fn dgd_import_ignores_numeric_secondary_record_names() {
-        let points = vec![DesignPoint {
-            offset: 100,
-            name: "POINT_1".to_owned(),
-            secondary_name: "0          6".to_owned(),
-            layer_name: None,
-            closed: false,
-            color_index: None,
-            seg_type: 0,
-            geometry_kind: DesignGeometryKind::Unknown,
-            x: 100.0,
-            y: 1000.0,
-            z: 10.0,
-        }];
-
-        let doc = document_from_dgd_points(&points, &[], &[], &[]);
-
-        assert_eq!(doc.layers()[0].name, "DGD Import");
-    }
-
-    #[test]
-    fn dgd_import_uses_inline_header_layer_name_when_primary_is_generated() {
-        let mut point = line_point("POINT_1", 0, 100, 100.0);
-        point.layer_name = Some("Dog".to_owned());
-        let points = vec![point];
-
-        let doc = document_from_dgd_points(&points, &[], &[], &[]);
-
-        assert_eq!(doc.layers()[0].name, "Dog");
-    }
-
-    #[test]
-    fn dgd_import_does_not_precreate_untrusted_gallery_layers() {
-        let points = vec![line_point("POINT_1", 0, 100, 100.0)];
-        let embedded_layer_names = vec!["Cat".to_owned()];
-
-        let doc = document_from_dgd_points(&points, &[], &[], &embedded_layer_names);
-
-        let layer_names: Vec<&str> = doc
-            .layers()
-            .iter()
-            .map(|layer| layer.name.as_str())
-            .collect();
-        assert_eq!(layer_names, vec!["DGD Import"]);
-    }
-
-    #[test]
-    fn dgd_import_precreates_current_isix_layers() {
-        let index_entries = vec![
-            DesignIndexEntry {
-                offset: 100,
-                name: "Dog".to_owned(),
-            },
-            DesignIndexEntry {
-                offset: 200,
-                name: "1234".to_owned(),
-            },
-            DesignIndexEntry {
-                offset: 300,
-                name: "Cat".to_owned(),
-            },
-            DesignIndexEntry {
-                offset: 400,
-                name: "DIG$COLOUR".to_owned(),
-            },
-            DesignIndexEntry {
-                offset: 500,
-                name: "POLYLINE".to_owned(),
-            },
-        ];
-
-        let doc = document_from_dgd_points(&[], &[], &index_entries, &[]);
-
-        let layer_names: Vec<&str> = doc
-            .layers()
-            .iter()
-            .map(|layer| layer.name.as_str())
-            .collect();
-        assert_eq!(layer_names, vec!["Dog", "1234", "Cat"]);
-    }
-
-    #[test]
-    fn dgd_import_uses_isix_layer_names_at_segment_starts() {
-        let points = vec![
-            line_point("POINT_1", 0, 100, 100.0),
-            line_point("POINT_2", 1, 217, 117.0),
-            line_point("POINT_3", 0, 334, 200.0),
-            line_point("POINT_4", 1, 451, 217.0),
-        ];
-        let index_entries = vec![
-            DesignIndexEntry {
-                offset: 90,
-                name: "BLASTMASTERS".to_owned(),
-            },
-            DesignIndexEntry {
-                offset: 190,
-                name: "CREST".to_owned(),
-            },
-        ];
-
-        let doc = document_from_dgd_points(&points, &[], &index_entries, &[]);
-
-        let layer_names: Vec<&str> = doc
-            .layers()
-            .iter()
-            .map(|layer| layer.name.as_str())
-            .collect();
-        assert_eq!(layer_names, vec!["BLASTMASTERS", "CREST"]);
-    }
-
-    #[test]
-    fn dgd_import_breaks_segments_on_record_gaps_even_when_seg_type_continues() {
-        let points = vec![
-            line_point("DRILLHOLES", 0, 0, 0.0),
-            line_point("DRILLHOLES", 1, 117, 1.0),
-            line_point("DRILLHOLES", 1, 500, 20.0),
-        ];
-
-        let doc = document_from_dgd_points(&points, &[], &[], &[]);
-
-        assert_eq!(doc.objects().len(), 2);
-        assert!(matches!(doc.objects()[0], Object::Polyline { .. }));
-        assert!(matches!(doc.objects()[1], Object::Point { .. }));
-    }
-
-    #[test]
-    fn dgd_import_emits_polypoint_runs_as_points() {
-        let points = vec![
-            point_at("POINT_1", 0, 0, 0.0, DesignGeometryKind::Point),
-            point_at("POINT_2", 1, 117, 1.0, DesignGeometryKind::Point),
-        ];
-
-        let doc = document_from_dgd_points(&points, &[], &[], &[]);
-
-        assert_eq!(doc.objects().len(), 2);
-        assert!(
-            doc.objects()
-                .iter()
-                .all(|object| matches!(object, Object::Point { .. }))
-        );
-    }
 }

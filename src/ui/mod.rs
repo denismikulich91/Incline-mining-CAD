@@ -68,12 +68,6 @@ impl Gui {
         let ctx = egui::Context::default();
         setup_custom_fonts(&ctx);
         egui_extras::install_image_loaders(&ctx);
-        #[cfg(feature = "inspection")]
-        match egui_inspection::attach_from_env(&ctx, Some("Incline".to_owned())) {
-            Ok(true) => log::info!("egui_inspection: attached (EGUI_INSPECTION set)"),
-            Ok(false) => {}
-            Err(error) => log::warn!("egui_inspection: failed to attach: {error}"),
-        }
         ctx.global_style_mut(|style| {
             style.interaction.show_tooltips_only_when_still = false;
             style.interaction.tooltip_delay = 0.0;
@@ -280,10 +274,28 @@ fn viewport_label_text(editor: &EditorState) -> Option<ViewportToolLabel> {
         )));
     }
 
+    if editor.active_tool == ActiveTool::MeasureBermAngle {
+        if let Some(measurement) =
+            crate::ui::state::berm_angle_measurement(editor.berm_angle_points.as_slice())
+        {
+            return Some(ViewportToolLabel::neutral(format!(
+                "{:.2}° berm angle",
+                measurement.angle_degrees
+            )));
+        }
+        return Some(ViewportToolLabel::neutral(
+            match editor.berm_angle_points.len() {
+                0 => "Select first crest/toe point",
+                1 => "Select second crest/toe point",
+                _ => "Select opposite berm point",
+            },
+        ));
+    }
+
     match editor.active_tool {
         ActiveTool::Move if editor.selected_handles.is_empty() => Some("Select an item"),
         ActiveTool::OffsetElement if editor.offset_awaiting_side_pick => Some("Choose offset side"),
-        ActiveTool::OffsetElement if editor.offset_target_id.is_none() => {
+        ActiveTool::OffsetElement if editor.offset_target_ids.is_empty() => {
             Some("Select a line or polygon")
         }
         ActiveTool::RelimitLine if editor.relimit_confirming_end => Some("Choose relimit side"),
@@ -302,6 +314,13 @@ fn viewport_label_text(editor: &EditorState) -> Option<ViewportToolLabel> {
             Some("Select the next line to fuse")
         }
         ActiveTool::FuseIntoPolygon => Some("Select a line to fuse"),
+        ActiveTool::SplitAtPoints if editor.split_poly_id.is_none() => Some("Select a polygon"),
+        ActiveTool::SplitAtPoints if editor.split_selected_verts[0].is_none() => {
+            Some("Select first split point")
+        }
+        ActiveTool::SplitAtPoints if editor.split_selected_verts[1].is_none() => {
+            Some("Select second split point")
+        }
         ActiveTool::Chamfer if editor.chamfer_corner_index.is_none() => {
             Some("Select a polygon vertex")
         }
@@ -338,12 +357,15 @@ fn draw_ui(
 
     // --- Panel layout: compute rects for all fixed panels ---
     let project_active = project.active_index.is_some();
-    let editing_enabled = project.active_index.is_some() && editor.active_layer.is_some();
+    let editing_enabled =
+        project.active_index.is_some() && editor.active_layer.is_some() && !editor.fly_mode_enabled;
 
     let main_menu_rect =
         crate::ui::elements::main_menu::draw_main_menu(root_ui, editor, project, commands);
     crate::ui::elements::tabs::sync_block_model_table_tabs(block_models);
     let (tabs_rect, active_tab) = crate::ui::elements::tabs::draw_tabs(root_ui);
+
+    // tabs
     match active_tab {
         crate::ui::elements::tabs::TabClass::Preferences => {
             crate::ui::elements::preferences::draw_preferences(root_ui, editor, commands);
@@ -395,6 +417,7 @@ fn draw_ui(
         editor,
         editing_enabled,
         project_active,
+        commands,
     );
 
     let right_toolbar_rect =
@@ -626,6 +649,24 @@ fn draw_ui(
         painter.circle_stroke(pos, 7.5, egui::Stroke::new(1.5, egui::Color32::WHITE));
     }
 
+    // Split At Points tool: vertex dots and selected split points
+    if editor.active_tool == ActiveTool::SplitAtPoints {
+        let ppp = root_ui.ctx().pixels_per_point();
+        let painter = root_ui.painter().with_clip_rect(canvas_rect);
+
+        for &(x, y) in &editor.split_poly_verts_screen_px {
+            painter.circle_filled(egui::pos2(x / ppp, y / ppp), 5.0, egui::Color32::WHITE);
+        }
+
+        for selected in editor.split_selected_verts.iter().flatten() {
+            if let Some(&(x, y)) = editor.split_poly_verts_screen_px.get(*selected) {
+                let pos = egui::pos2(x / ppp, y / ppp);
+                painter.circle_filled(pos, 7.0, SELECTION_COLOR);
+                painter.circle_stroke(pos, 8.5, egui::Stroke::new(1.5, egui::Color32::WHITE));
+            }
+        }
+    }
+
     // Bezier tool: vertex dots, control handles, and dashed preview
     if editor.active_tool == ActiveTool::Bezier {
         let ppp = root_ui.ctx().pixels_per_point();
@@ -727,9 +768,8 @@ fn draw_ui(
 
     // --- Startup & global dialogs ---
     if project.needs_startup_dialog {
-        crate::ui::dialogs::editing::draw_select_pidb_dialog(root_ui, commands);
+        crate::ui::dialogs::editing::draw_select_pidb_dialog(root_ui, editor, commands);
     }
-    crate::ui::dialogs::files::draw_file_operation_dialog(root_ui, editor, project, commands);
     crate::ui::dialogs::files::draw_vertical_exaggeration_dialog(root_ui, editor, canvas_rect);
     crate::ui::dialogs::editing::draw_move_to_layer_dialog(root_ui, editor, project, commands);
     crate::ui::dialogs::editing::draw_set_selection_z_dialog(root_ui, editor, commands);
@@ -754,7 +794,7 @@ fn draw_ui(
     // --- Tool-specific dialogs ---
 
     // Create Layer
-    if editor.active_tool == ActiveTool::NewLayer {
+    if editor.new_layer_dialog_open {
         crate::ui::dialogs::editing::draw_create_layer_dialog(
             root_ui,
             commands,
@@ -803,15 +843,19 @@ fn draw_ui(
             }
         }
         let stroke = egui::Stroke::new(2.0, yellow);
-        let n = pts.len();
-        for i in 0..n {
-            let next = if editor.offset_preview_closed {
-                (i + 1) % n
-            } else {
-                i + 1
-            };
-            if next < n {
-                painter.line_segment([pts[i], pts[next]], stroke);
+        for &(start, end, closed) in &editor.offset_preview_ranges {
+            if start >= end || end > pts.len() {
+                continue;
+            }
+            for i in start..end {
+                let next = if closed {
+                    start + ((i - start + 1) % (end - start))
+                } else {
+                    i + 1
+                };
+                if next < end {
+                    painter.line_segment([pts[i], pts[next]], stroke);
+                }
             }
         }
     }
@@ -1031,6 +1075,11 @@ fn draw_ui(
     if editor.tri_contour_open {
         crate::ui::dialogs::triangulation::draw_contour_dialog(root_ui, editor, project, commands);
     }
+    if editor.point_cloud_tin_open {
+        crate::ui::dialogs::triangulation::draw_point_cloud_tin_dialog(
+            root_ui, editor, project, commands,
+        );
+    }
     if editor.ore_triangulation_open {
         crate::ui::elements::block_model::draw_ore_triangulation_dialog(
             root_ui,
@@ -1039,6 +1088,10 @@ fn draw_ui(
             commands,
         );
     }
+
+    // import export menus
+    crate::ui::dialogs::import_export::draw_import_menu(root_ui, editor, project, commands);
+    crate::ui::dialogs::import_export::draw_export_menu(root_ui, editor, project, commands);
 
     geometry_dirty
 }

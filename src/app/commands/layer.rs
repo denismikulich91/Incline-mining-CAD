@@ -40,7 +40,6 @@ impl<'a> App<'a> {
                 .pidb
                 .document
                 .add_layer(name.clone(), None, [1.0, 1.0, 1.0, 1.0], true, 0.0);
-        project.dirty = true;
         project.loaded_layers.insert(layer_id);
         self.workspace.set_active_index(project_index);
         self.history.clear();
@@ -81,7 +80,6 @@ impl<'a> App<'a> {
                 },
             );
             project.loaded_layers.remove(&layer_id);
-            project.dirty = true;
             true
         };
         if deleted {
@@ -137,7 +135,6 @@ impl<'a> App<'a> {
             },
         );
         project.loaded_layers.insert(new_layer_id);
-        project.dirty = true;
         project.invalidate_dirty_layers();
         self.editor.selected_handles.clear();
         userspace_log!("Duplicated layer '{duplicate_name}' in project {project_index}");
@@ -199,7 +196,6 @@ impl<'a> App<'a> {
             }
             source_project.pidb.document.delete_layer(layer_id);
             source_project.loaded_layers.remove(&layer_id);
-            source_project.dirty = true;
             source_project.invalidate_dirty_layers();
         }
 
@@ -209,7 +205,6 @@ impl<'a> App<'a> {
                 .document
                 .append_layer_snapshot(&moved_layer, moved_objects.iter());
             target_project.loaded_layers.insert(new_layer_id);
-            target_project.dirty = true;
             target_project.invalidate_dirty_layers();
         }
 
@@ -331,19 +326,10 @@ impl<'a> App<'a> {
             return;
         }
         self.unload_layer(project_index, layer_id);
-        if let Some(project) = self.workspace.projects.get_mut(project_index) {
-            // Use dirty_layers() rather than a separate differs_from_disk() call: it reads
-            // the file once, caches the result, and the next frame's project_view() gets a
-            // cache hit instead of a third disk read.
-            let still_dirty = project.dirty_layers();
-            project.dirty = match &project.path {
-                Some(_) => !still_dirty.is_empty(),
-                None => {
-                    !project.pidb.document.layers().is_empty()
-                        || !project.pidb.document.objects().is_empty()
-                }
-            };
-            // dirty_layers() just populated the cache — don't invalidate it here.
+        if let Some(project) = self.workspace.projects.get(project_index) {
+            // Reuse dirty_layers() so the disk snapshot stays cached and the
+            // next frame's project_view() gets a cache hit.
+            let _ = project.dirty_layers();
         }
         self.editor
             .pending_unload_queue
@@ -489,7 +475,6 @@ impl<'a> App<'a> {
             self.try_unload_layer(project_index, id);
         }
         userspace_log!("Requested unload of {count} layer(s) in project {project_index}");
-        userspace_warn!("Requested unload of {count} layer(s) from PIDB index {project_index}");
     }
 
     pub(crate) fn select_all_objects_in_layer(&mut self, project_index: usize, layer_id: LayerId) {

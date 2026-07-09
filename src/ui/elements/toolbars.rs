@@ -99,12 +99,11 @@ pub(crate) fn draw_top_toolbar(
 
                         if ColorSquarePicker::new(&mut line_c32).show(ui).changed() {
                             editor.tool_line_color = color32_to_rgba(line_c32);
-                            editor.tool_fill_color = color32_to_rgba(line_c32);
                         }
 
                         HatchPicker::new(
                             &mut editor.tool_hatch,
-                            rgba_to_color32(editor.tool_fill_color),
+                            rgba_to_color32(editor.tool_line_color),
                         )
                         .show(ui);
                     });
@@ -122,6 +121,7 @@ pub(crate) fn draw_left_toolbar(
     editor: &mut EditorState,
     editing_enabled: bool,
     project_active: bool,
+    commands: &mut Vec<UiCommand>,
 ) -> egui::Rect {
     egui::Panel::left("left_tools_strip")
         .resizable(false)
@@ -133,13 +133,20 @@ pub(crate) fn draw_left_toolbar(
                 .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_enabled_ui(project_active, |ui| {
-                            tool_button(
-                                ui,
-                                egui::Image::new(unthemed_icon!("new_layer.svg")),
-                                "New layer",
-                                editor,
-                                ActiveTool::NewLayer,
+                            let new_layer = ui.add(
+                                ToolbarButton::new(
+                                    egui::Image::new(unthemed_icon!("new_layer.svg")),
+                                    "New layer",
+                                )
+                                .selected(editor.new_layer_dialog_open),
                             );
+                            if new_layer.clicked() {
+                                editor.new_layer_dialog_open = !editor.new_layer_dialog_open;
+                                if editor.new_layer_dialog_open {
+                                    editor.new_layer_name = "design".to_owned();
+                                    commands.push(UiCommand::SetActiveTool(ActiveTool::None));
+                                }
+                            }
 
                             ui.add_space(6.0);
                             ui.separator();
@@ -151,40 +158,45 @@ pub(crate) fn draw_left_toolbar(
                             tool_button(
                                 ui,
                                 egui::Image::new(themed_icon!(ui, "make_point.svg")),
-                                "Make Point",
+                                "Create Point",
                                 editor,
+                                commands,
                                 ActiveTool::MakePoint,
                             );
 
                             tool_button(
                                 ui,
                                 egui::Image::new(themed_icon!(ui, "make_line.svg")),
-                                "Make Line",
+                                "Create Line",
                                 editor,
+                                commands,
                                 ActiveTool::MakeLine,
                             );
 
                             tool_button(
                                 ui,
                                 egui::Image::new(themed_icon!(ui, "make_poly.svg")),
-                                "Make Polygon",
+                                "Create Polygon",
                                 editor,
+                                commands,
                                 ActiveTool::MakePoly,
                             );
 
                             tool_button(
                                 ui,
                                 egui::Image::new(unthemed_icon!("make_text.svg")),
-                                "Make Text",
+                                "Create Text",
                                 editor,
+                                commands,
                                 ActiveTool::MakeText,
                             );
 
                             tool_button(
                                 ui,
                                 egui::Image::new(unthemed_icon!("make_road.svg")),
-                                "Make Roads",
+                                "Create Road",
                                 editor,
+                                commands,
                                 ActiveTool::MakeRoad,
                             );
 
@@ -197,6 +209,7 @@ pub(crate) fn draw_left_toolbar(
                                 egui::Image::new(themed_icon!(ui, "pan.svg")),
                                 "Move",
                                 editor,
+                                commands,
                                 ActiveTool::Move,
                             );
 
@@ -205,6 +218,7 @@ pub(crate) fn draw_left_toolbar(
                                 egui::Image::new(themed_icon!(ui, "offset.svg")),
                                 "Offset",
                                 editor,
+                                commands,
                                 ActiveTool::OffsetElement,
                             );
 
@@ -213,6 +227,7 @@ pub(crate) fn draw_left_toolbar(
                                 egui::Image::new(unthemed_icon!("pit_design.svg")),
                                 "Auto-Bench",
                                 editor,
+                                commands,
                                 ActiveTool::BatterBermOffset,
                             );
 
@@ -221,6 +236,7 @@ pub(crate) fn draw_left_toolbar(
                                 egui::Image::new(themed_icon!(ui, "rebase.svg")),
                                 "Relimit Line",
                                 editor,
+                                commands,
                                 ActiveTool::RelimitLine,
                             );
 
@@ -229,6 +245,7 @@ pub(crate) fn draw_left_toolbar(
                                 egui::Image::new(themed_icon!(ui, "fuse.svg")),
                                 "Fuse Lines Into Polygon",
                                 editor,
+                                commands,
                                 ActiveTool::FuseIntoPolygon,
                             );
 
@@ -237,6 +254,7 @@ pub(crate) fn draw_left_toolbar(
                                 egui::Image::new(themed_icon!(ui, "chamfer.svg")),
                                 "Chamfer Polygon Corners",
                                 editor,
+                                commands,
                                 ActiveTool::Chamfer,
                             );
 
@@ -245,7 +263,17 @@ pub(crate) fn draw_left_toolbar(
                                 egui::Image::new(themed_icon!(ui, "bezier.svg")),
                                 "Bezier Polygon",
                                 editor,
+                                commands,
                                 ActiveTool::Bezier,
+                            );
+
+                            tool_button(
+                                ui,
+                                egui::Image::new(themed_icon!(ui, "split_at_points.svg")),
+                                "Split Polygon At Points",
+                                editor,
+                                commands,
+                                ActiveTool::SplitAtPoints,
                             );
 
                             tool_button(
@@ -253,6 +281,7 @@ pub(crate) fn draw_left_toolbar(
                                 egui::Image::new(unthemed_icon!("boom.svg")),
                                 "Explode Polygon to Lines",
                                 editor,
+                                commands,
                                 ActiveTool::ExplodePolygon,
                             );
 
@@ -261,6 +290,7 @@ pub(crate) fn draw_left_toolbar(
                                 egui::Image::new(unthemed_icon!("delete_element.svg")),
                                 "Delete",
                                 editor,
+                                commands,
                                 ActiveTool::DeleteElement,
                             );
                         });
@@ -303,7 +333,7 @@ pub(crate) fn draw_right_toolbar(
                 // Open Vertical Exaggeration menu button
                 let response = ui.add(
                     ToolbarButton::new(
-                        egui::Image::new(unthemed_icon!("exagerated_topology.svg")),
+                        egui::Image::new(unthemed_icon!("exaggerated_topology.svg")),
                         format!(
                             "Vertical Exaggeration ({:.2}×)",
                             editor.vertical_exaggeration
@@ -345,7 +375,7 @@ pub(crate) fn draw_right_toolbar(
                     .selected(editor.fly_mode_enabled),
                 );
                 if response.clicked() {
-                    editor.fly_mode_enabled = !editor.fly_mode_enabled;
+                    commands.push(UiCommand::SetFlyModeEnabled(!editor.fly_mode_enabled));
                 }
             });
         })
@@ -433,10 +463,20 @@ pub(crate) fn draw_bottom_toolbar(
 
                 tool_button(
                     ui,
-                    egui::Image::new(themed_icon!(ui, "mesure_distance.svg")),
+                    egui::Image::new(themed_icon!(ui, "measure_distance.svg")),
                     "Measure distance",
                     editor,
+                    commands,
                     ActiveTool::MeasureDistance,
+                );
+
+                tool_button(
+                    ui,
+                    egui::Image::new(themed_icon!(ui, "measure_angle.svg")),
+                    "Measure berm angle",
+                    editor,
+                    commands,
+                    ActiveTool::MeasureBermAngle,
                 );
             });
         })
@@ -450,80 +490,14 @@ pub(crate) fn tool_button(
     icon: egui::Image<'static>,
     tooltip: &str,
     editor: &mut EditorState,
+    commands: &mut Vec<UiCommand>,
     tool: ActiveTool,
 ) -> egui::Response {
     let selected = editor.active_tool == tool;
     let response = ui.add(ToolbarButton::new(icon, tooltip).selected(selected));
 
     if response.clicked() {
-        let previous_tool = editor.active_tool;
-        if selected {
-            editor.active_tool = ActiveTool::None;
-        } else {
-            editor.active_tool = tool;
-        }
-
-        // Cancel in-progress tool state when switching away from tools with panels/previews.
-        if previous_tool == ActiveTool::OffsetElement
-            && editor.active_tool != ActiveTool::OffsetElement
-        {
-            editor.offset_dialog_open = false;
-            editor.offset_target_id = None;
-            editor.offset_awaiting_side_pick = false;
-            editor.offset_preview_world.clear();
-            editor.offset_source_world.clear();
-        }
-        if previous_tool == ActiveTool::RelimitLine && editor.active_tool != ActiveTool::RelimitLine
-        {
-            editor.relimit_dialog_open = false;
-            editor.relimit_source_id = None;
-            editor.relimit_awaiting_source_pick = false;
-            editor.relimit_waiting_for_pick = false;
-            editor.relimit_confirming_end = false;
-        }
-        if previous_tool == ActiveTool::BatterBermOffset
-            && editor.active_tool != ActiveTool::BatterBermOffset
-        {
-            editor.batter_berm_dialog_open = false;
-            editor.batter_berm_target_id = None;
-            editor.batter_berm_rings_world.clear();
-            editor.batter_berm_source_world.clear();
-            editor.batter_berm_guides_world.clear();
-            editor.batter_berm_rings_screen_px.clear();
-            editor.batter_berm_source_screen_px.clear();
-            editor.batter_berm_guides_screen_px.clear();
-            editor.tool_highlight_id = None;
-        }
-        if previous_tool == ActiveTool::MakeRoad && editor.active_tool != ActiveTool::MakeRoad {
-            editor.road_dialog_open = false;
-            editor.pending_stroke.clear();
-            editor.road_preview_left_world.clear();
-            editor.road_preview_right_world.clear();
-            editor.road_preview_left_screen_px.clear();
-            editor.road_preview_right_screen_px.clear();
-            editor.road_preview_center_screen_px.clear();
-        }
-        if previous_tool == ActiveTool::Bezier && editor.active_tool != ActiveTool::Bezier {
-            editor.bezier_poly_id = None;
-            editor.bezier_selected_verts = [None; 2];
-            editor.bezier_cp1 = [0.0; 3];
-            editor.bezier_cp2 = [0.0; 3];
-            editor.bezier_poly_verts_screen_px.clear();
-            editor.bezier_cp1_screen_px = None;
-            editor.bezier_cp2_screen_px = None;
-            editor.bezier_preview_screen_px.clear();
-            editor.bezier_dragging_cp = None;
-            editor.bezier_hover_cp = None;
-            editor.bezier_dialog_open = false;
-        }
-
-        if editor.active_tool == ActiveTool::NewLayer {
-            editor.new_layer_name = "design".to_owned();
-        }
-        if tool == ActiveTool::MeasureDistance {
-            editor.measurement_start = None;
-            editor.measurement_end = None;
-        }
+        commands.push(UiCommand::SetActiveTool(tool));
     }
 
     response

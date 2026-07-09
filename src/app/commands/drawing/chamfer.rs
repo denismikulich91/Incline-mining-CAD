@@ -34,12 +34,15 @@ impl<'a> App<'a> {
         let Some((oid, vi, _world)) = result else {
             return;
         };
+        if !self.activate_project_for_object(oid) {
+            return;
+        }
 
-        // Only accept closed polylines
-        if !self
-            .active_layer_object(oid)
-            .is_some_and(|o| matches!(o, Object::Polyline { closed: true, .. }))
-        {
+        // Only accept real closed polygons. Modifying tools are not restricted
+        // to the active layer.
+        if !self.active_document().get_object(oid).is_some_and(
+            |o| matches!(o, Object::Polyline { closed: true, verts, .. } if verts.len() >= 3),
+        ) {
             return;
         }
 
@@ -56,6 +59,9 @@ impl<'a> App<'a> {
         ) else {
             return;
         };
+        if !self.activate_project_for_object(oid) {
+            return;
+        }
         let Some(project) = self.workspace.active_project_mut() else {
             return;
         };
@@ -85,7 +91,6 @@ impl<'a> App<'a> {
         if before != after {
             self.history
                 .execute(doc, Command::Replace { before, after });
-            project.dirty = true;
             userspace_log!(
                 "Chamfered corner {} (radius {:.3}, {} segments)",
                 ci,

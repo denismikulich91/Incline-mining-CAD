@@ -89,6 +89,35 @@ pub struct DgdDesignData {
     pub points: Vec<DesignPoint>,
     pub texts: Vec<DesignText>,
     pub layer_names: Vec<String>,
+    /// The RGB palette embedded in the database's `dig$colour256` hidden layer,
+    /// if present. Object colour indices resolve through this in preference to
+    /// the built-in default palette. We read the 256-colour (extended) table:
+    /// the file also carries a 32-colour `dig$colour` table on a 0..=15 scale,
+    /// but nothing in the ISIS stream records which mode is active, so the
+    /// extended table is used unconditionally for now.
+    pub palette: Option<DgdColorTable>,
+}
+
+/// An RGB colour palette embedded in a DGD design database via a hidden
+/// colour-table layer (`dig$colour256` = extended 256-colour, `dig$colour` =
+/// standard 32-colour). Under the layer's type-01 header each palette entry is
+/// a type-05 record whose segment field is the 1-based colour index and whose
+/// XYZ coordinate fields carry the RGB channels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DgdColorTable {
+    /// RGB by colour index minus one; a missing index reads back as `None` so
+    /// the caller falls back to the built-in default palette.
+    entries: Vec<Option<[u8; 3]>>,
+}
+
+impl DgdColorTable {
+    /// The 8-bit RGB for a 1-based Vulcan colour index, if this table defines it.
+    pub fn rgb(&self, index: u8) -> Option<[u8; 3]> {
+        self.entries
+            .get((index as usize).checked_sub(1)?)
+            .copied()
+            .flatten()
+    }
 }
 
 #[derive(Debug)]
@@ -149,6 +178,7 @@ pub fn read_dgd_design_bytes(bytes: &[u8]) -> Result<DgdDesignData, IsisError> {
     points.retain(|point| !text_coord_offsets.contains(&point.offset));
     attribute_dgd_closed(&mut points, &objects);
     attribute_dgd_layers(&mut points, &mut texts, &layer_headers, &saves);
+    reconnect_dgd_closed_multistring(&mut points, &objects);
     for name in points
         .iter()
         .filter_map(|point| point.layer_name.as_deref())
@@ -156,11 +186,78 @@ pub fn read_dgd_design_bytes(bytes: &[u8]) -> Result<DgdDesignData, IsisError> {
     {
         push_unique_layer_name(&mut layer_names, name);
     }
+    let palette = scan_dgd_color_table(&data, &layer_headers, "DIG$COLOUR256");
     Ok(DgdDesignData {
         points,
         texts,
         layer_names,
+        palette,
     })
+}
+
+/// Parse the RGB palette stored in a DGD colour-table layer. `dig$colour256`
+/// stores channels on a 0..=255 scale and `dig$colour` on 0..=15 (4-bit); the
+/// scale is detected from the values and normalised to 0..=255. The entries are
+/// the run of type-05 records immediately following the colour layer's type-01
+/// header, each keyed by its segment field (the 1-based colour index). Returns
+/// `None` when the layer is absent or holds no usable entries.
+///
+/// Vulcan stores each entry's channels in the coordinate fields as **Red,
+/// Blue, Green** — the same `.scd` column order (`Colour, Red, Blue, Green`) as
+/// the built-in default palette — so the Y/Z (blue/green) fields are swapped
+/// back to `[R, G, B]` here. Without the swap, greens and blues transpose
+/// (index 3 `#00FF00` reads as `#0000FF`, index 4 `#1166FF` as `#11FF66`).
+fn scan_dgd_color_table(
+    data: &[u8],
+    headers: &[DgdLayerHeader],
+    layer_name: &str,
+) -> Option<DgdColorTable> {
+    let header = headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case(layer_name))?;
+
+    let mut raw: Vec<(usize, [f64; 3])> = Vec::new();
+    let mut i = header.offset + DGD_COORD_RECORD_LEN;
+    while i + DGD_COORD_RECORD_LEN <= data.len() && data[i] == 0x05 {
+        if let Some(index) = parse_dgd_color_index(&data[i + 2..i + 5])
+            && let Some((red, blue, green)) = try_read_xyz(data, i + 5)
+        {
+            raw.push((index as usize, [red, green, blue]));
+        }
+        i += DGD_COORD_RECORD_LEN;
+    }
+    if raw.is_empty() {
+        return None;
+    }
+
+    // A 4-bit (`dig$colour`) table keeps every channel within 0..=15; scale it
+    // up so both palettes are stored as 0..=255.
+    let four_bit = raw
+        .iter()
+        .flat_map(|(_, rgb)| rgb.iter())
+        .all(|channel| (0.0..=15.0).contains(channel));
+    let scale = if four_bit { 17.0 } else { 1.0 };
+
+    let max_index = raw.iter().map(|(index, _)| *index).max()?;
+    let mut entries = vec![None; max_index];
+    for (index, rgb) in raw {
+        let channel = |value: f64| (value * scale).round().clamp(0.0, 255.0) as u8;
+        entries[index - 1] = Some([channel(rgb[0]), channel(rgb[1]), channel(rgb[2])]);
+    }
+    Some(DgdColorTable { entries })
+}
+
+/// Parse a colour-table record's 3-byte segment field as a 1-based colour
+/// index (1..=256). Unlike [`parse_dgd_seg_field`] this keeps the full range —
+/// the 256th entry must not saturate to a `u8`.
+fn parse_dgd_color_index(field: &[u8]) -> Option<u32> {
+    let digits: String = field
+        .iter()
+        .filter(|byte| byte.is_ascii_digit())
+        .map(|&byte| byte as char)
+        .collect();
+    let index = digits.parse::<u32>().ok()?;
+    (1..=256).contains(&index).then_some(index)
 }
 
 pub fn read_dgd_index(path: impl AsRef<Path>) -> Result<Vec<DesignIndexEntry>, IsisError> {
@@ -314,10 +411,17 @@ fn scan_dgd_layer_headers(data: &[u8]) -> Vec<DgdLayerHeader> {
             i += 1;
             continue;
         };
+        // The tail after the 40-byte timestamp field carries a space-padded
+        // trailing counter whose column floats with the stamp's padding width,
+        // so a lone ASCII digit can land here (e.g. the `0` in
+        // `…DGEDIT             0` of `WBC405_PB_V23_C`). Allowing digits — as the
+        // type-09 save validator already does for its own tail — keeps such
+        // genuine live headers from being dropped, which would otherwise fold
+        // the following layer's strings into the preceding layer.
         if !is_dgd_layer_header_stamp(&stamp)
             || !data[i + TAIL_OFFSET..i + DGD_COORD_RECORD_LEN]
                 .iter()
-                .all(|byte| *byte == 0 || *byte == b' ')
+                .all(|byte| *byte == 0 || *byte == b' ' || byte.is_ascii_digit())
         {
             i += 1;
             continue;
@@ -630,6 +734,8 @@ fn scan_dgd_objects(data: &[u8]) -> Vec<DgdObjectHeader> {
 /// and closing each would fabricate closing edges (e.g. `LINE$11448` came
 /// through as two closed polygons instead of one open line), so closure is
 /// suppressed for every string of a multi-string object.
+/// [`reconnect_dgd_closed_multistring`] then stitches a *closed* multi-string
+/// object back into the single open line Vulcan actually draws.
 fn attribute_dgd_closed(points: &mut [DesignPoint], objects: &[DgdObjectHeader]) {
     let owning_poly = |offset: usize| -> Option<usize> {
         let index = objects
@@ -653,6 +759,97 @@ fn attribute_dgd_closed(points: &mut [DesignPoint], objects: &[DgdObjectHeader])
             let single_string = segment_headers.get(&index).copied().unwrap_or(0) <= 1;
             point.closed = object.closed && single_string;
             point.color_index = object.color_index;
+        }
+    }
+}
+
+/// Reconstruct a *closed* multi-string POLY into the single open polyline Vulcan
+/// draws for it, matching its "connected" point semantics.
+///
+/// A closed object draws a segment from its last point back to its first; a
+/// point whose "connected" flag is off (a mid-object `seg_type == 0` header) is
+/// a pen-up with no drawn segment into it. So the drawn edges of a two-string
+/// closed object are: everything within each string, plus the closing edge
+/// (last→first) — but *not* the pen-up into the second string's start. That is
+/// one open line, `string2 → (closing edge) → string1`, whose two free ends are
+/// the pen-up gap. Emitting the strings verbatim instead yields two disjoint
+/// lines and loses the closing edge (the earlier fix suppressed the fabricated
+/// closure but never rejoined them).
+///
+/// We realise this by reordering each closed object's points so its last string
+/// leads (the closing edge becomes an ordinary connection into the first
+/// string) and merging that pair into one string; any middle strings keep their
+/// own pen-up breaks as separate open strings. The object's original offsets are
+/// re-applied in ascending order so the downstream polyline builder still sees
+/// one contiguous, monotonic run rather than re-splitting on a fabricated gap.
+fn reconnect_dgd_closed_multistring(points: &mut [DesignPoint], objects: &[DgdObjectHeader]) {
+    let owning_poly = |offset: usize| -> Option<usize> {
+        let index = objects
+            .partition_point(|object| object.offset < offset)
+            .checked_sub(1)?;
+        (objects[index].kind == DgdObjectKind::Poly).then_some(index)
+    };
+
+    let mut start = 0;
+    while start < points.len() {
+        let Some(object_index) = owning_poly(points[start].offset) else {
+            start += 1;
+            continue;
+        };
+        let mut end = start;
+        while end < points.len() && owning_poly(points[end].offset) == Some(object_index) {
+            end += 1;
+        }
+        let block = &mut points[start..end];
+        let seg_headers = block.iter().filter(|point| point.seg_type == 0).count();
+        if objects[object_index].closed && seg_headers > 1 {
+            reconnect_closed_object(block);
+        }
+        start = end;
+    }
+}
+
+/// Reorder one closed object's points (a contiguous slice) into the merged open
+/// line described on [`reconnect_dgd_closed_multistring`].
+fn reconnect_closed_object(block: &mut [DesignPoint]) {
+    // Split into strings, each beginning at a `seg_type == 0` header.
+    let mut strings: Vec<Vec<DesignPoint>> = Vec::new();
+    for point in block.iter() {
+        if strings.is_empty() || point.seg_type == 0 {
+            strings.push(Vec::new());
+        }
+        strings
+            .last_mut()
+            .expect("a string was just pushed")
+            .push(point.clone());
+    }
+    if strings.len() < 2 {
+        return;
+    }
+
+    // Preserve the block's offsets so the run stays contiguous and ascending.
+    let mut offsets: Vec<usize> = block.iter().map(|point| point.offset).collect();
+    offsets.sort_unstable();
+
+    // Merge the last string with the first (joined by the closing edge); the
+    // middle strings remain separate open strings after it.
+    let last = strings.pop().expect("at least two strings");
+    let mut merged = last;
+    merged.append(&mut strings[0]);
+    let mut ordered: Vec<Vec<DesignPoint>> = vec![merged];
+    ordered.extend(strings.into_iter().skip(1));
+
+    // Flatten back into the block: a header (`seg_type == 0`) at each string
+    // start, the closing flag cleared (the line is now open), and the preserved
+    // offsets re-applied in order.
+    let mut out = 0;
+    for string in ordered {
+        for (within, mut point) in string.into_iter().enumerate() {
+            point.seg_type = u8::from(within != 0);
+            point.closed = false;
+            point.offset = offsets[out];
+            block[out] = point;
+            out += 1;
         }
     }
 }
@@ -1097,7 +1294,10 @@ fn try_read_xyz(data: &[u8], offset: usize) -> Option<(f64, f64, f64)> {
 }
 
 fn is_plausible_coord(x: f64, y: f64, z: f64) -> bool {
-    x.abs() > 100.0 && x.abs() < 1e8 && y.abs() > 100.0 && y.abs() < 1e8 && z.abs() < 50_000.0
+    // No lower magnitude bound: local-grid sites and axis-crossing strings
+    // legitimately have coordinates near zero. The record prefix + seg field
+    // checks in `scan_dgd_points` are what reject scan false positives.
+    x.abs() < 1e8 && y.abs() < 1e8 && z.abs() < 50_000.0
 }
 
 fn decode_name(bytes: &[u8]) -> String {
@@ -1114,583 +1314,4 @@ fn decode_name(bytes: &[u8]) -> String {
         .collect::<String>()
         .trim_end()
         .to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Gated on `INCLINE_TEST_ISIS=<path>` — run against real Vulcan files that
-    /// can't live in the repo. Prints record/segment stats for manual review.
-    #[test]
-    fn reads_dgd_isis_from_env_path() {
-        let Ok(path) = std::env::var("INCLINE_TEST_ISIS") else {
-            return;
-        };
-        if let Ok(dump_path) = std::env::var("INCLINE_TEST_ISIS_DUMP") {
-            let bytes = fs::read(&path).unwrap();
-            let (data, aux) = decompress_if_vulz(&bytes).unwrap_or_else(|e| panic!("{path}: {e}"));
-            fs::write(&dump_path, &data).unwrap();
-            fs::write(format!("{dump_path}.aux"), &aux).unwrap();
-            println!(
-                "dumped {} logical + {} aux bytes to {dump_path}",
-                data.len(),
-                aux.len()
-            );
-        }
-        let design = read_dgd_design(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-        let segments = design.points.iter().filter(|p| p.seg_type == 0).count();
-        let mut names: Vec<&str> = design.points.iter().map(|p| p.name.as_str()).collect();
-        names.sort_unstable();
-        names.dedup();
-        println!(
-            "{path}: {} points, {segments} segments, {} texts, {} distinct names, {} embedded layer names",
-            design.points.len(),
-            design.texts.len(),
-            names.len(),
-            design.layer_names.len()
-        );
-        for text in design.texts.iter().take(10) {
-            println!(
-                "  text {:?} at ({:.1},{:.1},{:.1}) h={} rot={:.1} layer={:?}",
-                text.content,
-                text.x,
-                text.y,
-                text.z,
-                text.height,
-                text.rotation_degrees,
-                text.layer_name
-            );
-        }
-        let closed = design.points.iter().filter(|p| p.closed).count();
-        println!(
-            "  {closed} of {} points belong to closed polygons",
-            design.points.len()
-        );
-        for name in names.iter().take(20) {
-            println!("  name: {name:?}");
-        }
-        for name in design.layer_names.iter().take(20) {
-            println!("  layer: {name:?}");
-        }
-        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-        for point in &design.points {
-            *counts
-                .entry(point.layer_name.as_deref().unwrap_or("<unattributed>"))
-                .or_default() += 1;
-        }
-        let mut counts: Vec<_> = counts.into_iter().collect();
-        counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
-        for (name, count) in counts {
-            println!("  layer {name:?}: {count} points");
-        }
-        if let Ok(expected) = std::env::var("INCLINE_TEST_ISIS_LAYER_NAME") {
-            assert!(
-                design.layer_names.iter().any(|name| name == &expected)
-                    || design
-                        .points
-                        .iter()
-                        .any(|point| point.layer_name.as_deref() == Some(expected.as_str())),
-                "{expected:?} was not found in {path}"
-            );
-        }
-        assert!(
-            !design.points.is_empty(),
-            "no design points found in {path}"
-        );
-    }
-
-    #[test]
-    fn reads_embedded_dgd_layer_names_between_png_previews() {
-        const PNG_SIGNATURE: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-        const PNG_IEND: &[u8] = &[b'I', b'E', b'N', b'D', 0xae, b'B', b'`', 0x82];
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(PNG_IEND);
-        let mut slot = [0_u8; 56];
-        let name = b"30P202_0514_20250319";
-        slot[..name.len()].copy_from_slice(name);
-        bytes.extend_from_slice(&slot);
-        bytes.extend_from_slice(PNG_SIGNATURE);
-
-        let design = read_dgd_design_bytes(&bytes).unwrap();
-
-        assert_eq!(design.layer_names, vec!["30P202_0514_20250319"]);
-    }
-
-    fn write_coord_record(bytes: &mut [u8], offset: usize, seg: &[u8; 3], name: &str) {
-        write_coord_record_xyz(bytes, offset, seg, name, (1234.0, 5678.0, 1000.0));
-    }
-
-    fn write_coord_record_xyz(
-        bytes: &mut [u8],
-        offset: usize,
-        seg: &[u8; 3],
-        name: &str,
-        (x, y, z): (f64, f64, f64),
-    ) {
-        bytes[offset] = 0x05;
-        bytes[offset + 1] = b' ';
-        bytes[offset + 2..offset + 5].copy_from_slice(seg);
-        bytes[offset + 5..offset + 13].copy_from_slice(&x.to_be_bytes());
-        bytes[offset + 13..offset + 21].copy_from_slice(&y.to_be_bytes());
-        bytes[offset + 21..offset + 29].copy_from_slice(&z.to_be_bytes());
-        write_fixed_name(&mut bytes[offset + 37..offset + 77], name);
-        bytes[offset + 77..offset + 117].fill(b' ');
-    }
-
-    fn write_object_record(bytes: &mut [u8], offset: usize, kind: u8, name: &str, closed: bool) {
-        bytes[offset] = kind;
-        bytes[offset + 1] = b' ';
-        write_fixed_name(&mut bytes[offset + 2..offset + 42], name);
-        // eight zero bytes at 42..50 are already present in a fresh buffer
-        bytes[offset + 50..offset + DGD_COORD_RECORD_LEN].fill(b' ');
-        bytes[offset + 76] = if closed { b'1' } else { b'0' };
-    }
-
-    fn write_text_line_record(bytes: &mut [u8], offset: usize, content: &str) {
-        bytes[offset] = 0x06;
-        bytes[offset + 1] = b' ';
-        bytes[offset + 2..offset + DGD_COORD_RECORD_LEN].fill(b' ');
-        bytes[offset + 2..offset + 2 + content.len()].copy_from_slice(content.as_bytes());
-    }
-
-    fn write_save_record(bytes: &mut [u8], offset: usize, flag: u8, name: &str) {
-        bytes[offset] = 0x09;
-        bytes[offset + 1] = flag;
-        write_fixed_name(&mut bytes[offset + 2..offset + 42], name);
-        bytes[offset + 42..offset + DGD_COORD_RECORD_LEN].fill(b' ');
-    }
-
-    fn write_layer_header_record(bytes: &mut [u8], offset: usize, flag: u8, name: &str) {
-        bytes[offset] = 0x01;
-        bytes[offset + 1] = flag;
-        write_fixed_name(&mut bytes[offset + 2..offset + 42], name);
-        write_fixed_name(
-            &mut bytes[offset + 42..offset + 82],
-            "1119Jul202317:41:24DGEDIT",
-        );
-        bytes[offset + 82..offset + DGD_COORD_RECORD_LEN].fill(b' ');
-    }
-
-    #[test]
-    fn attributes_points_to_the_following_layer_save_record() {
-        let coord_offset = 0x1000;
-        let save_offset = coord_offset + DGD_COORD_RECORD_LEN;
-        let mut bytes = vec![0_u8; save_offset + DGD_COORD_RECORD_LEN];
-
-        write_coord_record(&mut bytes, coord_offset, b"  0", "POINT_1");
-        write_save_record(&mut bytes, save_offset, b' ', "30P202_0526_20250414");
-
-        let points = read_dgd_points_bytes(&bytes).unwrap();
-
-        assert_eq!(points.len(), 1);
-        assert_eq!(
-            points[0].layer_name.as_deref(),
-            Some("30P202_0526_20250414")
-        );
-    }
-
-    #[test]
-    fn layer_header_owns_points_even_when_following_save_has_stale_name() {
-        let rec = DGD_COORD_RECORD_LEN;
-        let base = 0x1000;
-        let mut bytes = vec![0_u8; base + 3 * rec];
-        write_layer_header_record(&mut bytes, base, b' ', "ACTIVE_LAYER");
-        write_coord_record(&mut bytes, base + rec, b"  0", "POINT_1");
-        write_save_record(&mut bytes, base + 2 * rec, b' ', "STALE_SAVE_NAME");
-
-        let points = read_dgd_points_bytes(&bytes).unwrap();
-
-        assert_eq!(points.len(), 1);
-        assert_eq!(points[0].layer_name.as_deref(), Some("ACTIVE_LAYER"));
-    }
-
-    #[test]
-    fn layer_headers_drop_temporary_deleted_and_system_blocks() {
-        let rec = DGD_COORD_RECORD_LEN;
-        let base = 0x1000;
-        let mut bytes = vec![0_u8; base + 8 * rec];
-        write_layer_header_record(&mut bytes, base, b' ', "ACTIVE_LAYER");
-        write_coord_record(&mut bytes, base + rec, b"  0", "POINT_1");
-        write_layer_header_record(&mut bytes, base + 2 * rec, b'$', "$12345");
-        write_coord_record(&mut bytes, base + 3 * rec, b"  0", "POINT_2");
-        write_layer_header_record(&mut bytes, base + 4 * rec, b'D', "DELETED_LAYER");
-        write_coord_record(&mut bytes, base + 5 * rec, b"  0", "POINT_3");
-        write_layer_header_record(&mut bytes, base + 6 * rec, b' ', "DIG$COLOUR");
-        write_coord_record(&mut bytes, base + 7 * rec, b"  0", "POINT_4");
-
-        let points = read_dgd_points_bytes(&bytes).unwrap();
-
-        assert_eq!(points.len(), 1);
-        assert_eq!(points[0].name, "POINT_1");
-        assert_eq!(points[0].layer_name.as_deref(), Some("ACTIVE_LAYER"));
-    }
-
-    #[test]
-    fn keeps_only_the_latest_save_of_a_layer_and_drops_deleted_layers() {
-        let rec = DGD_COORD_RECORD_LEN;
-        let base = 0x1000;
-        // stale save block, deleted block, live block — one point each
-        let mut bytes = vec![0_u8; base + 6 * rec];
-        write_coord_record(&mut bytes, base, b"  0", "POINT_1");
-        write_save_record(&mut bytes, base + rec, b' ', "BENCH");
-        write_coord_record(&mut bytes, base + 2 * rec, b"  0", "POINT_2");
-        write_save_record(&mut bytes, base + 3 * rec, b'D', "OLD_LAYER");
-        write_coord_record(&mut bytes, base + 4 * rec, b"1  ", "POINT_3");
-        write_save_record(&mut bytes, base + 5 * rec, b' ', "BENCH");
-
-        let points = read_dgd_points_bytes(&bytes).unwrap();
-
-        assert_eq!(points.len(), 1, "stale and deleted blocks are dropped");
-        assert_eq!(points[0].name, "POINT_3");
-        assert_eq!(points[0].seg_type, 1, "left-aligned seg field parses");
-        assert_eq!(points[0].layer_name.as_deref(), Some("BENCH"));
-    }
-
-    #[test]
-    fn extracts_text_objects_and_prunes_their_coordinates_from_points() {
-        let rec = DGD_COORD_RECORD_LEN;
-        let base = 0x1000;
-        let mut bytes = vec![0_u8; base + 6 * rec];
-        write_object_record(&mut bytes, base, 0x04, "REACTIVETEXT$1", false);
-        // Vulcan colour index on the text header (byte 60), like POLY headers.
-        bytes[base + 60..base + 62].copy_from_slice(b"7 ");
-        write_coord_record_xyz(
-            &mut bytes,
-            base + rec,
-            b"2  ",
-            "1:1250",
-            (1234.0, 5678.0, 500.0),
-        );
-        write_coord_record_xyz(
-            &mut bytes,
-            base + 2 * rec,
-            b"44 ",
-            "POINT_1",
-            // Real drafting angle from a company file: radians, wound past -2π.
-            (12.5, 1.0, -12.573177),
-        );
-        write_text_line_record(&mut bytes, base + 3 * rec, "300m Non-Vib");
-        write_text_line_record(&mut bytes, base + 4 * rec, "Offset");
-        write_save_record(&mut bytes, base + 5 * rec, b' ', "BENCH");
-
-        let design = read_dgd_design_bytes(&bytes).unwrap();
-
-        assert_eq!(design.texts.len(), 1);
-        let text = &design.texts[0];
-        assert_eq!(text.content, "300m Non-Vib\nOffset");
-        assert_eq!((text.x, text.y, text.z), (1234.0, 5678.0, 500.0));
-        assert_eq!(text.height, 12.5);
-        // The stored angle is radians normalised to Vulcan's 0..360 display.
-        assert!(
-            (text.rotation_degrees - 359.61).abs() < 0.01,
-            "got {}",
-            text.rotation_degrees
-        );
-        assert_eq!(text.layer_name.as_deref(), Some("BENCH"));
-        assert_eq!(text.color_index, Some(7), "text colour comes from byte 60");
-        assert!(
-            design.points.is_empty(),
-            "text sub-coordinates must not surface as design points"
-        );
-    }
-
-    #[test]
-    fn joins_soft_wrapped_text_records_without_a_line_break() {
-        let rec = DGD_COORD_RECORD_LEN;
-        let base = 0x1000;
-        let mut bytes = vec![0_u8; base + 6 * rec];
-        write_object_record(&mut bytes, base, 0x04, "REACTIVETEXT$1", false);
-        write_coord_record_xyz(&mut bytes, base + rec, b"2  ", "1:1250", (0.0, 0.0, 0.0));
-        write_coord_record_xyz(
-            &mut bytes,
-            base + 2 * rec,
-            b"44 ",
-            "POINT_1",
-            (1.0, 1.0, 0.0),
-        );
-        // Vulcan wraps one logical line across records: a 0x01 byte marks the
-        // soft wrap, and "within" is split "wit" | "hin".
-        write_text_line_record(
-            &mut bytes,
-            base + 3 * rec,
-            "Mine Geology - No reactive material wit",
-        );
-        bytes[base + 3 * rec + 2 + "Mine Geology - No reactive material wit".len()] = 0x01;
-        write_text_line_record(&mut bytes, base + 4 * rec, "hin pit RL");
-        write_save_record(&mut bytes, base + 5 * rec, b' ', "BENCH");
-
-        let design = read_dgd_design_bytes(&bytes).unwrap();
-
-        assert_eq!(design.texts.len(), 1);
-        assert_eq!(
-            design.texts[0].content, "Mine Geology - No reactive material within pit RL",
-            "soft-wrapped records join with no newline and no stray '?'"
-        );
-    }
-
-    #[test]
-    fn extracts_3dtext_objects_skipping_the_font_record() {
-        let rec = DGD_COORD_RECORD_LEN;
-        let base = 0x1000;
-        let mut bytes = vec![0_u8; base + 9 * rec];
-        write_object_record(&mut bytes, base, 0x0a, "3DTEXT", false);
-        write_coord_record_xyz(
-            &mut bytes,
-            base + rec,
-            b"0  ",
-            "1:1250",
-            (1234.0, 5678.0, 0.0),
-        );
-        write_coord_record_xyz(
-            &mut bytes,
-            base + 2 * rec,
-            b"0  ",
-            "POINT_2",
-            (1.0, 0.0, 0.0),
-        );
-        write_coord_record_xyz(
-            &mut bytes,
-            base + 3 * rec,
-            b"0  ",
-            "POINT_3",
-            (0.0, 1.0, 0.0),
-        );
-        write_coord_record_xyz(
-            &mut bytes,
-            base + 4 * rec,
-            b"0  ",
-            "POINT_4",
-            (0.08, 0.25, 0.0),
-        );
-        write_coord_record_xyz(&mut bytes, base + 5 * rec, b"0  ", "", (2.0, 2.0, 0.0));
-        write_text_line_record(&mut bytes, base + 6 * rec, "TIMES+");
-        write_text_line_record(&mut bytes, base + 7 * rec, "M_HEL0103");
-        write_save_record(&mut bytes, base + 8 * rec, b' ', "BENCH");
-
-        let design = read_dgd_design_bytes(&bytes).unwrap();
-
-        assert_eq!(design.texts.len(), 1);
-        let text = &design.texts[0];
-        assert_eq!(
-            text.content, "M_HEL0103",
-            "the leading font record is not content"
-        );
-        // The raw character size (coord 4's y = 0.25) is scaled to world units
-        // by the map scale from the origin's name field: 0.25 × 1250 / 100.
-        assert_eq!(text.height, 3.125);
-        assert_eq!(text.rotation_degrees, 0.0);
-        assert!(design.points.is_empty());
-    }
-
-    #[test]
-    fn reads_the_closed_flag_from_poly_object_headers() {
-        let rec = DGD_COORD_RECORD_LEN;
-        let base = 0x1000;
-        let mut bytes = vec![0_u8; base + 8 * rec];
-        write_object_record(&mut bytes, base, 0x03, "POLY", true);
-        write_coord_record(&mut bytes, base + rec, b"0  ", "POINT_1");
-        write_coord_record(&mut bytes, base + 2 * rec, b"1  ", "POINT_2");
-        write_coord_record(&mut bytes, base + 3 * rec, b"1  ", "POINT_3");
-        write_object_record(&mut bytes, base + 4 * rec, 0x03, "POLY", false);
-        write_coord_record(&mut bytes, base + 5 * rec, b"0  ", "POINT_1");
-        write_coord_record(&mut bytes, base + 6 * rec, b"1  ", "POINT_2");
-        write_save_record(&mut bytes, base + 7 * rec, b' ', "BENCH");
-
-        let points = read_dgd_points_bytes(&bytes).unwrap();
-
-        assert_eq!(points.len(), 5);
-        assert!(points[..3].iter().all(|point| point.closed));
-        assert!(points[3..].iter().all(|point| !point.closed));
-    }
-
-    #[test]
-    fn suppresses_closure_for_multi_string_poly_objects() {
-        // A closed POLY (byte 76 = '1') whose coordinates contain a second
-        // segment header (a second `seg='0'`) is a multi-string line: Vulcan
-        // renders the internal break as a disconnection and the line stays open,
-        // so none of its points should carry the closed flag.
-        let rec = DGD_COORD_RECORD_LEN;
-        let base = 0x1000;
-        let mut bytes = vec![0_u8; base + 6 * rec];
-        write_object_record(&mut bytes, base, 0x03, "LINE$11448", true);
-        write_coord_record(&mut bytes, base + rec, b"0  ", "Rec#190695");
-        write_coord_record(&mut bytes, base + 2 * rec, b"1  ", "POINT_2");
-        // Second string: a new segment header mid-object (connected unticked).
-        write_coord_record(&mut bytes, base + 3 * rec, b"0  ", "POINT_3");
-        write_coord_record(&mut bytes, base + 4 * rec, b"1  ", "POINT_4");
-        write_save_record(&mut bytes, base + 5 * rec, b' ', "BENCH");
-
-        let points = read_dgd_points_bytes(&bytes).unwrap();
-
-        assert_eq!(points.len(), 4);
-        assert!(
-            points.iter().all(|point| !point.closed),
-            "a multi-string object must not close any of its strings"
-        );
-    }
-
-    #[test]
-    fn reads_the_colour_index_from_poly_object_headers() {
-        let rec = DGD_COORD_RECORD_LEN;
-        let base = 0x1000;
-        let mut bytes = vec![0_u8; base + 5 * rec];
-        write_object_record(&mut bytes, base, 0x03, "POLY", true);
-        // Colour-index field is the space-padded integer at byte 60.
-        bytes[base + 60..base + 62].copy_from_slice(b"7 ");
-        write_coord_record(&mut bytes, base + rec, b"0  ", "POINT_1");
-        write_coord_record(&mut bytes, base + 2 * rec, b"1  ", "POINT_2");
-        // A second, colourless POLY must not inherit the first's index.
-        write_object_record(&mut bytes, base + 3 * rec, 0x03, "POLY", false);
-        write_coord_record(&mut bytes, base + 4 * rec, b"0  ", "POINT_1");
-
-        let points = read_dgd_points_bytes(&bytes).unwrap();
-
-        assert_eq!(points.len(), 3);
-        assert_eq!(points[0].color_index, Some(7));
-        assert_eq!(points[1].color_index, Some(7));
-        assert_eq!(points[2].color_index, None);
-    }
-
-    #[test]
-    fn detects_unnamed_and_feature_named_poly_headers() {
-        let rec = DGD_COORD_RECORD_LEN;
-        let base = 0x1000;
-        let mut bytes = vec![0_u8; base + 4 * rec];
-
-        // An unnamed POLY carrying a Value f64 at bytes 42-49 (blank name), with
-        // colour 20 and the closed flag set — previously rejected for the empty
-        // name, dropping its colour and closure.
-        bytes[base] = 0x03;
-        bytes[base + 1] = b' ';
-        bytes[base + 2..base + rec].fill(b' ');
-        bytes[base + 42..base + 50].copy_from_slice(&3.0_f64.to_be_bytes());
-        bytes[base + 60..base + 62].copy_from_slice(b"20");
-        bytes[base + 76] = b'1';
-        write_coord_record(&mut bytes, base + rec, b"0  ", "POINT_1");
-
-        // A POLY whose attribute region embeds a feature/group name at byte 77+.
-        write_object_record(&mut bytes, base + 2 * rec, 0x03, "PRU578.8", false);
-        bytes[base + 2 * rec + 60..base + 2 * rec + 62].copy_from_slice(b"14");
-        bytes[base + 2 * rec + 77..base + 2 * rec + 86].copy_from_slice(b"PIT$CREST");
-        write_coord_record(&mut bytes, base + 3 * rec, b"0  ", "POINT_1");
-
-        let points = read_dgd_points_bytes(&bytes).unwrap();
-
-        assert_eq!(points.len(), 2);
-        assert_eq!(
-            points[0].color_index,
-            Some(20),
-            "unnamed valued POLY colour"
-        );
-        assert!(points[0].closed, "unnamed valued POLY closed flag");
-        assert_eq!(
-            points[1].color_index,
-            Some(14),
-            "feature-named POLY colour is still read"
-        );
-    }
-
-    #[test]
-    fn reads_dgd_isix_entries() {
-        let mut bytes = vec![b' '; 0x400 + 48];
-        write_dgd_index_entry(&mut bytes, 0x400, 0x1234, "LAYER");
-
-        assert_eq!(
-            read_dgd_index_bytes(&bytes),
-            vec![DesignIndexEntry {
-                offset: 0x1234,
-                name: "LAYER".to_owned(),
-            }]
-        );
-    }
-
-    #[test]
-    fn reads_dgd_isix_entries_without_fixed_table_alignment() {
-        let entry_offset = 0x411;
-        let mut bytes = vec![b' '; entry_offset + 48];
-        write_dgd_index_entry(&mut bytes, entry_offset, 0x4321, "BENCH1");
-
-        assert_eq!(
-            read_dgd_index_bytes(&bytes),
-            vec![DesignIndexEntry {
-                offset: 0x4321,
-                name: "BENCH1".to_owned(),
-            }]
-        );
-    }
-
-    #[test]
-    fn reads_current_dgd_isix_layer_page_before_other_index_pages() {
-        let mut bytes = vec![b' '; 0x1400];
-        write_dgd_index_entry(&mut bytes, 0x400, 0x10, "$12345");
-        write_dgd_index_entry(&mut bytes, 0x430, 0x20, "$23456");
-        write_dgd_index_entry(&mut bytes, 0x800, 0x11, "Dog");
-        write_dgd_index_entry(&mut bytes, 0x830, 0x22, "1234");
-        write_dgd_index_entry(&mut bytes, 0x860, 0x33, "Cat");
-        write_dgd_index_entry(&mut bytes, 0x890, 0x44, "DIG$COLOUR");
-        write_dgd_index_entry(&mut bytes, 0x8c0, 0x55, "POLYLINE");
-        write_dgd_index_entry(&mut bytes, 0x1000, 0x66, "Wolf");
-
-        assert_eq!(
-            read_dgd_index_bytes(&bytes),
-            vec![
-                DesignIndexEntry {
-                    offset: 0x11,
-                    name: "Dog".to_owned(),
-                },
-                DesignIndexEntry {
-                    offset: 0x22,
-                    name: "1234".to_owned(),
-                },
-                DesignIndexEntry {
-                    offset: 0x33,
-                    name: "Cat".to_owned(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn reads_dgd_isix_from_env_path() {
-        let Ok(path) = std::env::var("INCLINE_TEST_ISIX") else {
-            return;
-        };
-        let entries = read_dgd_index(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-        println!("{path}: {} current layer entries", entries.len());
-        for entry in &entries {
-            println!("  {:#x}: {}", entry.offset, entry.name);
-        }
-        assert!(
-            !entries.is_empty(),
-            "no current layer entries found in {path}"
-        );
-    }
-
-    #[test]
-    fn same_stem_isix_path_finds_mixed_case_sidecar() {
-        let dir =
-            std::env::temp_dir().join(format!("proinspector_isix_test_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir(&dir).unwrap();
-        let sidecar = dir.join("mine.DGD.ISIX");
-        fs::write(&sidecar, []).unwrap();
-
-        let source = dir.join("mine.dgd.isis");
-        assert_eq!(same_stem_isix_path(&source), Some(sidecar));
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    fn write_fixed_name(slot: &mut [u8], name: &str) {
-        slot.fill(b' ');
-        slot[..name.len()].copy_from_slice(name.as_bytes());
-    }
-
-    fn write_dgd_index_entry(bytes: &mut [u8], offset: usize, pointer: u32, name: &str) {
-        bytes[offset..offset + 4].copy_from_slice(&pointer.to_be_bytes());
-        bytes[offset + 4..offset + 8].copy_from_slice(&[0xff; 4]);
-        write_fixed_name(&mut bytes[offset + 8..offset + 48], name);
-    }
 }

@@ -1,6 +1,6 @@
 //! Top application menu bar (File, Design, View, Analyse, Open Pit, Triangulation).
 
-use crate::ui::{EditorState, UiCommand, UiProjectView, state::FileOperationKind};
+use crate::ui::{EditorState, UiCommand, UiProjectView};
 
 /// Draw the top menu bar panel.
 ///
@@ -24,23 +24,31 @@ pub(crate) fn draw_main_menu(
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("New .pidb").clicked() {
+                    if ui.button("New PIDB").clicked() {
                         commands.push(UiCommand::NewPidb);
                         ui.close();
                     }
-                    if ui.button("Open .pidb(s)").clicked() {
+                    if ui.button("Open PIDBs...").clicked() {
                         commands.push(UiCommand::OpenPidb);
                         ui.close();
                     }
                     ui.separator();
-                    draw_import_menu(ui, commands);
-                    draw_export_menu(ui, commands);
+                    if ui.button("Import").clicked() {
+                        editor.show_import = true;
+                        editor.show_export = false;
+                        ui.close();
+                    }
+                    if ui.button("Export").clicked() {
+                        editor.show_import = false;
+                        editor.show_export = true;
+                        ui.close();
+                    }
                     if ui.button("Add Triangulation Folder").clicked() {
                         commands.push(UiCommand::OpenTriangulationFolder);
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Preferences ...").clicked() {
+                    if ui.button("Preferences...").clicked() {
                         commands.push(UiCommand::OpenPreferences);
                         ui.close();
                     }
@@ -55,6 +63,15 @@ pub(crate) fn draw_main_menu(
                     if ui.checkbox(&mut dark_mode, "Dark Mode").changed() {
                         commands.push(UiCommand::SetDarkMode(dark_mode));
                     }
+
+                    let mut show_world_axis_gizmo = editor.show_world_axis_gizmo;
+                    if ui
+                        .checkbox(&mut show_world_axis_gizmo, "Show World Axis Gizmo")
+                        .changed()
+                    {
+                        commands.push(UiCommand::SetShowWorldAxisGizmo(show_world_axis_gizmo));
+                    }
+
                     ui.separator();
 
                     let mut show_console = editor.show_console;
@@ -69,20 +86,30 @@ pub(crate) fn draw_main_menu(
                     {
                         commands.push(UiCommand::SetTopologyWireframes(wireframes_enabled));
                     }
-                    ui.separator();
-                    let mut show_world_axis_gizmo = editor.show_world_axis_gizmo;
+                    let mut debug_chunk_coloring = editor.debug_chunk_coloring;
                     if ui
-                        .checkbox(&mut show_world_axis_gizmo, "Show World Axis Gizmo")
+                        .checkbox(&mut debug_chunk_coloring, "Colour Triangles by GPU Chunk")
                         .changed()
                     {
-                        commands.push(UiCommand::SetShowWorldAxisGizmo(show_world_axis_gizmo));
+                        commands.push(UiCommand::SetDebugChunkColoring(debug_chunk_coloring));
                     }
                 });
 
                 // Not implemented
                 ui.menu_button("Object", |ui| {
-                    if ui.button("Set selection(s) Z value ..").clicked() {
+                    if ui.button("Set Selection Z Value...").clicked() {
                         commands.push(UiCommand::OpenSetSelectionZValueDialog);
+                        ui.close();
+                    }
+                });
+
+                ui.menu_button("Roads", |ui| {
+                    if ui.button("Convert to Triangulation...").clicked() {
+                        commands.push(UiCommand::OpenConvertRoadsToTriangulation);
+                        ui.close();
+                    }
+                    if ui.button("Convert Road to Polylines").clicked() {
+                        commands.push(UiCommand::ConvertSelectedRoadsToPolylines);
                         ui.close();
                     }
                 });
@@ -93,43 +120,39 @@ pub(crate) fn draw_main_menu(
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Cut by Polygon …").clicked() {
+                    if ui.button("Clip by Polygon...").clicked() {
                         commands.push(UiCommand::OpenCutTriangulationByPolygon);
                         ui.close();
                     }
-                    if ui.button("Cut by Z Range …").clicked() {
+                    if ui.button("Slice by Elevation...").clicked() {
                         commands.push(UiCommand::OpenCutTriangulationByZ);
                         ui.close();
                     }
-                    if ui.button("Cut by Surface …").clicked() {
+                    if ui.button("Trim by Surface...").clicked() {
                         commands.push(UiCommand::OpenCutTriangulationBySurface);
                         ui.close();
                     }
-                    if ui.button("Cut Topology to Pit Shell …").clicked() {
+                    ui.separator();
+                    if ui.button("Cut Topology with Shell").clicked() {
                         commands.push(UiCommand::OpenCutTopologyByPitShell);
                         ui.close();
                     }
-                    ui.separator();
-                    if ui.button("Include Pit/Stockpile Solid …").clicked() {
+                    if ui.button("Merge Shell into Topology").clicked() {
                         commands.push(UiCommand::OpenIncludeSolidInTopology);
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Generate Contour Lines …").clicked() {
+                    if ui.button("Generate Contours...").clicked() {
                         commands.push(UiCommand::OpenContourTriangulation);
                         ui.close();
                     }
                 });
 
                 ui.menu_button("Geology", |ui| {
-                    if ui.button("Import Block Model ...").clicked() {
-                        commands.push(UiCommand::OpenImportBlockModel);
-                        ui.close();
-                    }
                     if ui
                         .add_enabled(
                             !project.block_models.is_empty(),
-                            egui::Button::new("Create Ore Triangulation ..."),
+                            egui::Button::new("Create Ore Triangulation..."),
                         )
                         .clicked()
                     {
@@ -138,14 +161,17 @@ pub(crate) fn draw_main_menu(
                     }
                 });
 
-                // Not implemented
-                ui.add_enabled_ui(false, |ui| {
-                    ui.menu_button("Roads", |_ui| {});
-                });
-
-                // Not implemented
-                ui.add_enabled_ui(false, |ui| {
-                    ui.menu_button("Survey", |_ui| {});
+                ui.menu_button("Survey", |ui| {
+                    if ui
+                        .add_enabled(
+                            project.point_clouds.iter().any(|cloud| cloud.is_loaded),
+                            egui::Button::new("Create Terrain TIN..."),
+                        )
+                        .clicked()
+                    {
+                        commands.push(UiCommand::OpenPointCloudTin);
+                        ui.close();
+                    }
                 });
 
                 // Not implemented
@@ -176,43 +202,4 @@ pub(crate) fn draw_main_menu(
         })
         .response
         .rect
-}
-
-/// Draw the Import sub-menu items.
-fn draw_import_menu(ui: &mut egui::Ui, commands: &mut Vec<UiCommand>) {
-    ui.menu_button("Import", |ui| {
-        for (label, kind) in [
-            ("As Layers ...", FileOperationKind::ImportLayers),
-            ("As .pidb ...", FileOperationKind::ImportPidb),
-            (
-                "As Triangulation ...",
-                FileOperationKind::ImportTriangulation,
-            ),
-            ("As Block Model ...", FileOperationKind::ImportBlockModel),
-        ] {
-            if ui.button(label).clicked() {
-                commands.push(UiCommand::OpenFileOperation(kind));
-                ui.close();
-            }
-        }
-    });
-}
-
-/// Draw the Export sub-menu items.
-fn draw_export_menu(ui: &mut egui::Ui, commands: &mut Vec<UiCommand>) {
-    ui.menu_button("Export", |ui| {
-        for (label, kind) in [
-            ("Layer to ...", FileOperationKind::ExportLayer),
-            (".pidb to ...", FileOperationKind::ExportPidb),
-            (
-                "Triangulation to ...",
-                FileOperationKind::ExportTriangulation,
-            ),
-        ] {
-            if ui.button(label).clicked() {
-                commands.push(UiCommand::OpenFileOperation(kind));
-                ui.close();
-            }
-        }
-    });
 }

@@ -38,6 +38,18 @@ pub(crate) struct PickHit {
     pub(crate) world: DVec3,
 }
 
+/// One set of pick records with the CPU vertex/index buffers their ranges
+/// index into. The per-rebuild stream is one group; each static stroke chunk
+/// is another (with no fill geometry).
+#[derive(Clone, Copy)]
+pub(crate) struct PickGeometry<'a> {
+    pub(crate) records: &'a [PickRecord],
+    pub(crate) stroke_verts: &'a [StrokeVertex],
+    pub(crate) stroke_indices: &'a [u32],
+    pub(crate) fill_verts: &'a [Vertex],
+    pub(crate) fill_indices: &'a [u32],
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TextPickRecord {
     pub(crate) entity: SceneEntityId,
@@ -79,11 +91,7 @@ pub(crate) fn closest_t_on_segment(p: DVec2, a: DVec2, b: DVec2) -> f64 {
 /// index patterns, so they fall back to the triangle-edge path below.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pick_nearest(
-    records: &[PickRecord],
-    stroke_verts: &[StrokeVertex],
-    stroke_indices: &[u32],
-    fill_verts: &[Vertex],
-    fill_indices: &[u32],
+    groups: &[PickGeometry<'_>],
     scene_origin: DVec3,
     view_proj: &DMat4,
     screen: Size,
@@ -93,138 +101,150 @@ pub(crate) fn pick_nearest(
 ) -> Option<PickHit> {
     let cursor = DVec2::new(cursor_px.0 as f64, cursor_px.1 as f64);
     let mut best_dist = threshold_px as f64;
-    let mut best_hit: Option<PickHit> = None;
+    let mut best_stroke_hit: Option<PickHit> = None;
+    let mut best_fill_vertex_dist = threshold_px as f64;
+    let mut best_fill_vertex_hit: Option<PickHit> = None;
+    let mut best_fill_hit: Option<PickHit> = None;
     let mut best_fill_depth = f64::INFINITY;
 
-    for rec in records {
-        // Frozen entities are visible but not selectable.
-        if frozen.contains(&rec.entity) {
-            continue;
-        }
-        let (s0, s1) = (
-            rec.stroke_index_range.0 as usize,
-            (rec.stroke_index_range.1 as usize).min(stroke_indices.len()),
-        );
-        let mut tested_stroke_centerlines = false;
-        for quad in stroke_indices[s0..s1].chunks_exact(6) {
-            let Some(base) = stroke_line_quad_base(quad) else {
-                continue;
-            };
-            let (Some(a), Some(b)) = (stroke_verts.get(base), stroke_verts.get(base + 2)) else {
-                continue;
-            };
-            let wa = DVec3::from_array(a.pos.map(f64::from)) + scene_origin;
-            let wb = DVec3::from_array(b.pos.map(f64::from)) + scene_origin;
-            if (wb - wa).length_squared() <= f64::EPSILON {
+    for group in groups {
+        let PickGeometry {
+            records,
+            stroke_verts,
+            stroke_indices,
+            fill_verts,
+            fill_indices,
+        } = *group;
+        for rec in records {
+            // Frozen entities are visible but not selectable.
+            if frozen.contains(&rec.entity) {
                 continue;
             }
-            tested_stroke_centerlines = true;
-            if let (Some(sa), Some(sb)) = (
-                world_to_screen(view_proj, wa, screen),
-                world_to_screen(view_proj, wb, screen),
-            ) {
-                let t = closest_t_on_segment(cursor, sa, sb);
-                let dist = (sa + (sb - sa) * t).distance(cursor);
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_hit = Some(PickHit {
-                        entity: rec.entity,
-                        world: wa + (wb - wa) * t,
-                    });
+            let (s0, s1) = (
+                rec.stroke_index_range.0 as usize,
+                (rec.stroke_index_range.1 as usize).min(stroke_indices.len()),
+            );
+            let mut tested_stroke_centerlines = false;
+            for quad in stroke_indices[s0..s1].chunks_exact(6) {
+                let Some(base) = stroke_line_quad_base(quad) else {
+                    continue;
+                };
+                let (Some(a), Some(b)) = (stroke_verts.get(base), stroke_verts.get(base + 2))
+                else {
+                    continue;
+                };
+                let wa = DVec3::from_array(a.pos.map(f64::from)) + scene_origin;
+                let wb = DVec3::from_array(b.pos.map(f64::from)) + scene_origin;
+                if (wb - wa).length_squared() <= f64::EPSILON {
+                    continue;
+                }
+                tested_stroke_centerlines = true;
+                if let (Some(sa), Some(sb)) = (
+                    world_to_screen(view_proj, wa, screen),
+                    world_to_screen(view_proj, wb, screen),
+                ) {
+                    let t = closest_t_on_segment(cursor, sa, sb);
+                    let dist = (sa + (sb - sa) * t).distance(cursor);
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_stroke_hit = Some(PickHit {
+                            entity: rec.entity,
+                            world: wa + (wb - wa) * t,
+                        });
+                    }
                 }
             }
-        }
 
-        if !tested_stroke_centerlines {
-            for triangle in stroke_indices[s0..s1].chunks_exact(3) {
-                for (a, b) in [
-                    (triangle[0], triangle[1]),
-                    (triangle[1], triangle[2]),
-                    (triangle[2], triangle[0]),
-                ] {
-                    let (Some(a), Some(b)) =
-                        (stroke_verts.get(a as usize), stroke_verts.get(b as usize))
-                    else {
-                        continue;
-                    };
-                    let wa = DVec3::from_array(a.pos.map(f64::from)) + scene_origin;
-                    let wb = DVec3::from_array(b.pos.map(f64::from)) + scene_origin;
-                    if let (Some(sa), Some(sb)) = (
-                        world_to_screen(view_proj, wa, screen),
-                        world_to_screen(view_proj, wb, screen),
-                    ) {
-                        let t = closest_t_on_segment(cursor, sa, sb);
-                        let dist = (sa + (sb - sa) * t).distance(cursor);
-                        if dist < best_dist {
-                            best_dist = dist;
-                            best_hit = Some(PickHit {
-                                entity: rec.entity,
-                                world: wa + (wb - wa) * t,
-                            });
+            if !tested_stroke_centerlines {
+                for triangle in stroke_indices[s0..s1].chunks_exact(3) {
+                    for (a, b) in [
+                        (triangle[0], triangle[1]),
+                        (triangle[1], triangle[2]),
+                        (triangle[2], triangle[0]),
+                    ] {
+                        let (Some(a), Some(b)) =
+                            (stroke_verts.get(a as usize), stroke_verts.get(b as usize))
+                        else {
+                            continue;
+                        };
+                        let wa = DVec3::from_array(a.pos.map(f64::from)) + scene_origin;
+                        let wb = DVec3::from_array(b.pos.map(f64::from)) + scene_origin;
+                        if let (Some(sa), Some(sb)) = (
+                            world_to_screen(view_proj, wa, screen),
+                            world_to_screen(view_proj, wb, screen),
+                        ) {
+                            let t = closest_t_on_segment(cursor, sa, sb);
+                            let dist = (sa + (sb - sa) * t).distance(cursor);
+                            if dist < best_dist {
+                                best_dist = dist;
+                                best_stroke_hit = Some(PickHit {
+                                    entity: rec.entity,
+                                    world: wa + (wb - wa) * t,
+                                });
+                            }
                         }
                     }
                 }
             }
-        }
 
-        let (f0, f1) = (rec.fill_range.0 as usize, rec.fill_range.1 as usize);
-        for vert in &fill_verts[f0..f1.min(fill_verts.len())] {
-            let world = DVec3::from_array(vert.pos.map(f64::from)) + scene_origin;
-            if let Some(sp) = world_to_screen(view_proj, world, screen) {
-                let dist = sp.distance(cursor);
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_hit = Some(PickHit {
-                        entity: rec.entity,
-                        world,
-                    });
+            let (f0, f1) = (rec.fill_range.0 as usize, rec.fill_range.1 as usize);
+            for vert in &fill_verts[f0..f1.min(fill_verts.len())] {
+                let world = DVec3::from_array(vert.pos.map(f64::from)) + scene_origin;
+                if let Some(sp) = world_to_screen(view_proj, world, screen) {
+                    let dist = sp.distance(cursor);
+                    if best_stroke_hit.is_none() && dist < best_fill_vertex_dist {
+                        best_fill_vertex_dist = dist;
+                        best_fill_vertex_hit = Some(PickHit {
+                            entity: rec.entity,
+                            world,
+                        });
+                    }
                 }
             }
-        }
 
-        let (i0, i1) = (
-            rec.fill_index_range.0 as usize,
-            (rec.fill_index_range.1 as usize).min(fill_indices.len()),
-        );
-        for triangle in fill_indices[i0..i1].chunks_exact(3) {
-            let [Some(a), Some(b), Some(c)] = [
-                fill_verts.get(triangle[0] as usize),
-                fill_verts.get(triangle[1] as usize),
-                fill_verts.get(triangle[2] as usize),
-            ] else {
-                continue;
-            };
-            let wa = DVec3::from_array(a.pos.map(f64::from)) + scene_origin;
-            let wb = DVec3::from_array(b.pos.map(f64::from)) + scene_origin;
-            let wc = DVec3::from_array(c.pos.map(f64::from)) + scene_origin;
-            let (Some(sa), Some(sb), Some(sc)) = (
-                world_to_screen(view_proj, wa, screen),
-                world_to_screen(view_proj, wb, screen),
-                world_to_screen(view_proj, wc, screen),
-            ) else {
-                continue;
-            };
-            if let Some(weights) = triangle_weights(cursor, sa, sb, sc) {
-                let world = wa * weights.x + wb * weights.y + wc * weights.z;
-                let clip = *view_proj * world.extend(1.0);
-                let depth = if clip.w.abs() > f64::EPSILON {
-                    clip.z / clip.w
-                } else {
-                    f64::INFINITY
+            let (i0, i1) = (
+                rec.fill_index_range.0 as usize,
+                (rec.fill_index_range.1 as usize).min(fill_indices.len()),
+            );
+            for triangle in fill_indices[i0..i1].chunks_exact(3) {
+                let [Some(a), Some(b), Some(c)] = [
+                    fill_verts.get(triangle[0] as usize),
+                    fill_verts.get(triangle[1] as usize),
+                    fill_verts.get(triangle[2] as usize),
+                ] else {
+                    continue;
                 };
-                if depth < best_fill_depth {
-                    best_fill_depth = depth;
-                    best_dist = 0.0;
-                    best_hit = Some(PickHit {
-                        entity: rec.entity,
-                        world,
-                    });
+                let wa = DVec3::from_array(a.pos.map(f64::from)) + scene_origin;
+                let wb = DVec3::from_array(b.pos.map(f64::from)) + scene_origin;
+                let wc = DVec3::from_array(c.pos.map(f64::from)) + scene_origin;
+                let (Some(sa), Some(sb), Some(sc)) = (
+                    world_to_screen(view_proj, wa, screen),
+                    world_to_screen(view_proj, wb, screen),
+                    world_to_screen(view_proj, wc, screen),
+                ) else {
+                    continue;
+                };
+                if let Some(weights) = triangle_weights(cursor, sa, sb, sc) {
+                    let world = wa * weights.x + wb * weights.y + wc * weights.z;
+                    let clip = *view_proj * world.extend(1.0);
+                    let depth = if clip.w.abs() > f64::EPSILON {
+                        clip.z / clip.w
+                    } else {
+                        f64::INFINITY
+                    };
+                    if depth < best_fill_depth {
+                        best_fill_depth = depth;
+                        best_fill_hit = Some(PickHit {
+                            entity: rec.entity,
+                            world,
+                        });
+                    }
                 }
             }
         }
     }
 
-    best_hit
+    best_stroke_hit.or(best_fill_vertex_hit).or(best_fill_hit)
 }
 
 fn stroke_line_quad_base(indices: &[u32]) -> Option<usize> {

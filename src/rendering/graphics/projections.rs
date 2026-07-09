@@ -22,6 +22,7 @@ impl<'a> Graphics<'a> {
         } else {
             editor.offset_source_screen_px.clear();
             editor.offset_preview_screen_px.clear();
+            editor.offset_preview_ranges.clear();
         }
 
         if editor.batter_berm_dialog_open && !editor.batter_berm_rings_world.is_empty() {
@@ -357,6 +358,31 @@ impl<'a> Graphics<'a> {
             editor.bezier_preview_screen_px.clear();
             editor.bezier_hover_cp = None;
             editor.bezier_dragging_cp = None;
+        }
+
+        if editor.active_tool == ActiveTool::SplitAtPoints {
+            let vp = self.view_proj();
+            let screen = self.screen_size();
+            if let Some(oid) = editor.split_poly_id {
+                if let Some(Object::Polyline {
+                    verts,
+                    closed: true,
+                    ..
+                }) = document.get_object(oid)
+                {
+                    editor.split_poly_verts_screen_px = verts
+                        .iter()
+                        .filter_map(|v| crate::rendering::pick::world_to_screen(&vp, v.pos, screen))
+                        .map(|sp| (sp.x as f32, sp.y as f32))
+                        .collect();
+                } else {
+                    editor.split_poly_verts_screen_px.clear();
+                }
+            } else {
+                editor.split_poly_verts_screen_px.clear();
+            }
+        } else {
+            editor.split_poly_verts_screen_px.clear();
         }
 
         {

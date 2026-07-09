@@ -123,6 +123,44 @@ pub(crate) fn rebuild_editor_overlay(input: OverlaySceneBuildInput<'_>) {
         draw_screen_cross(&mut overlay, start, 8.0, 2.0, MEASUREMENT_COLOR);
     }
 
+    if editor.active_tool == ActiveTool::MeasureBermAngle {
+        let mut points = editor.berm_angle_points.clone();
+        if points.len() < 3
+            && let Some(cursor) = editor.cursor_world
+        {
+            points.push(cursor);
+        }
+
+        if let Some(&first) = points.first() {
+            draw_screen_cross(&mut overlay, first, 8.0, 2.0, MEASUREMENT_COLOR);
+        }
+        if points.len() >= 2 {
+            draw_line(&mut overlay, points[0], points[1], 2.0, MEASUREMENT_COLOR);
+            draw_screen_cross(&mut overlay, points[1], 8.0, 2.0, MEASUREMENT_COLOR);
+        }
+        if points.len() >= 3 {
+            if let Some(measurement) = crate::ui::state::berm_angle_measurement(points.as_slice()) {
+                draw_line(
+                    &mut overlay,
+                    measurement.projection,
+                    points[2],
+                    2.0,
+                    MEASUREMENT_COLOR,
+                );
+                draw_screen_cross(
+                    &mut overlay,
+                    measurement.projection,
+                    6.0,
+                    1.5,
+                    MEASUREMENT_COLOR,
+                );
+            } else {
+                draw_line(&mut overlay, points[1], points[2], 2.0, MEASUREMENT_COLOR);
+            }
+            draw_screen_cross(&mut overlay, points[2], 8.0, 2.0, MEASUREMENT_COLOR);
+        }
+    }
+
     let marker_target_id = editor.move_vertex_target.map(|(id, _)| id);
     if let Some(target_id) = marker_target_id
         && let Some(obj) = document.get_object(target_id)

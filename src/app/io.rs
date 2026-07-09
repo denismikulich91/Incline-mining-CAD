@@ -1,7 +1,11 @@
 // io.rs
 // responsible for managing config files, and other editor files storage.
 
-use std::{env, fs, io, path::PathBuf};
+use std::{
+    fs, io,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +52,9 @@ pub(crate) struct Session {
     /// Individually imported Vulcan block model pairs.
     #[serde(default)]
     pub(crate) block_model_sources: Vec<crate::model::block_model::BlockModelSource>,
+    /// Individually imported point cloud files (.las/.laz/.xyz/.pts/.pcd).
+    #[serde(default)]
+    pub(crate) point_cloud_file_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,6 +84,8 @@ pub(crate) struct Config {
     pub(crate) frame_counter_enabled: bool,
     #[serde(default = "default_show_world_axis_gizmo")]
     pub(crate) show_world_axis_gizmo: bool,
+    #[serde(default)]
+    pub(crate) debug_chunk_coloring: bool,
 }
 
 impl Default for Config {
@@ -84,7 +93,7 @@ impl Default for Config {
         Self {
             topology_wireframes_enabled: false,
             dark_mode: false,
-            show_console: false,
+            show_console: true,
             renderer_background_color: default_renderer_background_color(),
             snap_poll_rate: default_snap_poll_rate(),
             frame_rate_cap: default_frame_rate_cap(),
@@ -93,51 +102,58 @@ impl Default for Config {
                 default_block_model_interaction_resolution_divisor(),
             frame_counter_enabled: false,
             show_world_axis_gizmo: default_show_world_axis_gizmo(),
+            debug_chunk_coloring: false,
         }
     }
 }
 
 pub(crate) fn save_config(config: &Config) -> io::Result<()> {
-    let path = local_to_global_path("data/config.toml")?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let path = data_path("config.toml")?;
     let contents = toml::to_string_pretty(config).map_err(io::Error::other)?;
-    fs::write(path, contents)
+    write_atomic(&path, contents.as_bytes())
 }
 
 pub(crate) fn load_config() -> io::Result<Config> {
-    let contents = fs::read_to_string(local_to_global_path("data/config.toml")?)?;
+    let contents = fs::read_to_string(data_path("config.toml")?)?;
     toml::from_str(&contents).map_err(io::Error::other)
 }
 
 pub(crate) fn save_session(session: &Session) -> io::Result<()> {
-    let path = local_to_global_path("data/last_session.toml")?;
-
-    // Create parent directories if needed
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let toml_string = toml::to_string_pretty(session).map_err(io::Error::other)?;
-
-    fs::write(path, toml_string)?;
-
-    Ok(())
+    let path = data_path("last_session.toml")?;
+    let contents = toml::to_string_pretty(session).map_err(io::Error::other)?;
+    write_atomic(&path, contents.as_bytes())
 }
 
 pub(crate) fn load_session() -> io::Result<Session> {
-    let contents = fs::read_to_string(local_to_global_path("data/last_session.toml")?)?;
+    let contents = fs::read_to_string(data_path("last_session.toml")?)?;
 
     let session: Session = toml::from_str(&contents).map_err(io::Error::other)?;
 
     Ok(session)
 }
 
-pub(crate) fn local_to_global_path(path: &str) -> Result<PathBuf, std::io::Error> {
-    let exe = env::current_exe()?;
-    let base = exe
-        .parent()
-        .ok_or_else(|| std::io::Error::other("executable has no parent directory"))?;
-    Ok(base.join(path))
+/// Resolve a path inside the editor's data directory: the platform config
+/// directory (`$XDG_CONFIG_HOME`, `~/Library/Application Support`,
+/// `%APPDATA%`) under `incline/`.
+pub(crate) fn data_path(relative: &str) -> io::Result<PathBuf> {
+    dirs::config_dir()
+        .map(|dir| dir.join("incline").join(relative))
+        .ok_or_else(|| io::Error::other("no platform config directory"))
+}
+
+/// Write via temp file + `sync_all` + rename so a crash or full disk cannot
+/// leave a truncated file behind (mirrors `pidb::save`).
+fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut tmp_name = path.file_name().unwrap_or_default().to_owned();
+    tmp_name.push(".tmp");
+    let tmp_path = path.with_file_name(tmp_name);
+    {
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp_path, path)
 }

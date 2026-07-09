@@ -5,7 +5,7 @@ use crate::{
     rendering::color::{byte_to_linear_rgba, linear_to_srgb_byte},
     ui::{
         EditorState, UiCommand,
-        widgets::menu::{MenuFieldBool, MenuFieldColor32, MenuFieldU32, PrefrenceCatagory},
+        widgets::menu::{MenuFieldBool, MenuFieldColor32, MenuFieldU32, PreferenceCategory},
     },
 };
 
@@ -40,27 +40,38 @@ pub(crate) fn draw_preferences(
                         .resizable(false)
                         .show(ui, |ui| {
                             egui::ScrollArea::new([false, true]).show(ui, |ui| {
-                                if PrefrenceCatagory::new("Interface".to_string())
+                                if PreferenceCategory::new("Interface".to_string())
                                     .active(
-                                        editor.active_prefrence_catagory
-                                            == crate::ui::state::PrefrenceCatagory::Interface,
+                                        editor.active_preference_category
+                                            == crate::ui::state::PreferenceCategory::Interface,
                                     )
                                     .show(ui)
                                     .clicked()
                                 {
-                                    editor.active_prefrence_catagory =
-                                        crate::ui::state::PrefrenceCatagory::Interface;
+                                    editor.active_preference_category =
+                                        crate::ui::state::PreferenceCategory::Interface;
                                 }
-                                if PrefrenceCatagory::new("Preformance".to_string())
+                                if PreferenceCategory::new("Performance".to_string())
                                     .active(
-                                        editor.active_prefrence_catagory
-                                            == crate::ui::state::PrefrenceCatagory::Preformance,
+                                        editor.active_preference_category
+                                            == crate::ui::state::PreferenceCategory::Performance,
                                     )
                                     .show(ui)
                                     .clicked()
                                 {
-                                    editor.active_prefrence_catagory =
-                                        crate::ui::state::PrefrenceCatagory::Preformance;
+                                    editor.active_preference_category =
+                                        crate::ui::state::PreferenceCategory::Performance;
+                                };
+                                if PreferenceCategory::new("Developer".to_string())
+                                    .active(
+                                        editor.active_preference_category
+                                            == crate::ui::state::PreferenceCategory::Developer,
+                                    )
+                                    .show(ui)
+                                    .clicked()
+                                {
+                                    editor.active_preference_category =
+                                        crate::ui::state::PreferenceCategory::Developer;
                                 };
                             });
                         });
@@ -95,8 +106,8 @@ pub(crate) fn draw_preferences(
                         });
 
                     egui::ScrollArea::new([false, true]).show(ui, |ui| {
-                        match editor.active_prefrence_catagory {
-                            crate::ui::state::PrefrenceCatagory::Interface => {
+                        match editor.active_preference_category {
+                            crate::ui::state::PreferenceCategory::Interface => {
                                 ui.heading("Interface Preferences");
                                 ui.add_space(12.0);
 
@@ -136,8 +147,9 @@ pub(crate) fn draw_preferences(
                                 )
                                 .show(ui);
                             }
-                            crate::ui::state::PrefrenceCatagory::Preformance => {
-                                ui.heading("Preformance Preferences");
+                            crate::ui::state::PreferenceCategory::Performance => {
+                                ui.heading("Performance Preferences");
+                                ui.label("It is recommended you leave these options in their default state");
                                 ui.add_space(12.0);
                                 MenuFieldU32::new(
                                     "Snap to point/line polling rate",
@@ -161,12 +173,26 @@ pub(crate) fn draw_preferences(
                                 .suffix(" FPS")
                                 .show(ui);
                                 MenuFieldU32::new(
-                                    "Block model raycast downscale while interacting",
+                                    "Block model interaction downscale",
                                     &mut draft.block_model_interaction_resolution_divisor,
                                     1..=64,
                                 )
                                 .suffix("x")
                                 .show(ui);
+                            }
+                            crate::ui::state::PreferenceCategory::Developer => {
+                                ui.heading("Developer");
+                                ui.add_space(12.0);
+                                MenuFieldBool::new(
+                                    "Colour triangles by GPU chunk",
+                                    &mut draft.debug_chunk_coloring,
+                                )
+                                .show(ui);
+                                ui.add_space(4.0);
+                                ui.label(
+                                    "Visualises the Morton spatial chunking used for frustum \
+                                     culling.",
+                                );
                             }
                         }
                     });

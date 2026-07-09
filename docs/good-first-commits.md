@@ -2,7 +2,7 @@
 
 - Editing and writing documentation
 
-- Improving the toutorials so users are introduced to all the features
+- Improving the tutorials so users are introduced to all the features
 
 - Imroving the UX and efficiency of design workflows
 

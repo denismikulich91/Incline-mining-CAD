@@ -233,6 +233,13 @@ pub(crate) fn numeric_variable_default(
         .ok()
 }
 
+/// Vulcan's conventional "no grade" sentinels. Matched exactly (to float
+/// noise) rather than by a `<= -90` threshold so legitimately negative data
+/// (sub-sea RLs, elevations) isn't silently treated as missing.
+pub(crate) fn is_no_data_sentinel(value: f64) -> bool {
+    (value - -99.0).abs() < 1e-8 || (value - -999.0).abs() < 1e-8
+}
+
 /// The (min, max) of `values` at `indices`, skipping non-finite values, the
 /// variable's default/"unset" value, and Vulcan's common -99/-999 sentinel
 /// "no grade" values, so real ore values don't collapse into one colour.
@@ -252,7 +259,7 @@ pub(crate) fn render_value_range(
         if !value.is_finite() || default.is_some_and(|default| (value - default).abs() < 1e-8) {
             continue;
         }
-        if value <= -90.0 {
+        if is_no_data_sentinel(value) {
             continue;
         }
         min = min.min(value);

@@ -51,14 +51,18 @@ impl<'a> App<'a> {
                     mesh.vertex_count(),
                     mesh.face_count()
                 );
-                let spatial = crate::model::spatial::TriangleBvh::build(&mesh);
+                let spatial = std::sync::Arc::new(crate::model::spatial::TriangleBvh::build(&mesh));
                 let edges = crate::model::triangulation::unique_edges(&mesh);
+                let surface_face_order = std::sync::Arc::new(
+                    crate::model::triangulation::morton_surface_face_order(&mesh),
+                );
                 Ok(LoadedTriangulation {
                     name,
                     path,
-                    mesh,
+                    mesh: std::sync::Arc::new(mesh),
                     spatial,
                     edges,
+                    surface_face_order,
                     scene_was_empty,
                 })
             })();
@@ -80,7 +84,7 @@ impl<'a> App<'a> {
         for (path, rx) in receivers {
             match rx.try_recv() {
                 Ok(Ok(loaded)) => {
-                    self.pending_loads -= 1;
+                    self.pending_loads = self.pending_loads.saturating_sub(1);
                     let id = TriangulationId(self.next_triangulation_id);
                     self.next_triangulation_id += 1;
                     self.triangulations.push(OpenTriangulation {
@@ -91,6 +95,7 @@ impl<'a> App<'a> {
                         mesh: loaded.mesh,
                         spatial: loaded.spatial,
                         edges: loaded.edges,
+                        surface_face_order: loaded.surface_face_order,
                         visible: true,
                         color: DEFAULT_TRIANGULATION_COLOR,
                         line_color: [0.05, 0.08, 0.10, 1.0],
@@ -107,7 +112,7 @@ impl<'a> App<'a> {
                     self.invalidate_topology_bounds_and_redraw();
                 }
                 Ok(Err(e)) => {
-                    self.pending_loads -= 1;
+                    self.pending_loads = self.pending_loads.saturating_sub(1);
                     let message = format!("{e:#}");
                     crate::userspace_warn!("Failed to load triangulation: {message}");
                     self.finish_topology_load();
@@ -116,7 +121,7 @@ impl<'a> App<'a> {
                     still_pending.push((path, rx));
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.pending_loads -= 1;
+                    self.pending_loads = self.pending_loads.saturating_sub(1);
                     self.finish_topology_load();
                 }
             }
@@ -184,6 +189,7 @@ impl<'a> App<'a> {
         let tri = self.triangulations.remove(index);
         let handle = tri.entity_id();
         self.clear_triangulation_entity_state(handle);
+        self.clear_dialog_refs_to_triangulation(id);
         if self.active_triangulation == Some(id) {
             self.active_triangulation = None;
         }
@@ -199,6 +205,7 @@ impl<'a> App<'a> {
             let tri = self.triangulations.remove(idx);
             let handle = tri.entity_id();
             self.clear_triangulation_entity_state(handle);
+            self.clear_dialog_refs_to_triangulation(tri.id);
             if self.active_triangulation == Some(tri.id) {
                 self.active_triangulation = None;
             }
@@ -221,6 +228,43 @@ impl<'a> App<'a> {
                 .unwrap_or_default()
         );
         self.persist_session();
+    }
+
+    fn clear_dialog_refs_to_triangulation(&mut self, id: TriangulationId) {
+        if self.editor.tri_cut_poly_tri_id == Some(id) {
+            self.editor.tri_cut_poly_tri_id = None;
+            self.editor.tri_cut_poly_open = false;
+            self.editor.tri_cut_poly_awaiting_pick = false;
+        }
+        if self.editor.tri_cut_z_tri_id == Some(id) {
+            self.editor.tri_cut_z_tri_id = None;
+            self.editor.tri_cut_z_open = false;
+        }
+        if self.editor.tri_cut_surface_target_id == Some(id)
+            || self.editor.tri_cut_surface_reference_id == Some(id)
+        {
+            self.editor.tri_cut_surface_target_id = None;
+            self.editor.tri_cut_surface_reference_id = None;
+            self.editor.tri_cut_surface_open = false;
+        }
+        if self.editor.tri_cut_pitshell_topology_id == Some(id)
+            || self.editor.tri_cut_pitshell_pitshell_id == Some(id)
+        {
+            self.editor.tri_cut_pitshell_topology_id = None;
+            self.editor.tri_cut_pitshell_pitshell_id = None;
+            self.editor.tri_cut_pitshell_open = false;
+        }
+        if self.editor.tri_include_solid_topology_id == Some(id)
+            || self.editor.tri_include_solid_shape_id == Some(id)
+        {
+            self.editor.tri_include_solid_topology_id = None;
+            self.editor.tri_include_solid_shape_id = None;
+            self.editor.tri_include_solid_open = false;
+        }
+        if self.editor.tri_contour_tri_id == Some(id) {
+            self.editor.tri_contour_tri_id = None;
+            self.editor.tri_contour_open = false;
+        }
     }
 
     /// Unload every mesh whose path lives in `dir`, and drop the dir from the tracked list.
@@ -318,23 +362,6 @@ impl<'a> App<'a> {
         )
     }
 
-    pub(crate) fn finish_generated_triangulation_with_edges(
-        &mut self,
-        name: String,
-        tri_vertices: Vec<tri00t::Vertex>,
-        tri_faces: Vec<[u32; 3]>,
-        surface_type: TriSurfaceType,
-        edges: Vec<[u32; 2]>,
-    ) -> Result<()> {
-        self.finish_generated_triangulation_with_edge_builder(
-            name,
-            tri_vertices,
-            tri_faces,
-            surface_type,
-            |_| edges,
-        )
-    }
-
     fn finish_generated_triangulation_with_edge_builder(
         &mut self,
         name: String,
@@ -343,14 +370,54 @@ impl<'a> App<'a> {
         surface_type: TriSurfaceType,
         build_edges: impl FnOnce(&tri00t::Triangulation) -> Vec<[u32; 2]>,
     ) -> Result<()> {
-        if tri_faces.is_empty() {
-            anyhow::bail!("Triangulation produced no faces");
+        let built = build_generated_triangulation(
+            name,
+            tri_vertices,
+            tri_faces,
+            surface_type,
+            build_edges,
+        )?;
+        self.insert_generated_triangulation(built);
+        Ok(())
+    }
+
+    /// Apply the result of a background job that produces one triangulation
+    /// with a single completion log line: log + insert on success, warn on
+    /// failure. Shared by the backgrounded cut/create paths.
+    pub(crate) fn apply_generated_triangulation_job(
+        &mut self,
+        result: Result<crate::model::triangulation::GeneratedTriangulationLog>,
+    ) {
+        match result {
+            Ok(log) => {
+                userspace_log!("{}", log.message);
+                self.insert_generated_triangulation(log.generated);
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                crate::userspace_warn!("Triangulation operation failed: {message}");
+            }
         }
-        let mesh = tri00t::Triangulation::from_vertices_and_faces(tri_vertices, tri_faces);
+    }
+
+    /// UI-thread half of a generated-triangulation apply: register a
+    /// pre-built mesh/BVH/edge bundle as a new `OpenTriangulation` and select
+    /// it. The heavy build (mesh assembly + BVH) is done by
+    /// `build_generated_triangulation`, which can run on a worker thread.
+    pub(crate) fn insert_generated_triangulation(
+        &mut self,
+        built: crate::model::triangulation::GeneratedTriangulation,
+    ) {
+        let crate::model::triangulation::GeneratedTriangulation {
+            name,
+            mesh,
+            spatial,
+            edges,
+            surface_face_order,
+            surface_type,
+        } = built;
         let vertex_count = mesh.vertex_count();
         let face_count = mesh.face_count();
-        let spatial = crate::model::spatial::TriangleBvh::build(&mesh);
-        let edges = build_edges(&mesh);
 
         let id = TriangulationId(self.next_triangulation_id);
         self.next_triangulation_id += 1;
@@ -370,6 +437,7 @@ impl<'a> App<'a> {
             mesh,
             spatial,
             edges,
+            surface_face_order,
             visible: true,
             color: DEFAULT_TRIANGULATION_COLOR,
             line_color: [0.05, 0.08, 0.10, 1.0],
@@ -389,6 +457,34 @@ impl<'a> App<'a> {
         } else {
             self.invalidate_topology_bounds_and_redraw();
         }
-        Ok(())
     }
+}
+
+/// Worker-thread half of a generated-triangulation apply: assemble the mesh,
+/// build its BVH and edge list. Pure (no `App`), so it can run off the UI
+/// thread; the result is handed to `insert_generated_triangulation`.
+pub(crate) fn build_generated_triangulation(
+    name: String,
+    tri_vertices: Vec<tri00t::Vertex>,
+    tri_faces: Vec<[u32; 3]>,
+    surface_type: TriSurfaceType,
+    build_edges: impl FnOnce(&tri00t::Triangulation) -> Vec<[u32; 2]>,
+) -> Result<crate::model::triangulation::GeneratedTriangulation> {
+    if tri_faces.is_empty() {
+        anyhow::bail!("Triangulation produced no faces");
+    }
+    let mesh = tri00t::Triangulation::from_vertices_and_faces(tri_vertices, tri_faces);
+    let spatial = std::sync::Arc::new(crate::model::spatial::TriangleBvh::build(&mesh));
+    let edges = build_edges(&mesh);
+    let surface_face_order = std::sync::Arc::new(
+        crate::model::triangulation::morton_surface_face_order(&mesh),
+    );
+    Ok(crate::model::triangulation::GeneratedTriangulation {
+        name,
+        mesh: std::sync::Arc::new(mesh),
+        spatial,
+        edges,
+        surface_face_order,
+        surface_type,
+    })
 }

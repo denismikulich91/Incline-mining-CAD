@@ -16,10 +16,15 @@ pub(crate) struct ObjectSnapIndex {
 impl ObjectSnapIndex {
     pub(crate) fn build(objects: &[Object]) -> Self {
         let bboxes: Vec<(DVec3, DVec3)> = objects.iter().map(object_bbox).collect();
-        let n = bboxes.len();
+        let order: Vec<u32> = bboxes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (min, max))| bbox_valid(*min, *max).then_some(index as u32))
+            .collect();
+        let n = order.len();
         let mut index = Self {
             bboxes,
-            order: (0..n as u32).collect(),
+            order,
             nodes: Vec::new(),
         };
         if n > 0 {
@@ -125,6 +130,9 @@ fn object_bbox(object: &Object) -> (DVec3, DVec3) {
 }
 
 fn polyline_bbox(verts: &[PolyVertex]) -> (DVec3, DVec3) {
+    if verts.is_empty() {
+        return (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY));
+    }
     let mut min = DVec3::splat(f64::INFINITY);
     let mut max = DVec3::splat(f64::NEG_INFINITY);
     for v in verts {
@@ -135,6 +143,10 @@ fn polyline_bbox(verts: &[PolyVertex]) -> (DVec3, DVec3) {
         return (DVec3::ZERO, DVec3::ZERO);
     }
     (min, max)
+}
+
+fn bbox_valid(min: DVec3, max: DVec3) -> bool {
+    min.is_finite() && max.is_finite() && min.x <= max.x && min.y <= max.y && min.z <= max.z
 }
 
 #[derive(Clone, Debug)]
@@ -309,23 +321,25 @@ impl TriangleBvh {
         })
     }
 
-    /// Return triangles whose projected BVH bounds overlap a cursor-sized
+    /// Visit triangles whose projected BVH bounds overlap a cursor-sized
     /// screen region. This keeps vertex/edge snapping proportional to nearby
-    /// geometry rather than the entire mesh.
-    pub(crate) fn screen_candidates(
+    /// geometry rather than the entire mesh, without materialising the
+    /// candidate set (dense meshes put thousands of triangles in a 15 px
+    /// radius).
+    pub(crate) fn for_each_screen_candidate(
         &self,
         mesh: &tri00t::Triangulation,
         view_projection: &DMat4,
         screen: (f32, f32),
         cursor: (f32, f32),
         threshold: f32,
-    ) -> Vec<[DVec3; 3]> {
+        mut visit: impl FnMut([DVec3; 3]),
+    ) {
         if self.nodes.is_empty() {
-            return Vec::new();
+            return;
         }
         let cursor = DVec2::new(cursor.0 as f64, cursor.1 as f64);
         let threshold = threshold as f64;
-        let mut result = Vec::new();
         let mut stack = vec![0usize];
         while let Some(index) = stack.pop() {
             let node = self.nodes[index];
@@ -341,17 +355,14 @@ impl TriangleBvh {
             }
             if node.count > 0 {
                 let start = node.right_child_or_start as usize;
-                result.extend(
-                    self.order[start..start + node.count as usize]
-                        .iter()
-                        .map(|&i| self.triangle(mesh, i as usize)),
-                );
+                for &i in &self.order[start..start + node.count as usize] {
+                    visit(self.triangle(mesh, i as usize));
+                }
             } else {
                 stack.push(node.right_child_or_start as usize);
                 stack.push(index + 1);
             }
         }
-        result
     }
 
     /// Return triangle indices whose XY bounds overlap the supplied rectangle.
@@ -428,7 +439,16 @@ impl TriangleBvh {
 
     fn triangle(&self, mesh: &tri00t::Triangulation, index: usize) -> [DVec3; 3] {
         mesh.face_vertex_indices(index)
-            .unwrap_or([0, 0, 0])
+            .unwrap_or_else(|| {
+                // The BVH `order` array is built from this mesh, so every
+                // index must resolve; substituting a degenerate triangle keeps
+                // ray tests safe but must not pass silently.
+                debug_assert!(false, "BVH face index {index} out of range");
+                log::error!(
+                    "BVH face index {index} out of range for mesh; substituting degenerate triangle"
+                );
+                [0, 0, 0]
+            })
             .map(|v| {
                 let p = mesh.vertices()[v];
                 DVec3::new(p.x, p.y, p.z)
@@ -591,11 +611,13 @@ pub(crate) fn projected_box_overlaps(
     let mut screen_min = DVec2::splat(f64::INFINITY);
     let mut screen_max = DVec2::splat(f64::NEG_INFINITY);
     let mut any = false;
+    let mut behind = 0;
     for x in [min.x, max.x] {
         for y in [min.y, max.y] {
             for z in [min.z, max.z] {
                 let clip = *view_projection * DVec3::new(x, y, z).extend(1.0);
-                if clip.w.abs() <= f64::EPSILON {
+                if clip.w <= f64::EPSILON {
+                    behind += 1;
                     continue;
                 }
                 let ndc = clip.truncate() / clip.w;
@@ -608,6 +630,12 @@ pub(crate) fn projected_box_overlaps(
                 any = true;
             }
         }
+    }
+    // A box straddling the near plane cannot be projected reliably; keep it
+    // (descend into children, which eventually land wholly on one side).
+    // A box wholly behind the eye can never contain the cursor hit.
+    if behind > 0 {
+        return any;
     }
     any && cursor.x >= screen_min.x - threshold
         && cursor.x <= screen_max.x + threshold

@@ -101,7 +101,7 @@ impl Camera {
 }
 
 const MIN_ORTHO_ZOOM: f64 = 1.0e-4;
-pub(crate) const PERSPECTIVE_FOV_Y: f64 = 70.0_f64.to_radians();
+pub(crate) const PERSPECTIVE_FOV_Y: f64 = 40.0_f64.to_radians();
 
 pub(crate) struct Projection {
     aspect: f64,
@@ -301,7 +301,6 @@ impl CameraController {
         self.view_transition = Some(ViewTransition {
             start_forward: camera.forward(),
             end_forward,
-            start_up: camera.up(),
             end_up,
             target: camera.target(),
             distance: target_distance.max(MIN_ORTHO_ZOOM),
@@ -328,9 +327,13 @@ impl CameraController {
         let duration = transition.duration.as_secs_f64().max(f64::EPSILON);
         let linear_t = (transition.elapsed.as_secs_f64() / duration).clamp(0.0, 1.0);
         let t = ease_out_cubic(linear_t);
-        let forward = slerp_unit(transition.start_forward, transition.end_forward, t);
-        let up_hint = slerp_unit(transition.start_up, transition.end_up, t);
-        let up = orthonormal_up(forward, up_hint);
+        let forward = slerp_unit_with_axis_hint(
+            transition.start_forward,
+            transition.end_forward,
+            transition.end_up,
+            t,
+        );
+        let up = orthonormal_up(forward, transition.end_up);
 
         camera.target = transition.target;
         camera.position = transition.target - forward * transition.distance;
@@ -493,7 +496,6 @@ impl CameraController {
 struct ViewTransition {
     start_forward: DVec3,
     end_forward: DVec3,
-    start_up: DVec3,
     end_up: DVec3,
     target: DVec3,
     distance: f64,
@@ -551,6 +553,28 @@ fn slerp_unit(from: DVec3, to: DVec3, t: f64) -> DVec3 {
     (from * a + to * b).normalize_or(to)
 }
 
+fn slerp_unit_with_axis_hint(from: DVec3, to: DVec3, axis_hint: DVec3, t: f64) -> DVec3 {
+    let from = from.normalize_or_zero();
+    let to = to.normalize_or(from);
+    let dot = from.dot(to).clamp(-1.0, 1.0);
+
+    if dot >= -0.9995 {
+        return slerp_unit(from, to, t);
+    }
+
+    let hinted_axis = axis_hint.reject_from(from);
+    let fallback_axis = from
+        .cross(if from.z.abs() < 0.9 {
+            DVec3::Z
+        } else {
+            DVec3::Y
+        })
+        .normalize_or(DVec3::X);
+    let axis = hinted_axis.normalize_or(fallback_axis);
+    DQuat::from_axis_angle(axis, std::f64::consts::PI * t)
+        .mul_vec3(from)
+        .normalize_or(to)
+}
 #[derive(Debug)]
 pub(crate) struct FlyCameraController {
     forward: bool,

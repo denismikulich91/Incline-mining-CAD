@@ -8,6 +8,7 @@ use crate::model::ObjectId;
 pub(crate) mod confirmations;
 pub(crate) mod editing;
 pub(crate) mod files;
+pub(crate) mod import_export;
 pub(crate) mod triangulation;
 
 #[derive(Clone, Debug, PartialEq)]

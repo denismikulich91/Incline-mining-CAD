@@ -18,3 +18,16 @@
 
 - Blockmodel improvements
 
+## V0.1.3
+
+- .duf Deswik support
+
+- New tools such as "Break polygon with points" and "Messure berm angle"
+
+- Point cloud support (very early, not very fleshed out)
+
+- Optimisation
+
+- Improved Import / Export
+
+- Moved configs to appdata/.config from executable location for compatabaility

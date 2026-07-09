@@ -4,8 +4,8 @@
 mod app;
 mod logging;
 mod model;
+mod os;
 mod rendering;
-mod startup;
 mod ui;
 
 use anyhow::Result;
@@ -25,7 +25,7 @@ fn main() -> Result<()> {
     logging::init();
     let result: Result<()> = (|| {
         let event_loop = EventLoop::new()?;
-        startup::init();
+        os::init();
         let mut app = App::new()?;
         event_loop.run_app(&mut app)?;
         Ok(())

@@ -15,7 +15,7 @@ use winit::{
 use crate::{
     Size,
     model::{
-        Document, Object, SceneEntityId, block_model::OpenBlockModel,
+        Document, Object, SceneEntityId, block_model::OpenBlockModel, point_cloud::OpenPointCloud,
         triangulation::OpenTriangulation,
     },
     rendering::{
@@ -25,9 +25,12 @@ use crate::{
             screen_to_world_on_plane,
         },
         color::linear_to_srgb,
-        pick::{PickRecord, TextPickRecord, pick_nearest, pick_text},
+        pick::{PickGeometry, PickRecord, TextPickRecord, pick_nearest, pick_text},
         query::SceneQuery,
-        scene::{BlockModelGpuCache, EdgeInstance, TriangulationGpuCache},
+        scene::{
+            BlockModelGpuCache, EdgeInstance, PointCloudGpuCache, PointInstance, StaticStrokeCache,
+            TriangulationGpuCache,
+        },
         snap::SNAP_THRESHOLD_PX,
         text::{CachedTextArea, TextCache, TextSystem},
     },
@@ -51,7 +54,8 @@ pub(crate) mod targets;
 pub(super) const TEXT_CACHE_TRIM_INTERVAL_FRAMES: u64 = 300;
 pub(super) const MSAA_SAMPLE_COUNT: u32 = 4;
 pub(super) const CAMERA_ROTATE_SENSITIVITY: f64 = 0.003;
-pub(super) const REQUESTED_MAX_BUFFER_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+/// Below this per-buffer limit, large tessellated scenes may be truncated.
+pub(super) const COMFORTABLE_MAX_BUFFER_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 pub(super) const YELLOW_HIGHLIGHT_COLOR: [f32; 4] = [1.0, 0.85, 0.0, 1.0];
 /// Sizing for editable document geometry.
 pub(super) const DOC_LINE_WIDTH: f32 = 1.0;
@@ -161,18 +165,20 @@ pub(crate) struct Graphics<'a> {
     pub(super) transparent_surface_render_pipeline: wgpu::RenderPipeline,
     pub(super) block_model_render_pipeline: wgpu::RenderPipeline,
     pub(super) block_model_volume_pipeline: wgpu::RenderPipeline,
-    pub(super) block_model_peel_pipeline: wgpu::RenderPipeline,
-    pub(super) block_model_peel_composite_pipeline: wgpu::RenderPipeline,
+    pub(super) block_model_transparency_fallback_pipeline: wgpu::RenderPipeline,
+    pub(super) block_model_transparency_composite_pipeline: wgpu::RenderPipeline,
     pub(super) block_model_volume_upscale_pipeline: wgpu::RenderPipeline,
     pub(super) block_model_volume_upscale_bind_group_layout: wgpu::BindGroupLayout,
-    pub(super) block_model_peel_bind_group_layout: wgpu::BindGroupLayout,
-    pub(super) block_model_peel_composite_bind_group_layout: wgpu::BindGroupLayout,
+    pub(super) block_model_transparency_fallback_bind_group_layout: wgpu::BindGroupLayout,
+    pub(super) block_model_transparency_composite_bind_group_layout: wgpu::BindGroupLayout,
     pub(super) block_model_volume_bind_group_layout: wgpu::BindGroupLayout,
     pub(super) surface_style_bind_group_layout: wgpu::BindGroupLayout,
+    pub(super) surface_chunk_bind_group_layout: wgpu::BindGroupLayout,
     pub(super) render_pipeline: wgpu::RenderPipeline,
     pub(super) xray_render_pipeline: wgpu::RenderPipeline,
     pub(super) stroke_render_pipeline: wgpu::RenderPipeline,
     pub(super) edge_render_pipeline: wgpu::RenderPipeline,
+    pub(super) point_cloud_render_pipeline: wgpu::RenderPipeline,
     pub(super) edge_style_bind_group_layout: wgpu::BindGroupLayout,
     pub(super) overlay_render_pipeline: wgpu::RenderPipeline,
     pub(super) lyon_vertex_gpu: wgpu::Buffer,
@@ -189,7 +195,7 @@ pub(crate) struct Graphics<'a> {
     pub(super) msaa_view: wgpu::TextureView,
     pub(super) depth_texture: wgpu::Texture,
     pub(super) depth_view: wgpu::TextureView,
-    pub(super) block_model_peel_targets: BlockModelPeelTargets,
+    pub(super) block_model_transparency_targets: BlockModelTransparencyTargets,
     pub(super) block_model_volume_target: BlockModelVolumeTarget,
     pub(super) surface: wgpu::Surface<'a>,
     pub(super) queue: wgpu::Queue,
@@ -238,7 +244,7 @@ pub(crate) struct Graphics<'a> {
     pub(super) cached_scene_bounds: Option<(DVec3, DVec3)>,
     pub(super) overlay_dirty: bool,
     pub(super) cached_scale_factor: f32,
-    pub(super) cached_measurement_state: (bool, Option<DVec3>, Option<DVec3>),
+    pub(super) cached_measurement_state: (bool, Option<DVec3>, Option<DVec3>, Vec<DVec3>),
     pub(super) cached_poly_finish_dialog: bool,
     pub(super) pick_records: Vec<PickRecord>,
     pub(super) text_pick_records: Vec<TextPickRecord>,
@@ -246,13 +252,21 @@ pub(crate) struct Graphics<'a> {
     pub(super) scene_origin: DVec3,
     pub(super) vertical_exaggeration: f64,
     pub(super) triangulation_gpu: TriangulationGpuCache,
+    /// Chunked, persistently uploaded stroke geometry for stable polylines
+    /// (contour output and the like); see `StaticStrokeCache`.
+    pub(super) static_strokes: StaticStrokeCache,
     pub(super) block_model_gpu: BlockModelGpuCache,
+    pub(super) point_cloud_gpu: PointCloudGpuCache,
+    /// `(rendered, total)` surface-chunk counts from the last scene pass, for
+    /// the developer chunk-debug readout. One frame stale by the time the UI
+    /// reads it, which is fine for a debug counter.
+    pub(crate) chunk_render_stats: (u32, u32),
 }
 
-pub(super) struct BlockModelPeelTargets {
+pub(super) struct BlockModelTransparencyTargets {
     pub(super) _accum_textures: Vec<wgpu::Texture>,
     pub(super) accum_views: Vec<wgpu::TextureView>,
-    pub(super) peel_bind_groups: Vec<wgpu::BindGroup>,
+    pub(super) transparency_fallback_bind_groups: Vec<wgpu::BindGroup>,
     pub(super) composite_bind_groups: Vec<wgpu::BindGroup>,
 }
 

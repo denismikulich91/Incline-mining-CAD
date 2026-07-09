@@ -13,8 +13,6 @@ impl<'a> App<'a> {
         let Some(originals) = self.move_session_original.take() else {
             return;
         };
-        let original_dirty = self.move_session_project_dirty.take();
-
         let commands: Vec<Command> = originals
             .into_iter()
             .filter_map(|before| {
@@ -26,15 +24,7 @@ impl<'a> App<'a> {
         let moved = commands.len();
         if moved > 0 {
             self.history.push_applied(Command::Batch(commands));
-            self.workspace.mark_dirty();
             userspace_log!("Applied move delta ({delta}) to {moved} object(s)");
-            userspace_log!("Moved {moved} object(s) by delta ({delta})");
-        } else {
-            if let (Some(dirty), Some(project)) =
-                (original_dirty, self.workspace.active_project_mut())
-            {
-                project.dirty = dirty;
-            }
         }
         self.editor.move_vertex_target = None;
         self.editor.move_panel_delta = [0.0; 3];
@@ -66,14 +56,11 @@ impl<'a> App<'a> {
         self.editor.gizmo_drag_axis_index = None;
 
         let Some(originals) = self.move_session_original.take() else {
-            self.move_session_project_dirty = None;
             self.editor.move_vertex_target = None;
             self.editor.move_panel_delta = [0.0; 3];
             self.editor.move_panel_last_preview = [f64::NAN; 3];
             return;
         };
-        let original_dirty = self.move_session_project_dirty.take();
-
         let commands: Vec<Command> = originals
             .into_iter()
             .filter_map(|before| {
@@ -85,11 +72,6 @@ impl<'a> App<'a> {
         let moved = commands.len();
         if moved > 0 {
             self.history.push_applied(Command::Batch(commands));
-            self.workspace.mark_dirty();
-        } else if let (Some(dirty), Some(project)) =
-            (original_dirty, self.workspace.active_project_mut())
-        {
-            project.dirty = dirty;
         }
 
         self.editor.move_vertex_target = None;
@@ -134,10 +116,6 @@ impl<'a> App<'a> {
             "Started gizmo drag on {} axis",
             ["X", "Y", "Z"][axis_idx as usize]
         );
-        userspace_log!(
-            "Started gizmo drag along {} axis",
-            ["X", "Y", "Z"][axis_idx as usize]
-        );
     }
 
     pub(crate) fn move_gizmo_to_cursor(&mut self) {
@@ -163,7 +141,6 @@ impl<'a> App<'a> {
         };
         self.editor.gizmo_drag_axis_index = None;
         userspace_log!("Finished gizmo drag");
-        userspace_log!("Finished gizmo drag");
         self.invalidate_geometry();
         self.invalidate_overlay();
     }
@@ -185,8 +162,6 @@ impl<'a> App<'a> {
             })
             .unwrap_or(true);
         if should_refresh {
-            self.move_session_project_dirty =
-                self.workspace.active_project().map(|project| project.dirty);
             self.move_session_original = Some(
                 selected_ids
                     .iter()
@@ -205,10 +180,8 @@ impl<'a> App<'a> {
             for object in originals {
                 let mut moved = object.clone();
                 translate_move_target(&mut moved, vertex_target, delta);
-                project.pidb.document.remove_object(object.id());
-                project.pidb.document.insert_object(moved);
+                project.pidb.document.replace_object(moved);
             }
-            project.dirty = true;
         }
     }
 
@@ -216,15 +189,11 @@ impl<'a> App<'a> {
         let Some(originals) = self.move_session_original.take() else {
             return;
         };
-        let original_dirty = self.move_session_project_dirty.take();
         if let Some(project) = self.workspace.active_project_mut() {
             for object in originals {
-                project.pidb.document.remove_object(object.id());
-                project.pidb.document.insert_object(object);
+                project.pidb.document.replace_object(object);
             }
-            if let Some(dirty) = original_dirty {
-                project.dirty = dirty;
-            }
+            project.invalidate_dirty_layers();
         }
     }
 
@@ -299,5 +268,5 @@ fn translate_move_target(
 }
 
 fn objects_differ(before: &Object, after: &Object) -> bool {
-    serde_json::to_value(before).ok() != serde_json::to_value(after).ok()
+    before != after
 }

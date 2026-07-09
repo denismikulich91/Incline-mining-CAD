@@ -1,25 +1,17 @@
 [package]
 name = "incline"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
-description = "Incline is an open-pit mine design project"
+description = "Incline is a free source-available mine design project"
 repository = "https://github.com/Incline-Mine-Designer/Incline"
 license-file = "LICENSE.md"
-keywords = ["mining", "cad", "gpu", "wgpu", "design"]
+keywords = ["mining", "cad", "design"]
 categories = ["graphics", "science"]
 exclude = [
     "target/",
     "docs/",
     "tutorial/"
 ]
-
-[features]
-default = []
-# Opt-in GUI inspection/automation over the egui_inspection protocol (egui_mcp and similar
-# tools). Off by default: enabling it lets any process that can reach EGUI_INSPECTION's bind
-# address (loopback-only unless explicitly overridden) read the UI tree, inject input, and
-# take screenshots. Build with `--features inspection` and run with `EGUI_INSPECTION=1`.
-inspection = ["dep:egui_inspection"]
 
 [build-dependencies]
 winresource = "0.1.31"
@@ -44,18 +36,19 @@ egui = "0.35.0"
 egui-winit = "0.35.0"
 egui-wgpu = "0.35.0"
 egui_extras = { version = "0.35.0", default-features = false, features = ["svg"] }
-egui_inspection = { version = "0.35.0", features = ["plugin"], optional = true }
 strum = { version = "0.28.0", features = ["derive"] }
 toml = "1.1.2"
 lazy_static = "1.5.0"
 rayon = "1.12.0"
 spade = "2.15.1"
-geo = { version = "0.33.1", default-features = false, features = ["spade", "multithreading"] } # Disables earcut dependency so its not downgraded to 0.4.5
 chrono = "0.4.45"
 colored = "3.1.1"
 earcut = "0.4.10"
 robust = "1.2"
 memmap2 = "0.9.9"
+snap = "1.1.1"
+dirs = "6.0.0"
+laz = "0.12.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"

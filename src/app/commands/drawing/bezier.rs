@@ -36,8 +36,11 @@ impl<'a> App<'a> {
         let Some((SceneEntityId::Object(oid), _)) = picked else {
             return;
         };
+        if !self.activate_project_for_object(oid) {
+            return;
+        }
 
-        if !self.active_layer_object(oid).is_some_and(
+        if !self.active_document().get_object(oid).is_some_and(
             |o| matches!(o, Object::Polyline { closed: true, verts, .. } if verts.len() >= 3),
         ) {
             return;
@@ -136,6 +139,9 @@ impl<'a> App<'a> {
         ) else {
             return;
         };
+        if !self.activate_project_for_object(oid) {
+            return;
+        }
         let Some(project) = self.workspace.active_project_mut() else {
             return;
         };
@@ -186,7 +192,6 @@ impl<'a> App<'a> {
         if before != after {
             self.history
                 .execute(doc, Command::Replace { before, after });
-            project.dirty = true;
             userspace_log!(
                 "Bezier applied: {} intermediate points on edge {vi}→{vj}",
                 segments - 1

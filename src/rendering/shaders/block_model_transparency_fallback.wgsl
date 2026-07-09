@@ -39,7 +39,7 @@ struct VertexOutput {
     @location(1) local_position: vec3<f32>,
 };
 
-struct PeelOutput {
+struct TransparencyOutput {
     @location(0) accum: vec4<f32>,
 };
 
@@ -104,7 +104,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, instance: InstanceInput) ->
 }
 
 @fragment
-fn fs_main(in: VertexOutput) -> PeelOutput {
+fn fs_main(in: VertexOutput) -> TransparencyOutput {
     if (in.grade < -1.5) {
         discard;
     }
@@ -132,7 +132,7 @@ fn fs_main(in: VertexOutput) -> PeelOutput {
     let intensity = 0.28 + 0.18 * view_light + 0.42 * key_light + 0.12 * fill_light;
     let color = vec4<f32>(rgb * intensity * alpha, alpha);
 
-    var out: PeelOutput;
+    var out: TransparencyOutput;
     out.accum = color;
     return out;
 }
