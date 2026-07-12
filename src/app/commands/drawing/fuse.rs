@@ -372,23 +372,16 @@ impl<'a> App<'a> {
                     return;
                 }
             };
-            let mut ordered: Vec<PolyVertex> = if seg.closed {
+            let ordered: Vec<PolyVertex> = if seg.closed {
                 (0..verts.len())
                     .map(|offset| verts[(seg.start_index + offset) % verts.len()])
                     .collect()
             } else if seg.reversed {
-                verts.iter().rev().copied().collect()
+                reverse_open_polyline(&verts)
             } else {
                 verts
             };
-            let coincident_start = all_verts
-                .last()
-                .zip(ordered.first())
-                .is_some_and(|(a, b)| points_coincident(a.pos, b.pos));
-            if coincident_start || (seg.weld_start && !all_verts.is_empty()) {
-                ordered.remove(0);
-            }
-            all_verts.extend(ordered);
+            append_fuse_vertices(&mut all_verts, ordered, seg.weld_start);
         }
 
         let closed = if all_verts
@@ -539,4 +532,41 @@ impl<'a> App<'a> {
         self.invalidate_geometry();
         self.invalidate_overlay();
     }
+}
+
+/// Reverse an open bulged polyline without changing its geometry. A bulge
+/// belongs to the segment starting at a vertex, so reversal both shifts it to
+/// the new segment start and negates its sweep direction.
+fn reverse_open_polyline(verts: &[PolyVertex]) -> Vec<PolyVertex> {
+    let n = verts.len();
+    (0..n)
+        .map(|i| {
+            let mut vertex = verts[n - 1 - i];
+            vertex.bulge = if i + 1 < n {
+                -verts[n - 2 - i].bulge
+            } else {
+                0.0
+            };
+            vertex
+        })
+        .collect()
+}
+
+fn append_fuse_vertices(
+    all_verts: &mut Vec<PolyVertex>,
+    mut ordered: Vec<PolyVertex>,
+    weld_start: bool,
+) {
+    let coincident_start = all_verts
+        .last()
+        .zip(ordered.first())
+        .is_some_and(|(a, b)| points_coincident(a.pos, b.pos));
+    if (coincident_start || weld_start) && !all_verts.is_empty() && !ordered.is_empty() {
+        // The removed join vertex owns the first outgoing arc of this source.
+        // Transfer it to the retained shared vertex before dropping it.
+        let outgoing_bulge = ordered[0].bulge;
+        all_verts.last_mut().expect("non-empty checked above").bulge = outgoing_bulge;
+        ordered.remove(0);
+    }
+    all_verts.extend(ordered);
 }

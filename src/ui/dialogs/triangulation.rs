@@ -22,7 +22,7 @@ use crate::{
 fn tri_reset_state(editor: &mut EditorState) {
     editor.tri_create_open = false;
     editor.tri_create_phase = TriCreatePhase::MainDialog;
-    editor.tri_create_source = TriCreateSource::Polygons;
+    editor.tri_create_source = TriCreateSource::Polylines;
     editor.tri_create_picker_px = None;
     editor.tri_hover_handles.clear();
     editor.tri_selected_object_ids.clear();
@@ -844,6 +844,11 @@ pub(crate) fn draw_include_solid_dialog(
                 .width(220.0)
                 .hint_text("e.g. topo_with_pit")
                 .show(ui);
+            MenuFieldBool::new(
+                "Save as two entities",
+                &mut editor.tri_include_solid_save_as_two,
+            )
+            .show(ui);
 
             ui.add_space(6.0);
             ui.separator();
@@ -865,6 +870,7 @@ pub(crate) fn draw_include_solid_dialog(
                         topology_id,
                         shape_id,
                         name: editor.tri_include_solid_name_input.trim().to_owned(),
+                        save_as_two: editor.tri_include_solid_save_as_two,
                     });
                 }
                 if ui.button("Cancel").clicked() {
@@ -969,21 +975,14 @@ pub(crate) fn draw_contour_dialog(
 
             let pidb_label = project
                 .projects
-                .get(editor.tri_contour_project_index)
-                .map(|p| p.name.as_str())
-                .unwrap_or("— select —");
-            MenuFieldCombo::new(
-                "contour_pidb",
-                "Store in",
-                &mut editor.tri_contour_project_index,
-                pidb_label,
-                project
-                    .projects
-                    .iter()
-                    .map(|project| (project.index, project.name.clone().into())),
-            )
-            .width(220.0)
-            .show(ui);
+                .iter()
+                .find(|entry| entry.is_active)
+                .map(|entry| entry.name.as_str())
+                .unwrap_or("No active PIDB");
+            ui.horizontal(|ui| {
+                ui.label("Store in");
+                ui.label(pidb_label);
+            });
 
             ui.add_space(6.0);
             ui.separator();
@@ -1004,7 +1003,7 @@ pub(crate) fn draw_contour_dialog(
             let can_run = editor.tri_contour_tri_id.is_some()
                 && valid_intervals
                 && valid_z_range
-                && !project.projects.is_empty();
+                && project.has_active_project;
 
             ui.horizontal(|ui| {
                 if ui
@@ -1018,7 +1017,6 @@ pub(crate) fn draw_contour_dialog(
                         minor_interval,
                         major_color: editor.tri_contour_major_color,
                         minor_color: editor.tri_contour_minor_color,
-                        project_index: editor.tri_contour_project_index,
                         z_range,
                     });
                 }

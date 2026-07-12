@@ -2,22 +2,126 @@
 
 use super::*;
 
+/// Hard ceiling for persistent design-point markers. Tool-specific vertex
+/// overlays are intentionally separate and remain complete. At two egui
+/// shapes per marker this bounds both projection work and UI tessellation.
+pub(crate) const SHOW_POINTS_DISPLAY_BUDGET: usize = 4_096;
+
+fn design_vertex_count(object: &Object) -> usize {
+    match object {
+        Object::Point { .. } => 1,
+        Object::Polyline { verts, .. } => verts.len(),
+        Object::Road { centerline, .. } => centerline.len(),
+        Object::Text { .. } => 0,
+    }
+}
+
+fn design_vertex_at(object: &Object, index: usize) -> Option<DVec3> {
+    match object {
+        Object::Point { pos, .. } => (index == 0).then_some(*pos),
+        Object::Polyline { verts, .. } => verts.get(index).map(|vertex| vertex.pos),
+        Object::Road { centerline, .. } => centerline.get(index).map(|vertex| vertex.pos),
+        Object::Text { .. } => None,
+    }
+}
+
+fn object_points_visible(
+    document: &Document,
+    object: &Object,
+    hidden: &std::collections::HashSet<SceneEntityId>,
+) -> bool {
+    document
+        .layer(object.layer())
+        .is_none_or(|layer| layer.visible)
+        && !hidden.contains(&SceneEntityId::Object(object.id()))
+}
+
+/// Visit a deterministic, evenly spaced LOD sample of visible design
+/// vertices without first collecting or projecting the complete document.
+/// Returns the number of visited source vertices.
+fn for_each_display_point(
+    document: &Document,
+    hidden: &std::collections::HashSet<SceneEntityId>,
+    budget: usize,
+    mut visit: impl FnMut(DVec3),
+) -> usize {
+    if budget == 0 {
+        return 0;
+    }
+    let total = document
+        .objects()
+        .iter()
+        .filter(|object| object_points_visible(document, object, hidden))
+        .fold(0usize, |total, object| {
+            total.saturating_add(design_vertex_count(object))
+        });
+    if total == 0 {
+        return 0;
+    }
+    let stride = total.div_ceil(budget).max(1);
+    let mut global_offset = 0usize;
+    let mut visited = 0usize;
+    for object in document
+        .objects()
+        .iter()
+        .filter(|object| object_points_visible(document, object, hidden))
+    {
+        let count = design_vertex_count(object);
+        let remainder = global_offset % stride;
+        let first = if remainder == 0 {
+            0
+        } else {
+            stride - remainder
+        };
+        for local_index in (first..count).step_by(stride) {
+            if let Some(point) = design_vertex_at(object, local_index) {
+                visit(point);
+                visited += 1;
+            }
+        }
+        global_offset = global_offset.saturating_add(count);
+    }
+    debug_assert!(visited <= budget);
+    visited
+}
+
 impl<'a> Graphics<'a> {
     pub(super) fn update_tool_projections(&self, editor: &mut EditorState, document: &Document) {
+        if editor.show_points {
+            let vp = self.view_proj();
+            let screen = self.screen_size();
+            editor.visible_points_screen_px.clear();
+            let hidden = &editor.hidden_handles;
+            let projected = &mut editor.visible_points_screen_px;
+            for_each_display_point(document, hidden, SHOW_POINTS_DISPLAY_BUDGET, |pos| {
+                if let Some(sp) = crate::rendering::pick::world_to_screen(&vp, pos, screen) {
+                    projected.push((sp.x as f32, sp.y as f32));
+                }
+            });
+        } else {
+            editor.visible_points_screen_px.clear();
+        }
+
         if editor.offset_awaiting_side_pick {
             let vp = self.view_proj();
             let screen = self.screen_size();
+            // One entry per source vertex: a clipped vertex must keep its
+            // slot so guide pairing and preview ranges stay index-aligned.
             editor.offset_source_screen_px = editor
                 .offset_source_world
                 .iter()
-                .filter_map(|&p| crate::rendering::pick::world_to_screen(&vp, p, screen))
-                .map(|sp| (sp.x as f32, sp.y as f32))
+                .map(|&p| {
+                    crate::rendering::pick::world_to_screen(&vp, p, screen)
+                        .map(|sp| (sp.x as f32, sp.y as f32))
+                })
                 .collect();
             editor.offset_preview_screen_px = editor
                 .offset_preview_world
                 .iter()
-                .filter_map(|&p| crate::rendering::pick::world_to_screen(&vp, p, screen))
-                .map(|sp| (sp.x as f32, sp.y as f32))
+                .map(|&p| {
+                    crate::rendering::pick::world_to_screen(&vp, p, screen)
+                        .map(|sp| (sp.x as f32, sp.y as f32))
+                })
                 .collect();
         } else {
             editor.offset_source_screen_px.clear();
@@ -214,7 +318,7 @@ impl<'a> Graphics<'a> {
                     ..
                 }) = document.get_object(oid)
                 {
-                    Some((verts.clone(), ci))
+                    (verts.len() >= 3 && ci < verts.len()).then(|| (verts.clone(), ci))
                 } else {
                     None
                 }
@@ -227,7 +331,7 @@ impl<'a> Graphics<'a> {
                 let chamfered =
                     chamfer_corner(verts, ci, editor.chamfer_radius, editor.chamfer_segments);
                 editor.chamfer_preview_screen_px =
-                    chamfered.iter().filter_map(|v| project(v.pos)).collect();
+                    chamfered.iter().map(|v| project(v.pos)).collect();
                 editor.chamfer_hover_corner_px = None;
 
                 let n = verts.len();
@@ -310,9 +414,12 @@ impl<'a> Graphics<'a> {
                     let n = verts.len();
 
                     editor.bezier_poly_verts_screen_px =
-                        verts.iter().filter_map(|v| project(v.pos)).collect();
+                        verts.iter().map(|v| project(v.pos)).collect();
 
-                    if let [Some(vi), Some(vj)] = editor.bezier_selected_verts {
+                    if let [Some(vi), Some(vj)] = editor.bezier_selected_verts
+                        && vi < n
+                        && vj < n
+                    {
                         let cp1 = DVec3::from(editor.bezier_cp1);
                         let cp2 = DVec3::from(editor.bezier_cp2);
                         editor.bezier_cp1_screen_px = project(cp1);
@@ -333,7 +440,7 @@ impl<'a> Graphics<'a> {
                             }
                         }
                         editor.bezier_preview_screen_px =
-                            preview.iter().filter_map(|&p| project(p)).collect();
+                            preview.iter().map(|&p| project(p)).collect();
                     } else {
                         editor.bezier_cp1_screen_px = None;
                         editor.bezier_cp2_screen_px = None;
@@ -372,8 +479,10 @@ impl<'a> Graphics<'a> {
                 {
                     editor.split_poly_verts_screen_px = verts
                         .iter()
-                        .filter_map(|v| crate::rendering::pick::world_to_screen(&vp, v.pos, screen))
-                        .map(|sp| (sp.x as f32, sp.y as f32))
+                        .map(|v| {
+                            crate::rendering::pick::world_to_screen(&vp, v.pos, screen)
+                                .map(|sp| (sp.x as f32, sp.y as f32))
+                        })
                         .collect();
                 } else {
                     editor.split_poly_verts_screen_px.clear();

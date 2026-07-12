@@ -26,6 +26,13 @@ const MAX_BLOCK_DEPTH: usize = 32;
 const TESSELLATION_SEGMENT_LEN: f64 = 0.15;
 const MIN_TESSELLATION_SEGMENTS: usize = 32;
 const MAX_TESSELLATION_SEGMENTS: usize = 4096;
+/// Total INSERT/MINSERT instances one import may expand. Nested blocks and
+/// large row/column grids multiply, so a small file could otherwise expand
+/// into billions of entities.
+const MAX_EXPANDED_INSERT_INSTANCES: usize = 65_536;
+/// Total polyline vertices one import may generate before further geometry
+/// is dropped with a warning.
+const MAX_GENERATED_VERTICES: usize = 50_000_000;
 
 /// Build a `Document` from a loaded DXF drawing.
 pub(crate) fn from_dxf(drawing: &Drawing) -> Document {
@@ -55,6 +62,9 @@ pub(crate) fn from_dxf(drawing: &Drawing) -> Document {
         stack: Vec::new(),
         unknown_layer_ids: HashMap::new(),
         next_unknown_layer_index: 0,
+        expanded_insert_instances: 0,
+        generated_vertices: 0,
+        budget_warning_emitted: false,
     };
     let transform = Transform::identity();
     let scope = BlockScope::world();
@@ -71,6 +81,7 @@ pub(crate) fn from_dxf(drawing: &Drawing) -> Document {
         doc.delete_layer(zero_id);
     }
 
+    doc.repair_degenerate_closed_polylines();
     doc
 }
 
@@ -81,6 +92,9 @@ struct ImportCtx<'a> {
     stack: Vec<String>,
     unknown_layer_ids: HashMap<String, LayerId>,
     next_unknown_layer_index: usize,
+    expanded_insert_instances: usize,
+    generated_vertices: usize,
+    budget_warning_emitted: bool,
 }
 
 /// Inherited colour/layer while rendering the contents of a block.
@@ -97,6 +111,50 @@ impl<'a> BlockScope<'a> {
 }
 
 impl ImportCtx<'_> {
+    /// Reserve `amount` against a running budget. Returns false (and warns
+    /// once) when the budget would be exceeded; the caller must then skip the
+    /// geometry instead of expanding it.
+    fn reserve_budget(
+        counter: &mut usize,
+        limit: usize,
+        amount: usize,
+        warned: &mut bool,
+        what: &str,
+    ) -> bool {
+        let requested = counter.saturating_add(amount);
+        if requested > limit {
+            if !*warned {
+                *warned = true;
+                userspace_warn!(
+                    "DXF import exceeds the {what} budget ({limit}); remaining geometry is skipped"
+                );
+            }
+            return false;
+        }
+        *counter = requested;
+        true
+    }
+
+    fn reserve_insert_instances(&mut self, amount: usize) -> bool {
+        Self::reserve_budget(
+            &mut self.expanded_insert_instances,
+            MAX_EXPANDED_INSERT_INSTANCES,
+            amount,
+            &mut self.budget_warning_emitted,
+            "block-instance",
+        )
+    }
+
+    fn reserve_vertices(&mut self, amount: usize) -> bool {
+        Self::reserve_budget(
+            &mut self.generated_vertices,
+            MAX_GENERATED_VERTICES,
+            amount,
+            &mut self.budget_warning_emitted,
+            "generated-vertex",
+        )
+    }
+
     fn layer_id(&mut self, name: &str) -> LayerId {
         if let Some(id) = self
             .layer_ids
@@ -124,9 +182,32 @@ impl ImportCtx<'_> {
     }
 }
 
-fn resolve_color(entity: &Entity, block_color: Option<u8>) -> ObjectColor {
+fn resolve_color(
+    entity: &Entity,
+    block_color: Option<u8>,
+    layer_color: Option<[f32; 4]>,
+) -> ObjectColor {
+    let explicit_alpha = dxf_entity_alpha(entity.common.transparency);
+    if entity.common.color_24_bit != 0 {
+        let rgb = entity.common.color_24_bit as u32;
+        let mut rgba = crate::rendering::color::rgb_bytes_to_linear_rgba([
+            ((rgb >> 16) & 0xff) as u8,
+            ((rgb >> 8) & 0xff) as u8,
+            (rgb & 0xff) as u8,
+        ]);
+        if let Some(alpha) = explicit_alpha {
+            rgba[3] = alpha;
+        }
+        return ObjectColor::Fixed(rgba);
+    }
     let color = &entity.common.color;
     let aci = if color.is_by_layer() {
+        if let Some(alpha) = explicit_alpha
+            && let Some(mut rgba) = layer_color
+        {
+            rgba[3] = alpha;
+            return ObjectColor::Fixed(rgba);
+        }
         return ObjectColor::ByLayer;
     } else if color.is_by_block() {
         block_color
@@ -134,9 +215,21 @@ fn resolve_color(entity: &Entity, block_color: Option<u8>) -> ObjectColor {
         color.index()
     };
     match aci.and_then(|index| aci_to_linear_rgba(index as i32)) {
-        Some(rgba) => ObjectColor::Fixed(rgba),
+        Some(mut rgba) => {
+            if let Some(alpha) = explicit_alpha {
+                rgba[3] = alpha;
+            }
+            ObjectColor::Fixed(rgba)
+        }
         None => ObjectColor::ByLayer,
     }
+}
+
+fn dxf_entity_alpha(raw: i32) -> Option<f32> {
+    let raw = raw as u32;
+    // 0 means no explicit transparency. Method byte 0x02 carries a direct
+    // alpha value in the low byte (0 transparent, 255 opaque).
+    ((raw & 0xff00_0000) == 0x0200_0000).then(|| (raw & 0xff) as f32 / 255.0)
 }
 
 fn import_entities<'e>(
@@ -155,7 +248,11 @@ fn import_entities<'e>(
             entity.common.layer.as_str()
         };
         let layer = ctx.layer_id(effective_layer);
-        let color = resolve_color(entity, scope.color);
+        let color = resolve_color(
+            entity,
+            scope.color,
+            ctx.doc.layer(layer).map(|layer| layer.color),
+        );
 
         match &entity.specific {
             EntityType::Line(line) => {
@@ -167,6 +264,14 @@ fn import_entities<'e>(
             }
             EntityType::LwPolyline(poly) => {
                 let elevation = entity.common.elevation;
+                let mut entity_transform = transform.clone();
+                entity_transform.push_with_affine(
+                    DVec3::ZERO,
+                    DVec3::ZERO,
+                    0.0,
+                    DVec3::ONE,
+                    ocs_to_wcs_affine(&poly.extrusion_direction),
+                );
                 let verts: Vec<PolyVertex> = poly
                     .vertices
                     .iter()
@@ -181,29 +286,45 @@ fn import_entities<'e>(
                         layer,
                         verts,
                         poly.is_closed(),
-                        normalize_or_z(vector_to_dvec3(&poly.extrusion_direction)),
-                        transform,
+                        DVec3::Z,
+                        &entity_transform,
                         color,
                     );
                 }
             }
             EntityType::Arc(arc) => {
+                let mut entity_transform = transform.clone();
+                entity_transform.push_with_affine(
+                    DVec3::ZERO,
+                    DVec3::ZERO,
+                    0.0,
+                    DVec3::ONE,
+                    ocs_to_wcs_affine(&arc.normal),
+                );
                 let verts = arc_to_verts(
                     point_to_dvec3(&arc.center),
                     arc.radius,
-                    normalize_or_z(vector_to_dvec3(&arc.normal)),
+                    DVec3::Z,
                     arc.start_angle.to_radians(),
                     arc.end_angle.to_radians(),
-                    transform,
+                    &entity_transform,
                 );
                 push_polyline(ctx, layer, verts, false, color);
             }
             EntityType::Circle(circle) => {
+                let mut entity_transform = transform.clone();
+                entity_transform.push_with_affine(
+                    DVec3::ZERO,
+                    DVec3::ZERO,
+                    0.0,
+                    DVec3::ONE,
+                    ocs_to_wcs_affine(&circle.normal),
+                );
                 let (verts, closed) = circle_to_verts(
                     point_to_dvec3(&circle.center),
                     circle.radius,
-                    normalize_or_z(vector_to_dvec3(&circle.normal)),
-                    transform,
+                    DVec3::Z,
+                    &entity_transform,
                 );
                 push_polyline(ctx, layer, verts, closed, color);
             }
@@ -220,17 +341,8 @@ fn import_entities<'e>(
                 }
             }
             EntityType::Spline(spline) => {
-                // v1: approximate with fit points (on-curve) or control points.
-                let source = if spline.fit_points.len() >= 2 {
-                    &spline.fit_points
-                } else {
-                    &spline.control_points
-                };
-                if source.len() >= 2 {
-                    let verts = source
-                        .iter()
-                        .map(|p| PolyVertex::straight(transform.apply(point_to_dvec3(p))))
-                        .collect();
+                let verts = spline_to_verts(spline, transform);
+                if verts.len() >= 2 {
                     push_polyline(ctx, layer, verts, spline.is_closed(), color);
                 }
             }
@@ -265,32 +377,31 @@ fn import_entities<'e>(
             }
             EntityType::Text(text) => {
                 let pos = transform.apply(point_to_dvec3(&text.location));
+                let (height, rotation) =
+                    transformed_text_style(transform, text.text_height, text.rotation.to_radians());
                 push_text(
                     ctx,
                     layer,
                     pos,
                     plain_text(&text.value),
-                    text.text_height,
-                    text.rotation.to_radians(),
+                    height,
+                    rotation,
                     color,
                 );
             }
             EntityType::MText(mtext) => {
                 let pos = transform.apply(point_to_dvec3(&mtext.insertion_point));
+                let (height, rotation) = transformed_text_style(
+                    transform,
+                    mtext.initial_text_height,
+                    mtext.rotation_angle.to_radians(),
+                );
                 let mut raw = String::new();
                 for chunk in &mtext.extended_text {
                     raw.push_str(chunk);
                 }
                 raw.push_str(&mtext.text);
-                push_text(
-                    ctx,
-                    layer,
-                    pos,
-                    plain_mtext(&raw),
-                    mtext.initial_text_height,
-                    mtext.rotation_angle.to_radians(),
-                    color,
-                );
+                push_text(ctx, layer, pos, plain_mtext(&raw), height, rotation, color);
             }
             EntityType::Polyline(poly) => {
                 // Skip polygon meshes and polyface meshes; only import 2D/3D polylines.
@@ -299,6 +410,16 @@ fn import_entities<'e>(
                 }
                 let is_3d = poly.is_3d_polyline();
                 let elevation = poly.location.z;
+                let mut entity_transform = transform.clone();
+                if !is_3d {
+                    entity_transform.push_with_affine(
+                        DVec3::ZERO,
+                        DVec3::ZERO,
+                        0.0,
+                        DVec3::ONE,
+                        ocs_to_wcs_affine(&poly.normal),
+                    );
+                }
                 let verts: Vec<PolyVertex> = poly
                     .vertices()
                     .filter(|v| {
@@ -322,8 +443,8 @@ fn import_entities<'e>(
                         layer,
                         verts,
                         poly.is_closed(),
-                        normalize_or_z(vector_to_dvec3(&poly.normal)),
-                        transform,
+                        DVec3::Z,
+                        &entity_transform,
                         color,
                     );
                 }
@@ -373,6 +494,13 @@ fn import_insert(
         entity.common.layer.clone()
     };
 
+    let rows = usize::try_from(insert.row_count.max(1)).unwrap_or(1);
+    let columns = usize::try_from(insert.column_count.max(1)).unwrap_or(1);
+    let instances = rows.saturating_mul(columns);
+    if !ctx.reserve_insert_instances(instances) {
+        return;
+    }
+
     let base_point = point_to_dvec3(&block.base_point);
     let location = point_to_dvec3(&insert.location);
     let rotation = insert.rotation.to_radians();
@@ -397,7 +525,7 @@ fn import_insert(
                 row as f64 * insert.row_spacing,
                 0.0,
             );
-            local.push(offset, DVec3::ZERO, 0.0, DVec3::ONE);
+            local.push(DVec3::ZERO, offset, 0.0, DVec3::ONE);
             import_entities(block.entities.iter(), ctx, &local, child_scope);
             local.pop();
         }
@@ -413,6 +541,9 @@ fn push_polyline(
     color: ObjectColor,
 ) {
     if verts.len() < 2 {
+        return;
+    }
+    if !ctx.reserve_vertices(verts.len()) {
         return;
     }
     ctx.doc.add_object(|id| Object::Polyline {
@@ -516,13 +647,233 @@ fn push_text(
     });
 }
 
-/// Normalise an arc sweep into `(0, TAU]`.
-fn normalize_sweep(start: f64, end: f64) -> f64 {
-    let mut sweep = end - start;
-    while sweep <= 0.0 {
-        sweep += std::f64::consts::TAU;
+fn transformed_text_style(transform: &Transform, height: f64, rotation: f64) -> (f64, f64) {
+    let matrix = transform.matrix();
+    let baseline = matrix.transform_vector3(DVec3::new(rotation.cos(), rotation.sin(), 0.0));
+    let up = matrix.transform_vector3(DVec3::new(-rotation.sin(), rotation.cos(), 0.0));
+    let transformed_height = height * up.length();
+    let transformed_rotation = if baseline.x.abs() + baseline.y.abs() <= f64::EPSILON {
+        rotation
+    } else {
+        baseline.y.atan2(baseline.x)
+    };
+    (transformed_height.abs(), transformed_rotation)
+}
+
+fn spline_to_verts(spline: &dxf::entities::Spline, transform: &Transform) -> Vec<PolyVertex> {
+    if spline.control_points.len() >= 2 {
+        return nurbs_spline_to_verts(spline, transform);
     }
-    sweep
+    fit_spline_to_verts(spline, transform)
+}
+
+fn nurbs_spline_to_verts(spline: &dxf::entities::Spline, transform: &Transform) -> Vec<PolyVertex> {
+    let control_points: Vec<DVec3> = spline.control_points.iter().map(point_to_dvec3).collect();
+    if control_points.iter().any(|point| !point.is_finite()) {
+        return Vec::new();
+    }
+    let count = control_points.len();
+    let degree = usize::try_from(spline.degree_of_curve)
+        .unwrap_or(1)
+        .clamp(1, count - 1);
+    let expected_knots = count + degree + 1;
+    let valid_knots = spline.knot_values.len() >= expected_knots
+        && spline.knot_values.iter().all(|value| value.is_finite())
+        && spline.knot_values.windows(2).all(|pair| pair[0] <= pair[1]);
+    let knots = if valid_knots {
+        spline.knot_values[..expected_knots].to_vec()
+    } else {
+        open_uniform_knots(count, degree)
+    };
+    let start = knots[degree];
+    let end = knots[count];
+    if !start.is_finite() || !end.is_finite() || end <= start {
+        return Vec::new();
+    }
+    let weights: Vec<f64> = if spline.weight_values.len() >= count
+        && spline
+            .weight_values
+            .iter()
+            .take(count)
+            .all(|weight| weight.is_finite() && *weight > 0.0)
+    {
+        spline.weight_values[..count].to_vec()
+    } else {
+        vec![1.0; count]
+    };
+    let segments = curve_segment_count(&control_points);
+    let sample_count = if spline.is_closed() {
+        segments
+    } else {
+        segments + 1
+    };
+    (0..sample_count)
+        .filter_map(|sample| {
+            let t = sample as f64 / segments as f64;
+            let parameter = if sample == segments {
+                end
+            } else {
+                start + (end - start) * t
+            };
+            de_boor_point(&control_points, &weights, &knots, degree, parameter)
+                .filter(|point| point.is_finite())
+                .map(|point| PolyVertex::straight(transform.apply(point)))
+        })
+        .collect()
+}
+
+fn open_uniform_knots(control_count: usize, degree: usize) -> Vec<f64> {
+    let knot_count = control_count + degree + 1;
+    let interior = control_count.saturating_sub(degree);
+    (0..knot_count)
+        .map(|index| {
+            if index <= degree {
+                0.0
+            } else if index >= control_count {
+                1.0
+            } else {
+                (index - degree) as f64 / interior as f64
+            }
+        })
+        .collect()
+}
+
+fn de_boor_point(
+    control_points: &[DVec3],
+    weights: &[f64],
+    knots: &[f64],
+    degree: usize,
+    parameter: f64,
+) -> Option<DVec3> {
+    let count = control_points.len();
+    let span = if parameter >= knots[count] {
+        count - 1
+    } else {
+        (degree..count).find(|&index| parameter < knots[index + 1])?
+    };
+    let mut work = Vec::with_capacity(degree + 1);
+    for local in 0..=degree {
+        let index = span - degree + local;
+        let weight = weights[index];
+        work.push(DVec4::new(
+            control_points[index].x * weight,
+            control_points[index].y * weight,
+            control_points[index].z * weight,
+            weight,
+        ));
+    }
+    for level in 1..=degree {
+        for local in (level..=degree).rev() {
+            let index = span - degree + local;
+            let denominator = knots[index + degree - level + 1] - knots[index];
+            let alpha = if denominator.abs() <= f64::EPSILON {
+                0.0
+            } else {
+                ((parameter - knots[index]) / denominator).clamp(0.0, 1.0)
+            };
+            work[local] = work[local - 1].lerp(work[local], alpha);
+        }
+    }
+    let point = work[degree];
+    (point.w.abs() > f64::EPSILON).then(|| point.truncate() / point.w)
+}
+
+fn fit_spline_to_verts(spline: &dxf::entities::Spline, transform: &Transform) -> Vec<PolyVertex> {
+    let points: Vec<DVec3> = spline.fit_points.iter().map(point_to_dvec3).collect();
+    let supplied_start_tangent = point_to_dvec3(&spline.start_tangent);
+    let supplied_end_tangent = point_to_dvec3(&spline.end_tangent);
+    if points.len() < 2
+        || points.iter().any(|point| !point.is_finite())
+        || !supplied_start_tangent.is_finite()
+        || !supplied_end_tangent.is_finite()
+    {
+        return Vec::new();
+    }
+    let closed = spline.is_closed();
+    let edge_count = if closed {
+        points.len()
+    } else {
+        points.len() - 1
+    };
+    let mut result = Vec::new();
+    for index in 0..edge_count {
+        let next = (index + 1) % points.len();
+        let previous = if index == 0 {
+            if closed { points.len() - 1 } else { 0 }
+        } else {
+            index - 1
+        };
+        let after_next = if next + 1 < points.len() {
+            next + 1
+        } else if closed {
+            0
+        } else {
+            next
+        };
+        let mut tangent_start = (points[next] - points[previous]) * 0.5;
+        let mut tangent_end = (points[after_next] - points[index]) * 0.5;
+        if index == 0 {
+            let supplied = supplied_start_tangent;
+            if supplied.length_squared() > f64::EPSILON {
+                tangent_start = supplied;
+            }
+        }
+        if !closed && next == points.len() - 1 {
+            let supplied = supplied_end_tangent;
+            if supplied.length_squared() > f64::EPSILON {
+                tangent_end = supplied;
+            }
+        }
+        let subsegments =
+            ((points[next] - points[index]).length() / TESSELLATION_SEGMENT_LEN).ceil() as usize;
+        // Share the global tessellation budget across all edges. With many
+        // fit points the per-edge budget can fall below the preferred minimum
+        // of 2; degrade to one sample per edge instead of constructing an
+        // invalid clamp range.
+        let per_edge_budget = (MAX_TESSELLATION_SEGMENTS / edge_count).max(1);
+        let subsegments = subsegments.max(2).min(per_edge_budget).max(1);
+        for sample in 0..subsegments {
+            let t = sample as f64 / subsegments as f64;
+            let t2 = t * t;
+            let t3 = t2 * t;
+            let point = (2.0 * t3 - 3.0 * t2 + 1.0) * points[index]
+                + (t3 - 2.0 * t2 + t) * tangent_start
+                + (-2.0 * t3 + 3.0 * t2) * points[next]
+                + (t3 - t2) * tangent_end;
+            result.push(PolyVertex::straight(transform.apply(point)));
+        }
+    }
+    if !closed {
+        result.push(PolyVertex::straight(
+            transform.apply(*points.last().unwrap_or(&points[0])),
+        ));
+    }
+    result
+}
+
+fn curve_segment_count(points: &[DVec3]) -> usize {
+    let length: f64 = points
+        .windows(2)
+        .map(|pair| pair[0].distance(pair[1]))
+        .sum();
+    ((length / TESSELLATION_SEGMENT_LEN).ceil() as usize)
+        .clamp(MIN_TESSELLATION_SEGMENTS, MAX_TESSELLATION_SEGMENTS)
+}
+
+/// Normalise an arc sweep into `(0, TAU]`. Returns 0 for non-finite input so
+/// callers can reject the arc instead of looping or producing NaN geometry.
+fn normalize_sweep(start: f64, end: f64) -> f64 {
+    let span = end - start;
+    if !span.is_finite() {
+        return 0.0;
+    }
+    let sweep = span.rem_euclid(std::f64::consts::TAU);
+    // Coincident or exactly TAU-separated endpoints mean a full circle.
+    if sweep <= 0.0 {
+        std::f64::consts::TAU
+    } else {
+        sweep
+    }
 }
 
 /// An arc in the XY plane becomes one bulged segment; otherwise it is
@@ -535,7 +886,18 @@ fn arc_to_verts(
     end: f64,
     transform: &Transform,
 ) -> Vec<PolyVertex> {
+    if !(center.is_finite()
+        && radius.is_finite()
+        && radius > 0.0
+        && start.is_finite()
+        && end.is_finite())
+    {
+        return Vec::new();
+    }
     let sweep = normalize_sweep(start, end);
+    if sweep <= 0.0 {
+        return Vec::new();
+    }
     if let Some(sign) = xy_bulge_transform_sign(transform, normal) {
         let start_pos = center + radius * DVec3::new(start.cos(), start.sin(), 0.0);
         let end_pos = center + radius * DVec3::new(end.cos(), end.sin(), 0.0);
@@ -610,6 +972,9 @@ fn ellipse_to_verts(ell: &dxf::entities::Ellipse, transform: &Transform) -> Vec<
     let b = a * ell.minor_axis_ratio;
     let start = ell.start_parameter;
     let end = ell.end_parameter;
+    if !(center.is_finite() && start.is_finite() && end.is_finite() && b.is_finite()) {
+        return Vec::new();
+    }
     let sweep = if ellipse_is_full_loop(start, end) {
         std::f64::consts::TAU
     } else {

@@ -4,6 +4,8 @@ pub(crate) mod file; // Handles importing, exportings, etc. commands
 pub(crate) mod layer; // Handles creating layers, deleting layers, etc. commands
 pub(crate) mod point_cloud; // Handles importing/loading point clouds, etc. commands
 pub(crate) mod property; // Handles changing colors, fills, etc. commands
+pub(crate) mod raster; // Handles georeferenced image textures.
+pub(crate) mod slice; // Handles the vertical slice view mode.
 pub(crate) mod text; // Handles text editing commands
 pub(crate) mod triangulation; // Handles loading meshes, deleting meshes, etc. commands
 pub(crate) mod view; /* Handles resetting camera view, , etc. commands */
@@ -15,6 +17,16 @@ use crate::{app::App, userspace_warn};
 
 impl<'a> App<'a> {
     pub(crate) fn apply_history_step(&mut self, undo: bool) {
+        if self.has_pending_move_delta() {
+            self.cancel_move_delta();
+        }
+        let layers_before: std::collections::HashSet<_> = self
+            .workspace
+            .active_project()
+            .into_iter()
+            .flat_map(|project| project.pidb.document.layers())
+            .map(|layer| layer.id)
+            .collect();
         let changed = self.workspace.active_project_mut().is_some_and(|project| {
             if undo {
                 self.history.undo(&mut project.pidb.document)
@@ -25,7 +37,21 @@ impl<'a> App<'a> {
         if !changed {
             return;
         }
-        self.refresh_active_project_dirty();
+        if let Some(project) = self.workspace.active_project_mut() {
+            let layers_after: std::collections::HashSet<_> = project
+                .pidb
+                .document
+                .layers()
+                .iter()
+                .map(|layer| layer.id)
+                .collect();
+            project
+                .loaded_layers
+                .retain(|layer_id| layers_after.contains(layer_id));
+            project
+                .loaded_layers
+                .extend(layers_after.difference(&layers_before).copied());
+        }
         if self
             .editor
             .active_layer
@@ -36,6 +62,8 @@ impl<'a> App<'a> {
         self.editor.selected_handles.clear();
         self.editor.canvas_context_menu_open = false;
         self.cancel_fuse();
+        self.cancel_chamfer();
+        self.clear_bezier_state();
         self.invalidate_geometry();
     }
 
@@ -47,9 +75,6 @@ impl<'a> App<'a> {
                 userspace_warn!("Command failed: {message}");
             }
         }
-        // A "Save and Unload" may have cleaned a project that still has other
-        // layers queued for confirmation; unload those without re-prompting.
-        self.drain_clean_unload_queue();
         if had_commands {
             self.redraw_requested = true;
         }
@@ -67,6 +92,10 @@ impl<'a> App<'a> {
                 self.set_fly_mode_enabled(enabled);
                 Ok(())
             }
+            UiCommand::SetSliceModeEnabled(enabled) => {
+                self.set_slice_mode_enabled(enabled);
+                Ok(())
+            }
             UiCommand::NewPidb => {
                 self.choose_new_pidb();
                 Ok(())
@@ -82,18 +111,39 @@ impl<'a> App<'a> {
                 self.startup_dialog_dismissed = true;
                 Ok(())
             }
-            UiCommand::SaveAllPidbs => self.save_all_dirty_projects().map(|_| ()),
             UiCommand::ImportAsPidbPaths(kind, paths) => {
                 self.choose_import_as_pidb_paths(kind, paths);
                 Ok(())
             }
-            UiCommand::ImportDxfPathsInto(index, paths) => self.import_dxf_paths_into(index, paths),
+            UiCommand::ImportDxfPathsInto(paths) => self.import_dxf_paths_into(paths),
             UiCommand::ImportTriangulationPaths(paths) => self.execute_file_dialog_action(
                 crate::app::commands::file::FileDialogAction::ImportTriangulation(paths),
             ),
             UiCommand::ImportPointCloudPaths(paths) => self.execute_file_dialog_action(
                 crate::app::commands::file::FileDialogAction::ImportPointCloud(paths),
             ),
+            UiCommand::ImportRasterPaths(paths) => self.execute_file_dialog_action(
+                crate::app::commands::file::FileDialogAction::ImportRaster(paths),
+            ),
+            UiCommand::LoadRaster(path) => {
+                self.open_raster_path(path);
+                Ok(())
+            }
+            UiCommand::UnloadRaster(path) => {
+                self.unload_raster(&path);
+                Ok(())
+            }
+            UiCommand::RemoveRaster(path) => {
+                self.remove_raster(&path);
+                Ok(())
+            }
+            UiCommand::RevealRaster(path) => self.reveal_in_file_manager(&path),
+            UiCommand::DrapeRaster(path) => self.drape_raster_over_surfaces(&path),
+            UiCommand::UndrapeRaster(path) => {
+                self.undrape_raster(&path);
+                Ok(())
+            }
+            UiCommand::ClearActiveTriangulationRaster => self.clear_active_triangulation_raster(),
             UiCommand::LoadPointCloud(path) => {
                 self.open_point_cloud_path(path);
                 Ok(())
@@ -132,16 +182,20 @@ impl<'a> App<'a> {
                 self.choose_open_triangulation_folder();
                 Ok(())
             }
-            UiCommand::ExportPidbDxf(index) => {
-                self.choose_export_pidb_dxf(index);
+            UiCommand::ExportPidbDxf => {
+                self.choose_export_pidb_dxf();
                 Ok(())
             }
-            UiCommand::ExportPidbCopy(index) => {
-                self.choose_export_pidb_copy(index);
+            UiCommand::ExportPidbCopy => {
+                self.choose_export_pidb_copy();
                 Ok(())
             }
-            UiCommand::ExportLayerDxf(index, layer) => {
-                self.choose_export_layer_dxf(index, layer);
+            UiCommand::ExportViewportImage => {
+                self.spawn_export_viewport_image_dialog();
+                Ok(())
+            }
+            UiCommand::ExportLayerDxf(layer) => {
+                self.choose_export_layer_dxf(layer);
                 Ok(())
             }
             UiCommand::ExportTriangulationAs(id, format) => {
@@ -158,7 +212,7 @@ impl<'a> App<'a> {
             }
             UiCommand::RevealTriangulation(id) => self.reveal_triangulation(id),
             UiCommand::RevealBlockModel(id) => self.reveal_block_model(id),
-            UiCommand::RevealPidb(index) => self.reveal_pidb(index),
+            UiCommand::RevealPidb(path) => self.reveal_pidb(&path),
             UiCommand::RevealAllTriangulations => {
                 for tri in &mut self.triangulations {
                     tri.visible = true;
@@ -176,72 +230,63 @@ impl<'a> App<'a> {
                 self.cancel_exit_request();
                 Ok(())
             }
-            UiCommand::CreateLayer {
-                project_index,
-                name,
-            } => self.create_layer(project_index, name),
-            UiCommand::RequestDeleteLayer(project_index, layer_id) => {
+            UiCommand::CreateLayer { name } => self.create_layer(name),
+            UiCommand::RequestDeleteLayer(layer_id) => {
+                self.activate_project_for_layer(layer_id);
                 let layer_name = self
                     .workspace
-                    .projects
-                    .get(project_index)
+                    .active_project()
                     .and_then(|project| project.pidb.document.layer(layer_id))
                     .map(|layer| layer.name.clone());
-                self.editor.pending_delete_layer =
-                    layer_name.map(|name| (project_index, layer_id, name));
+                self.editor.pending_delete_layer = layer_name.map(|name| (layer_id, name));
                 Ok(())
             }
-            UiCommand::DeleteLayer(project_index, layer_id) => {
-                self.delete_layer(project_index, layer_id)
+            UiCommand::DeleteLayer(layer_id) => {
+                self.activate_project_for_layer(layer_id);
+                self.delete_layer(layer_id)
             }
-            UiCommand::DuplicateLayer(project_index, layer_id) => {
-                self.duplicate_layer(project_index, layer_id);
+            UiCommand::DuplicateLayer(layer_id) => {
+                self.activate_project_for_layer(layer_id);
+                self.duplicate_layer(layer_id);
                 Ok(())
             }
-            UiCommand::BeginMoveLayer(project_index, layer_id) => {
-                let target_project_index = self
+            UiCommand::BeginMoveLayer(layer_id) => {
+                self.activate_project_for_layer(layer_id);
+                let source_id = self
+                    .workspace
+                    .active_project()
+                    .map(|project| project.runtime_id);
+                let target_project = self
                     .workspace
                     .projects
                     .iter()
-                    .enumerate()
-                    .find(|(index, _)| *index != project_index)
-                    .map(|(index, _)| index);
+                    .map(|project| project.runtime_id)
+                    .find(|runtime_id| Some(*runtime_id) != source_id);
                 self.editor.move_layer_dialog = Some(MoveLayerDialog {
-                    source_project_index: project_index,
                     layer_id,
-                    target_project_index,
+                    target_project,
                 });
                 Ok(())
             }
-            UiCommand::MoveLayerToProject {
-                source_project_index,
+            UiCommand::MoveLayerToPidb {
                 layer_id,
-                target_project_index,
-            } => {
-                self.move_layer_to_project(source_project_index, layer_id, target_project_index);
-                Ok(())
-            }
-            UiCommand::BeginRenameLayer(project_index, layer_id) => {
+                target_project,
+            } => self.move_layer_to_pidb(layer_id, target_project),
+            UiCommand::BeginRenameLayer(layer_id) => {
+                self.activate_project_for_layer(layer_id);
                 let current_name = self
                     .workspace
-                    .projects
-                    .get(project_index)
+                    .active_project()
                     .and_then(|p| p.pidb.document.layer(layer_id))
                     .map(|l| l.name.clone())
                     .unwrap_or_default();
-                self.editor.renaming_layer = Some((project_index, layer_id, current_name));
+                self.editor.renaming_layer = Some((layer_id, current_name));
                 Ok(())
             }
-            UiCommand::RenameLayer {
-                project_index,
-                layer_id,
-                new_name,
-            } => {
-                let Some((before, is_loaded)) = self
-                    .workspace
-                    .projects
-                    .get(project_index)
-                    .and_then(|project| {
+            UiCommand::RenameLayer { layer_id, new_name } => {
+                self.activate_project_for_layer(layer_id);
+                let Some((before, is_loaded)) =
+                    self.workspace.active_project().and_then(|project| {
                         project.pidb.document.layer(layer_id).map(|layer| {
                             (
                                 layer.name.clone(),
@@ -254,15 +299,9 @@ impl<'a> App<'a> {
                     return Ok(());
                 };
                 if before != new_name {
-                    let mut save_unloaded_rename = false;
-                    if self.workspace.active_index != Some(project_index) && is_loaded {
-                        self.history.clear();
-                        self.workspace.set_active_index(project_index);
-                        self.editor.selected_handles.clear();
-                    }
                     if is_loaded {
                         self.editor.active_layer = Some(layer_id);
-                        if let Some(project) = self.workspace.projects.get_mut(project_index) {
+                        if let Some(project) = self.workspace.active_project_mut() {
                             self.history.execute(
                                 &mut project.pidb.document,
                                 crate::model::Command::RenameLayer {
@@ -277,58 +316,51 @@ impl<'a> App<'a> {
                         if self.editor.active_layer == Some(layer_id) {
                             self.editor.active_layer = None;
                         }
-                        if let Some(project) = self.workspace.projects.get_mut(project_index) {
+                        if let Some(project) = self.workspace.active_project_mut() {
                             project.pidb.document.rename_layer(layer_id, new_name);
-                            project.invalidate_dirty_layers();
-                            save_unloaded_rename = project.path.is_some();
                         }
-                    }
-                    if save_unloaded_rename {
-                        self.save_project_layer(project_index, layer_id)?;
                     }
                 }
                 self.editor.renaming_layer = None;
                 Ok(())
             }
-            UiCommand::LoadLayer(project, layer) => {
-                self.load_layer(project, layer);
+            UiCommand::LoadLayer(layer) => {
+                self.load_layer(layer);
                 Ok(())
             }
-            UiCommand::UnloadLayer(project, layer) => {
-                self.try_unload_layer(project, layer);
+            UiCommand::UnloadLayer(layer) => {
+                self.unload_layer(layer);
                 Ok(())
             }
-            UiCommand::SelectAllObjectsInLayer(project, layer) => {
-                self.select_all_objects_in_layer(project, layer);
+            UiCommand::SelectAllObjectsInLayer(layer) => {
+                self.activate_project_for_layer(layer);
+                self.select_all_objects_in_layer(layer);
                 Ok(())
             }
-            UiCommand::UnloadLayerConfirmed(project, layer) => {
-                self.unload_layer_discarding_changes(project, layer);
+            UiCommand::LoadAllLayers(runtime_id) => {
+                self.load_all_layers(runtime_id);
                 Ok(())
             }
-            UiCommand::SaveAndUnloadLayer(project, layer) => {
-                self.save_and_unload_layer(project, layer)
-            }
-            UiCommand::LoadAllLayersInProject(index) => {
-                self.load_all_layers_in_project(index);
+            UiCommand::UnloadAllLayers(runtime_id) => {
+                self.unload_all_layers(runtime_id);
                 Ok(())
             }
-            UiCommand::UnloadAllLayersInProject(index) => {
-                self.unload_all_layers_in_project(index);
+            UiCommand::SaveAllPidbs => self.save_all_dirty_projects().map(|_| ()),
+            UiCommand::SavePidb(runtime_id) => self.save_project(runtime_id),
+            UiCommand::SavePidbAs(runtime_id) => {
+                self.spawn_save_pidb_as_dialog(runtime_id);
                 Ok(())
             }
-            UiCommand::SaveProjectForLayer(index, layer) => self.save_project_layer(index, layer),
-            UiCommand::SaveNamedPidb(index) => self.save_named_project(index),
-            UiCommand::SaveNamedPidbAs(index) => {
-                self.spawn_save_pidb_as_dialog(index);
+            UiCommand::ActivatePidb(runtime_id) => self.activate_pidb(runtime_id),
+            UiCommand::ClosePidb(runtime_id) => {
+                self.request_close_pidb(runtime_id);
                 Ok(())
             }
-            UiCommand::ClosePidb(index) => {
-                self.request_close_project(index);
+            UiCommand::SaveAndClosePidb(runtime_id) => self.save_and_close_pidb(runtime_id),
+            UiCommand::ClosePidbForce(runtime_id) => {
+                self.close_pidb(runtime_id);
                 Ok(())
             }
-            UiCommand::SaveAndClosePidb(index) => self.save_and_close_project(index),
-            UiCommand::ClosePidbForce(index) => self.close_project(index),
             UiCommand::LoadTriangulation(path) => self.open_triangulation_path(&path),
             UiCommand::LoadBlockModel(source) => self.open_block_model_source(source),
             UiCommand::CloseBlockModel(id) => {
@@ -432,15 +464,33 @@ impl<'a> App<'a> {
                 Ok(())
             }
             UiCommand::ResetView => {
+                self.set_slice_mode_enabled(false);
                 self.reset_view();
                 Ok(())
             }
             UiCommand::SetTopologyWireframes(enabled) => self.set_topology_wireframes(enabled),
+            UiCommand::SetSlicePreviewDetached(detached) => {
+                self.editor.slice_preview_detached = detached && self.editor.slice_mode_enabled;
+                if !self.editor.slice_preview_detached
+                    && let Some(graphics) = self.graphics.as_mut()
+                {
+                    graphics.close_slice_preview();
+                }
+                self.redraw_requested = true;
+                Ok(())
+            }
+            UiCommand::SetShowPoints(enabled) => self.set_show_points(enabled),
             UiCommand::SetDarkMode(enabled) => self.set_dark_mode(enabled),
             UiCommand::SetShowConsole(enabled) => self.set_show_console(enabled),
             UiCommand::SetShowWorldAxisGizmo(enabled) => self.set_show_world_axis_gizmo(enabled),
             UiCommand::SetDebugChunkColoring(enabled) => self.set_debug_chunk_coloring(enabled),
             UiCommand::SetStandardView(view) => {
+                // The slice camera is derived from the slice state each frame;
+                // a standard-view transition would silently queue and fire on
+                // exit, so ignore it while sliced.
+                if self.editor.slice_mode_enabled {
+                    return Ok(());
+                }
                 if let Some(graphics) = self.graphics.as_mut() {
                     graphics.set_standard_view(view);
                     self.redraw_requested = true;
@@ -513,12 +563,11 @@ impl<'a> App<'a> {
                 Ok(())
             }
             UiCommand::MoveObjectsToLayer {
-                project_index,
                 object_ids,
                 target_layer,
                 copy,
             } => {
-                self.move_objects_to_layer(project_index, object_ids, target_layer, copy);
+                self.move_objects_to_layer(object_ids, target_layer, copy);
                 Ok(())
             }
             UiCommand::SetTriangulationColor(tri_id, new_color) => {
@@ -530,6 +579,7 @@ impl<'a> App<'a> {
                 Ok(())
             }
             UiCommand::ZoomToExtents => {
+                self.set_slice_mode_enabled(false);
                 self.zoom_to_extents();
                 Ok(())
             }
@@ -593,6 +643,21 @@ impl<'a> App<'a> {
                     });
                 Ok(())
             }
+            UiCommand::InsertPointsAtIntersections => {
+                self.insert_points_at_selected_intersections();
+                Ok(())
+            }
+            UiCommand::OpenInsertPointAtElevationDialog => {
+                self.open_insert_point_at_elevation_dialog();
+                Ok(())
+            }
+            UiCommand::InsertPointsAtElevation {
+                object_ids,
+                elevation,
+            } => {
+                self.insert_points_at_elevation(object_ids, elevation);
+                Ok(())
+            }
             UiCommand::CommitBatterBerm => {
                 self.commit_batter_berm();
                 Ok(())
@@ -615,7 +680,7 @@ impl<'a> App<'a> {
             UiCommand::OpenCreateTriangulation => {
                 self.editor.tri_create_open = true;
                 self.editor.tri_create_phase = TriCreatePhase::MainDialog;
-                self.editor.tri_create_source = crate::ui::state::TriCreateSource::Polygons;
+                self.editor.tri_create_source = crate::ui::state::TriCreateSource::Polylines;
                 self.editor.selected_handles.clear();
                 self.editor.tri_selected_object_ids.clear();
                 self.editor.tri_selected_layer_ids.clear();
@@ -818,6 +883,7 @@ impl<'a> App<'a> {
                 self.editor.tri_include_solid_open = true;
                 self.editor.tri_include_solid_topology_id = self.active_triangulation;
                 self.editor.tri_include_solid_shape_id = None;
+                self.editor.tri_include_solid_save_as_two = false;
                 self.editor.tri_include_solid_name_input = self
                     .active_triangulation
                     .and_then(|id| {
@@ -839,8 +905,10 @@ impl<'a> App<'a> {
                 topology_id,
                 shape_id,
                 name,
+                save_as_two,
             } => {
-                let result = self.include_solid_in_topology(topology_id, shape_id, name);
+                let result =
+                    self.include_solid_in_topology(topology_id, shape_id, name, save_as_two);
                 if result.is_ok() {
                     self.editor.tri_include_solid_open = false;
                 }
@@ -849,7 +917,6 @@ impl<'a> App<'a> {
             UiCommand::OpenContourTriangulation => {
                 self.editor.tri_contour_open = true;
                 self.editor.tri_contour_tri_id = self.active_triangulation;
-                self.editor.tri_contour_project_index = self.workspace.active_index.unwrap_or(0);
                 Ok(())
             }
             UiCommand::ExecuteContourTriangulation {
@@ -858,7 +925,6 @@ impl<'a> App<'a> {
                 minor_interval,
                 major_color,
                 minor_color,
-                project_index,
                 z_range,
             } => {
                 let result = self.generate_contour_triangulation(
@@ -867,7 +933,6 @@ impl<'a> App<'a> {
                     minor_interval,
                     major_color,
                     minor_color,
-                    project_index,
                     z_range,
                 );
                 if result.is_ok() {

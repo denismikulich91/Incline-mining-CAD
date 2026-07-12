@@ -7,27 +7,58 @@ use crate::rendering::scene::{
     overlays::{OverlaySceneBuildInput, rebuild_editor_overlay},
 };
 
+pub(crate) struct RenderInput<'frame> {
+    pub(crate) editor: &'frame mut EditorState,
+    pub(crate) document: &'frame mut Document,
+    pub(crate) triangulations: &'frame [OpenTriangulation],
+    pub(crate) block_models: &'frame [crate::model::block_model::OpenBlockModel],
+    pub(crate) point_clouds: &'frame [crate::model::point_cloud::OpenPointCloud],
+    pub(crate) rasters: &'frame [OpenRasterTexture],
+    pub(crate) project: &'frame UiProjectView,
+}
+
 impl<'a> Graphics<'a> {
     pub(crate) fn render(
         &mut self,
-        editor: &mut EditorState,
-        document: &mut Document,
-        triangulations: &[OpenTriangulation],
-        block_models: &[crate::model::block_model::OpenBlockModel],
-        point_clouds: &[crate::model::point_cloud::OpenPointCloud],
-        project: &UiProjectView,
+        input: RenderInput<'_>,
     ) -> Result<UiFrameOutput, RenderSurfaceError> {
-        self.vertical_exaggeration = editor.vertical_exaggeration.clamp(0.1, 20.0);
-        self.fit_depth_to_scene(
+        let RenderInput {
+            editor,
             document,
             triangulations,
             block_models,
             point_clouds,
-            &editor.hidden_handles,
-        );
-        self.include_pending_stroke_in_depth(editor);
-        self.include_batter_berm_preview_in_depth(editor);
-        self.include_road_preview_in_depth(editor);
+            rasters,
+            project,
+        } = input;
+        self.vertical_exaggeration = editor.vertical_exaggeration.clamp(0.1, 20.0);
+        let slice_visible_half_length =
+            slice_visible_half_length(self.projection.zoom, self.screen_size());
+        if let Some(slice) = self.slice_view.as_mut() {
+            // Slice mode owns the clip planes: the symmetric depth extent *is*
+            // the slab, so the scene-fitting passes below must not run — they
+            // would blow the clip range back out to the scene bounds.
+            slice.width = editor.slice_width_input.clamp(0.1, 1.0e6);
+            slice.move_speed = editor.slice_speed_input.clamp(0.0, 1.0e6);
+            slice.rotate_speed = editor.slice_rotate_input.clamp(1.0, 720.0).to_radians();
+            self.projection
+                .set_symmetric_depth_extent(slice.width * 0.5);
+            editor.slice_center = [slice.center.x, slice.center.y, slice.center.z];
+            editor.slice_direction = [slice.direction.x, slice.direction.y];
+            editor.slice_half_length = slice_visible_half_length;
+        } else {
+            self.fit_depth_to_scene(
+                document,
+                triangulations,
+                block_models,
+                point_clouds,
+                &editor.hidden_handles,
+            );
+            self.include_pending_stroke_in_depth(editor);
+            self.include_batter_berm_preview_in_depth(editor);
+            self.include_road_preview_in_depth(editor);
+        }
+        editor.debug_clip_plane_distances = Some(self.projection.clip_planes());
         self.upload_camera_uniform(editor.block_model_interaction_resolution_divisor);
         let output = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(output)
@@ -41,6 +72,12 @@ impl<'a> Graphics<'a> {
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        // Non-sRGB view of the same texture for the egui pass; egui applies
+        // gamma itself, so it wants raw byte writes (see `Gui::new`).
+        let gui_view = output.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.config.format.remove_srgb_suffix()),
+            ..Default::default()
+        });
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -48,6 +85,13 @@ impl<'a> Graphics<'a> {
             });
 
         let scale_factor = self.window.scale_factor() as f32;
+        self.raster_gpu.sync(
+            &self.device,
+            &self.queue,
+            self.scene_origin,
+            rasters,
+            &self.raster_surface_bind_group_layout,
+        );
         self.triangulation_gpu.sync(
             &self.device,
             &self.queue,
@@ -75,9 +119,17 @@ impl<'a> Graphics<'a> {
             &self.queue,
             self.scene_origin,
             scale_factor,
+            glam::Mat4::from_cols_array_2d(&self.camera_uniform.view_proj),
+            (self.camera.position - self.scene_origin).as_vec3(),
             point_clouds,
             &self.edge_style_bind_group_layout,
         );
+        let render_style_key = editor.render_style_key();
+        if self.cached_render_style_key != Some(render_style_key) {
+            self.cached_render_style_key = Some(render_style_key);
+            self.geometry_dirty = true;
+            self.overlay_dirty = true;
+        }
         let needs_geometry_rebuild = self.geometry_dirty
             || self.cached_document_revision != document.revision()
             || (self.cached_scale_factor - scale_factor).abs() > f32::EPSILON;
@@ -105,6 +157,7 @@ impl<'a> Graphics<'a> {
                 textarea_depths: &mut self.textarea_depths,
                 pick_records: &mut self.pick_records,
                 text_pick_records: &mut self.text_pick_records,
+                document_draw_batches: &mut self.document_draw_batches,
                 scene_origin: self.scene_origin,
                 scale_factor,
             });
@@ -274,9 +327,11 @@ impl<'a> Graphics<'a> {
             if needs_geometry_rebuild
                 && self
                     .frame_index
-                    .is_multiple_of(TEXT_CACHE_TRIM_INTERVAL_FRAMES)
+                    .wrapping_sub(self.last_text_cache_trim_frame)
+                    >= TEXT_CACHE_TRIM_INTERVAL_FRAMES
             {
                 self.text_system.text_cache.trim();
+                self.last_text_cache_trim_frame = self.frame_index;
             }
         }
 
@@ -287,6 +342,35 @@ impl<'a> Graphics<'a> {
             triangulations,
             block_models,
             point_clouds,
+            rasters,
+            true,
+        );
+
+        // One-shot viewport export: re-render the scene (without the egui
+        // chrome) into an offscreen texture and queue a readback on this
+        // frame's encoder; the PNG is written after submit below.
+        let pending_screenshot = self.pending_screenshot.take().map(|path| {
+            self.encode_screenshot_capture(
+                &mut encoder,
+                editor,
+                triangulations,
+                block_models,
+                point_clouds,
+                rasters,
+                path,
+            )
+        });
+
+        // Render the in-viewport plan preview through the same shaded scene
+        // pass as the main and detached viewports. The egui panel samples this
+        // offscreen texture below.
+        self.render_embedded_slice_preview(
+            document,
+            triangulations,
+            block_models,
+            point_clouds,
+            rasters,
+            editor,
         );
 
         self.update_tool_projections(editor, document);
@@ -299,7 +383,7 @@ impl<'a> Graphics<'a> {
             &self.device,
             &self.queue,
             &mut encoder,
-            &view,
+            &gui_view,
             editor,
             document,
             project,
@@ -324,18 +408,23 @@ impl<'a> Graphics<'a> {
         if ui_output.ui_pointer_active {
             self.mark_interaction();
         }
-        if ui_output.repaint {
-            self.window.request_redraw();
-        }
         // Keep redrawing through the interaction cooldown so the volume
         // raycaster's reduced-quality frames are always followed by a
         // full-quality one once the camera settles / resizing stops.
         if self.interaction_active() {
             self.window.request_redraw();
         }
+        // Continue draining the bounded point-cloud upload queue without
+        // treating background upload progress as camera interaction.
+        if self.point_cloud_gpu.has_pending_uploads() || self.block_model_gpu.has_pending_builds() {
+            self.window.request_redraw();
+        }
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+        if let Some(capture) = pending_screenshot {
+            self.finish_screenshot_capture(capture);
+        }
         self.frame_index = self.frame_index.wrapping_add(1);
 
         Ok(ui_output)

@@ -33,6 +33,7 @@ type OptionalScreenPointPx = Option<(f32, f32)>;
 pub(crate) struct PreferencesDraft {
     pub(crate) renderer_background_color: [f32; 4],
     pub(crate) topology_wireframes_enabled: bool,
+    pub(crate) show_points: bool,
     pub(crate) dark_mode: bool,
     pub(crate) show_console: bool,
     pub(crate) show_world_axis_gizmo: bool,
@@ -42,6 +43,18 @@ pub(crate) struct PreferencesDraft {
     pub(crate) block_model_interaction_resolution_divisor: u32,
     pub(crate) frame_counter_enabled: bool,
     pub(crate) debug_chunk_coloring: bool,
+    pub(crate) debug_clip_planes: bool,
+    pub(crate) plan_orbit_sensitivity: f64,
+    pub(crate) plan_zoom_sensitivity: f64,
+    pub(crate) plan_invert_vertical_look: bool,
+    pub(crate) plan_invert_horizontal_look: bool,
+    pub(crate) plan_zoom_towards_cursor: bool,
+    pub(crate) fly_field_of_view_degrees: f64,
+    pub(crate) fly_mouse_look_sensitivity: f64,
+    pub(crate) fly_invert_vertical_look: bool,
+    pub(crate) fly_invert_horizontal_look: bool,
+    pub(crate) fly_near_clip_limit: f64,
+    pub(crate) fly_max_clip_span: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -53,9 +66,9 @@ pub(crate) struct MoveToLayerDialog {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct MoveLayerDialog {
-    pub(crate) source_project_index: usize,
     pub(crate) layer_id: LayerId,
-    pub(crate) target_project_index: Option<usize>,
+    /// Runtime id of the open PIDB receiving the layer.
+    pub(crate) target_project: Option<u32>,
 }
 
 impl Default for PreferencesDraft {
@@ -63,8 +76,9 @@ impl Default for PreferencesDraft {
         Self {
             renderer_background_color: crate::app::io::default_renderer_background_color(),
             topology_wireframes_enabled: false,
+            show_points: false,
             dark_mode: false,
-            show_console: true,
+            show_console: crate::app::io::default_show_console(),
             show_world_axis_gizmo: crate::app::io::default_show_world_axis_gizmo(),
             snap_poll_rate: crate::app::io::default_snap_poll_rate(),
             frame_rate_cap: crate::app::io::default_frame_rate_cap(),
@@ -73,6 +87,18 @@ impl Default for PreferencesDraft {
                 crate::app::io::default_block_model_interaction_resolution_divisor(),
             frame_counter_enabled: false,
             debug_chunk_coloring: false,
+            debug_clip_planes: false,
+            plan_orbit_sensitivity: crate::app::io::default_plan_orbit_sensitivity(),
+            plan_zoom_sensitivity: crate::app::io::default_plan_zoom_sensitivity(),
+            plan_invert_vertical_look: false,
+            plan_invert_horizontal_look: false,
+            plan_zoom_towards_cursor: crate::app::io::default_plan_zoom_towards_cursor(),
+            fly_field_of_view_degrees: crate::app::io::default_fly_field_of_view_degrees(),
+            fly_mouse_look_sensitivity: crate::app::io::default_fly_mouse_look_sensitivity(),
+            fly_invert_vertical_look: false,
+            fly_invert_horizontal_look: false,
+            fly_near_clip_limit: crate::app::io::default_fly_near_clip_limit(),
+            fly_max_clip_span: crate::app::io::default_fly_max_clip_span(),
         }
     }
 }
@@ -95,6 +121,37 @@ impl EditorState {
         if !self.selected_handles.remove(&handle) {
             self.selected_handles.insert(handle);
         }
+    }
+
+    /// Order-independent fingerprint of every editor field baked into the
+    /// static document geometry (selection colour, hidden/frozen skips,
+    /// translucency, tool highlights, road-preview suppression).
+    ///
+    /// `Graphics::render` compares this itself each frame, so selection and
+    /// project transitions rebuild the scene even when the mutation site only
+    /// requested an overlay refresh — the class of stale-geometry bug this
+    /// removes cannot depend on callers picking the right invalidation.
+    pub(crate) fn render_style_key(&self) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        fn set_key(handles: &HashSet<SceneEntityId>) -> u64 {
+            // XOR-fold per-element hashes: HashSet iteration order is
+            // unstable, so the combination must be commutative.
+            handles.iter().fold(handles.len() as u64, |acc, handle| {
+                let mut hasher = DefaultHasher::new();
+                handle.hash(&mut hasher);
+                acc ^ hasher.finish()
+            })
+        }
+        let mut hasher = DefaultHasher::new();
+        set_key(&self.selected_handles).hash(&mut hasher);
+        set_key(&self.hidden_handles).hash(&mut hasher);
+        set_key(&self.frozen_handles).hash(&mut hasher);
+        set_key(&self.translucent_handles).hash(&mut hasher);
+        set_key(&self.tri_hover_handles).hash(&mut hasher);
+        self.tool_highlight_id.hash(&mut hasher);
+        self.editing_labels_id.hash(&mut hasher);
+        self.road_preview_affected_roads.hash(&mut hasher);
+        hasher.finish()
     }
 }
 
@@ -150,7 +207,7 @@ pub(crate) enum TriCreatePhase {
 /// Source object type accepted by the Create Triangulation picker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TriCreateSource {
-    Polygons,
+    Polylines,
     Roads,
 }
 
@@ -300,6 +357,11 @@ pub(crate) struct EditorState {
     /// Show wireframes on all topology meshes. Selected topology meshes always
     /// show a highlighted wireframe independently of this preference.
     pub(crate) topology_wireframes_enabled: bool,
+    /// Show the vertices of all visible design objects. Tool-specific point
+    /// overlays remain independent so their required handles are never hidden.
+    pub(crate) show_points: bool,
+    /// Visible design vertices projected into physical screen pixels.
+    pub(crate) visible_points_screen_px: Vec<(f32, f32)>,
     /// Use dark UI visuals and icons instead of the default light theme.
     pub(crate) dark_mode: bool,
     /// Show the console underneath the bottom toolbar.
@@ -322,6 +384,21 @@ pub(crate) struct EditorState {
     /// `(rendered, total)` surface chunks from the last frame; shown in the
     /// status bar while `debug_chunk_coloring` is on.
     pub(crate) debug_chunk_stats: Option<(u32, u32)>,
+    /// Current projection near/far values, shown in the status bar when the
+    /// developer clip-plane readout is enabled.
+    pub(crate) debug_clip_plane_distances: Option<(f64, f64)>,
+    pub(crate) debug_clip_planes: bool,
+    pub(crate) plan_orbit_sensitivity: f64,
+    pub(crate) plan_zoom_sensitivity: f64,
+    pub(crate) plan_invert_vertical_look: bool,
+    pub(crate) plan_invert_horizontal_look: bool,
+    pub(crate) plan_zoom_towards_cursor: bool,
+    pub(crate) fly_field_of_view_degrees: f64,
+    pub(crate) fly_mouse_look_sensitivity: f64,
+    pub(crate) fly_invert_vertical_look: bool,
+    pub(crate) fly_invert_horizontal_look: bool,
+    pub(crate) fly_near_clip_limit: f64,
+    pub(crate) fly_max_clip_span: f64,
     /// Transient status-bar message from a background task (e.g. "Saving to …").
     /// `None` shows nothing; the field is updated from `poll_saves` each frame.
     pub(crate) status_message: Option<StatusBarMessage>,
@@ -336,12 +413,10 @@ pub(crate) struct EditorState {
     pub(crate) cursor_world: Option<DVec3>,
     pub(crate) new_layer_dialog_open: bool,
     pub(crate) new_layer_name: String,
-    pub(crate) new_layer_project_index: Option<usize>,
-    /// Active layer rename: (project_index, layer_id, name_buffer).
-    pub(crate) renaming_layer: Option<(usize, LayerId, String)>,
-    /// Layer awaiting destructive deletion confirmation:
-    /// (project_index, layer_id, display_name).
-    pub(crate) pending_delete_layer: Option<(usize, LayerId, String)>,
+    /// Active layer rename: (layer_id, name_buffer).
+    pub(crate) renaming_layer: Option<(LayerId, String)>,
+    /// Layer awaiting destructive deletion confirmation: (layer_id, display_name).
+    pub(crate) pending_delete_layer: Option<(LayerId, String)>,
     /// Vertices accumulated for an in-progress MakeLine / MakePoly stroke.
     pub(crate) pending_stroke: Vec<DVec3>,
     pub(crate) measurement_start: Option<DVec3>,
@@ -386,6 +461,8 @@ pub(crate) struct EditorState {
     pub(crate) canvas_context_menu_px: Option<(f32, f32)>,
     pub(crate) move_to_layer_dialog: Option<MoveToLayerDialog>,
     pub(crate) set_selection_z_dialog: Option<crate::ui::dialogs::SetSelectionZDialog>,
+    pub(crate) insert_point_at_elevation_dialog:
+        Option<crate::ui::dialogs::InsertPointAtElevationDialog>,
     pub(crate) move_layer_dialog: Option<MoveLayerDialog>,
 
     // Display overrides
@@ -394,6 +471,30 @@ pub(crate) struct EditorState {
     pub(crate) vertical_exaggeration: f64,
     pub(crate) vertical_exaggeration_input: f64,
     pub(crate) fly_mode_enabled: bool, // Not sure if this belongs here
+
+    // Vertical slice view
+    /// First click of the slice-line placement, if any.
+    pub(crate) slice_pending_start: Option<DVec3>,
+    /// Mirror of the graphics slice mode (like `fly_mode_enabled`).
+    pub(crate) slice_mode_enabled: bool,
+    /// True while the full-resolution plan preview is in a native window.
+    pub(crate) slice_preview_detached: bool,
+    /// GPU texture rendered with the normal shaded plan-view scene pass.
+    pub(crate) slice_preview_texture: Option<egui::TextureId>,
+    /// Physical pixel size requested by the embedded preview on its last UI frame.
+    pub(crate) slice_preview_size_px: [u32; 2],
+    /// Slab thickness in metres, live-applied from the slice panel.
+    pub(crate) slice_width_input: f64,
+    /// W/S slab movement speed (m/s).
+    pub(crate) slice_speed_input: f64,
+    /// Q/E rotation rate (degrees per second).
+    pub(crate) slice_rotate_input: f64,
+    /// Current slice centre (display space), mirrored per frame for the plan preview.
+    pub(crate) slice_center: [f64; 3],
+    /// Current slice-line direction in XY, mirrored per frame for the plan preview.
+    pub(crate) slice_direction: [f64; 2],
+    /// Half-width of the section currently visible in the main viewport.
+    pub(crate) slice_half_length: f64,
 
     // Selection box
     /// Physical-pixel bounds of an in-progress box selection.
@@ -424,10 +525,14 @@ pub(crate) struct EditorState {
     pub(crate) offset_preview_world: Vec<DVec3>,
     /// Source vertices matching `offset_preview_world`, used for offset guide connectors.
     pub(crate) offset_source_world: Vec<DVec3>,
-    /// Preview polygon vertices projected to physical-pixel screen coordinates this frame.
-    pub(crate) offset_preview_screen_px: Vec<(f32, f32)>,
-    /// Source vertices projected to physical-pixel screen coordinates this frame.
-    pub(crate) offset_source_screen_px: Vec<(f32, f32)>,
+    /// Preview polygon vertices projected to physical-pixel screen
+    /// coordinates this frame. One entry per source vertex; `None` marks a
+    /// vertex outside the camera depth range so indexed consumers stay
+    /// aligned with `offset_preview_world`.
+    pub(crate) offset_preview_screen_px: Vec<Option<(f32, f32)>>,
+    /// Source vertices projected to physical-pixel screen coordinates this
+    /// frame; index-aligned with `offset_source_world` (`None` = clipped).
+    pub(crate) offset_source_screen_px: Vec<Option<(f32, f32)>>,
     /// Preview screen ranges as `(start, end, closed)` so multiple offset
     /// previews are drawn independently.
     pub(crate) offset_preview_ranges: Vec<(usize, usize, bool)>,
@@ -480,7 +585,9 @@ pub(crate) struct EditorState {
     // Split At Points tool
     pub(crate) split_poly_id: Option<ObjectId>,
     pub(crate) split_selected_verts: [Option<usize>; 2],
-    pub(crate) split_poly_verts_screen_px: Vec<(f32, f32)>,
+    /// One entry per polygon vertex; `None` marks a vertex outside the camera
+    /// depth range, keeping `split_selected_verts` indices aligned.
+    pub(crate) split_poly_verts_screen_px: Vec<Option<(f32, f32)>>,
 
     // Chamfer tool
     pub(crate) chamfer_radius: f64,
@@ -492,8 +599,9 @@ pub(crate) struct EditorState {
     /// Which vertex index of `chamfer_poly_id` is the selected corner.
     pub(crate) chamfer_corner_index: Option<usize>,
     /// Preview of chamfered polygon projected to screen (raw pixels). Computed each frame by
-    /// render.rs.
-    pub(crate) chamfer_preview_screen_px: Vec<(f32, f32)>,
+    /// render.rs. One entry per preview vertex (`None` = clipped) so segments
+    /// between visible neighbours stay adjacent.
+    pub(crate) chamfer_preview_screen_px: Vec<Option<(f32, f32)>>,
     /// Screen position of the nearest hoverable chamfer corner (raw pixels, before a corner is
     /// picked).
     pub(crate) chamfer_hover_corner_px: Option<(f32, f32)>,
@@ -539,12 +647,8 @@ pub(crate) struct EditorState {
     pub(crate) delete_confirm_open: bool,
     pub(crate) can_undo: bool,
     pub(crate) can_redo: bool,
-    /// Dirty PIDB awaiting save/discard confirmation before it is removed.
-    pub(crate) pending_close_project: Option<usize>,
-    /// Queue of layers awaiting dirty-state unload confirmation. Each entry is
-    /// `(project index, layer id, layer name)`; the front is shown in the dialog.
-    /// A queue (not a single slot) so "Unload All Layers" can prompt per layer.
-    pub(crate) pending_unload_queue: Vec<(usize, LayerId, String)>,
+    /// Dirty PIDB awaiting save/discard confirmation before it is closed.
+    pub(crate) pending_close_pidb: Option<u32>,
     /// Path of the triangulation folder pending "load all" confirmation.
     pub(crate) confirm_load_all_folder: Option<PathBuf>,
 
@@ -602,6 +706,7 @@ pub(crate) struct EditorState {
     pub(crate) tri_include_solid_topology_id: Option<TriangulationId>,
     pub(crate) tri_include_solid_shape_id: Option<TriangulationId>,
     pub(crate) tri_include_solid_name_input: String,
+    pub(crate) tri_include_solid_save_as_two: bool,
 
     // Contour Generation
     pub(crate) tri_contour_open: bool,
@@ -610,7 +715,6 @@ pub(crate) struct EditorState {
     pub(crate) tri_contour_minor_interval_input: f64,
     pub(crate) tri_contour_major_color: [f32; 4],
     pub(crate) tri_contour_minor_color: [f32; 4],
-    pub(crate) tri_contour_project_index: usize,
     pub(crate) tri_contour_use_z_range: bool,
     pub(crate) tri_contour_z_min_input: f64,
     pub(crate) tri_contour_z_max_input: f64,
@@ -690,12 +794,15 @@ pub(crate) struct EditorState {
     pub(crate) bezier_cp2: [f64; 3],
     /// Number of line segments used to approximate the bezier curve.
     pub(crate) bezier_segments: u32,
-    /// Screen-space positions of every vertex in the selected polygon (for white dot indicators).
-    pub(crate) bezier_poly_verts_screen_px: Vec<(f32, f32)>,
+    /// Screen-space positions of every vertex in the selected polygon (for
+    /// white dot indicators). One entry per source vertex (`None` = clipped)
+    /// so `bezier_selected_verts` indices always address the right vertex.
+    pub(crate) bezier_poly_verts_screen_px: Vec<Option<(f32, f32)>>,
     pub(crate) bezier_cp1_screen_px: Option<(f32, f32)>,
     pub(crate) bezier_cp2_screen_px: Option<(f32, f32)>,
-    /// Screen-space positions of the dashed yellow preview polygon.
-    pub(crate) bezier_preview_screen_px: Vec<(f32, f32)>,
+    /// Screen-space positions of the dashed yellow preview polygon, one entry
+    /// per preview vertex (`None` = clipped).
+    pub(crate) bezier_preview_screen_px: Vec<Option<(f32, f32)>>,
     /// Which CP handle is being dragged (0 = cp1, 1 = cp2), None if not dragging.
     pub(crate) bezier_dragging_cp: Option<u8>,
     /// Which CP handle is hovered (0 = cp1, 1 = cp2), None if neither.
@@ -710,20 +817,149 @@ pub(crate) struct EditorState {
     pub(crate) import_source_menu: DataMenu,
     pub(crate) import_source_paths: Vec<PathBuf>,
     pub(crate) import_dxf_as_pidb: bool,
-    pub(crate) import_dxf_project_index: Option<usize>,
     pub(crate) import_bmf_path: Option<PathBuf>,
     pub(crate) import_bdf_path: Option<PathBuf>,
     pub(crate) export_dxf_layer: bool,
-    pub(crate) export_project_index: Option<usize>,
-    pub(crate) export_layer: Option<(usize, LayerId)>,
+    pub(crate) export_layer: Option<LayerId>,
     pub(crate) export_triangulation: Option<TriangulationId>,
 }
 
 impl EditorState {
+    /// Clear every project/object-owned interaction session in one lifecycle
+    /// transition. Numeric tool preferences remain intact, but no source id,
+    /// preview geometry, projected handle, or modal draft can refer to the
+    /// project that was just left.
+    pub(crate) fn clear_project_transients(&mut self) {
+        self.selected_handles.clear();
+        self.hidden_handles.clear();
+        self.frozen_handles.clear();
+        self.translucent_handles.clear();
+        self.active_layer = None;
+        self.active_tool = ActiveTool::None;
+        self.new_layer_dialog_open = false;
+        self.renaming_layer = None;
+        self.pending_delete_layer = None;
+        self.selection_box_start_px = None;
+        self.selection_box_current_px = None;
+        self.pending_stroke.clear();
+        self.poly_finish_dialog = false;
+        self.poly_finish_dialog_px = None;
+        self.canvas_context_menu_open = false;
+        self.canvas_context_menu_px = None;
+        self.move_to_layer_dialog = None;
+        self.set_selection_z_dialog = None;
+        self.insert_point_at_elevation_dialog = None;
+        self.move_layer_dialog = None;
+        self.measurement_start = None;
+        self.measurement_end = None;
+        self.berm_angle_points.clear();
+        self.text_editing_enabled = false;
+        self.editing_labels_id = None;
+        self.pending_text.clear();
+        self.text_edit_dialog_px = None;
+        self.text_edit_position_frames = 0;
+        self.text_edit_focus_requested = false;
+        self.text_edit_created = false;
+        self.slice_pending_start = None;
+
+        self.offset_dialog_open = false;
+        self.offset_target_id = None;
+        self.offset_target_ids.clear();
+        self.offset_awaiting_side_pick = false;
+        self.offset_project_to_rl = None;
+        self.offset_preview_world.clear();
+        self.offset_source_world.clear();
+        self.offset_preview_screen_px.clear();
+        self.offset_source_screen_px.clear();
+        self.offset_preview_ranges.clear();
+
+        self.relimit_dialog_open = false;
+        self.relimit_source_id = None;
+        self.relimit_awaiting_source_pick = false;
+        self.relimit_waiting_for_pick = false;
+        self.relimit_confirming_end = false;
+        self.relimit_second_id = None;
+        self.relimit_candidates.clear();
+        self.relimit_intersection_3d = None;
+        self.relimit_hover_target_id = None;
+        self.relimit_hover_target_screen_px.clear();
+        self.relimit_preview_from_px = None;
+        self.relimit_preview_to_px = None;
+        self.relimit_resize_end_px = None;
+
+        self.fuse_segments.clear();
+        self.fuse_awaiting_endpoint = None;
+        self.fuse_endpoint_markers.clear();
+        self.fuse_chain_tail = None;
+        self.fuse_close_marker = None;
+        self.split_poly_id = None;
+        self.split_selected_verts = [None, None];
+        self.split_poly_verts_screen_px.clear();
+
+        self.chamfer_poly_id = None;
+        self.chamfer_corner_index = None;
+        self.chamfer_preview_screen_px.clear();
+        self.chamfer_hover_corner_px = None;
+        self.delete_hover_vertex_px = None;
+        self.chamfer_gizmo_corner_px = None;
+        self.chamfer_gizmo_bisector_px = None;
+        self.chamfer_gizmo_handle_px = None;
+        self.chamfer_gizmo_hovered = false;
+        self.chamfer_gizmo_edge_screen_dir = None;
+        self.chamfer_gizmo_drag_start_px = None;
+
+        self.move_vertex_target = None;
+        self.move_gizmo_center_px = None;
+        self.move_gizmo_x_tip_px = None;
+        self.move_gizmo_y_tip_px = None;
+        self.move_gizmo_z_tip_px = None;
+        self.move_gizmo_hovered_axis = None;
+        self.gizmo_drag_axis_index = None;
+        self.move_panel_delta = [0.0; 3];
+        self.move_panel_last_preview = [0.0; 3];
+        self.tool_highlight_id = None;
+
+        self.road_dialog_open = false;
+        self.road_preview_left_world.clear();
+        self.road_preview_right_world.clear();
+        self.road_preview_center_world.clear();
+        self.road_preview_left_screen_px.clear();
+        self.road_preview_right_screen_px.clear();
+        self.road_preview_center_screen_px.clear();
+        self.road_preview_violation = None;
+        self.road_preview_affected_roads.clear();
+        self.road_preview_affected_edges.clear();
+
+        self.batter_berm_dialog_open = false;
+        self.batter_berm_target_id = None;
+        self.batter_berm_rings_world.clear();
+        self.batter_berm_source_world.clear();
+        self.batter_berm_guides_world.clear();
+        self.batter_berm_rings_screen_px.clear();
+        self.batter_berm_source_screen_px.clear();
+        self.batter_berm_guides_screen_px.clear();
+        self.batter_berm_preview_key = None;
+
+        self.bezier_poly_id = None;
+        self.bezier_selected_verts = [None, None];
+        self.bezier_poly_verts_screen_px.clear();
+        self.bezier_cp1_screen_px = None;
+        self.bezier_cp2_screen_px = None;
+        self.bezier_preview_screen_px.clear();
+        self.bezier_dragging_cp = None;
+        self.bezier_hover_cp = None;
+        self.bezier_dialog_open = false;
+
+        self.tri_hover_handles.clear();
+        self.tri_selected_object_ids.clear();
+        self.tri_selected_layer_ids.clear();
+    }
+
     pub(crate) fn current_preferences(&self) -> PreferencesDraft {
         PreferencesDraft {
             renderer_background_color: self.renderer_background_color,
             topology_wireframes_enabled: self.topology_wireframes_enabled,
+            show_points: self.show_points,
             dark_mode: self.dark_mode,
             show_console: self.show_console,
             show_world_axis_gizmo: self.show_world_axis_gizmo,
@@ -734,6 +970,18 @@ impl EditorState {
                 .block_model_interaction_resolution_divisor,
             frame_counter_enabled: self.frame_counter_enabled,
             debug_chunk_coloring: self.debug_chunk_coloring,
+            debug_clip_planes: self.debug_clip_planes,
+            plan_orbit_sensitivity: self.plan_orbit_sensitivity,
+            plan_zoom_sensitivity: self.plan_zoom_sensitivity,
+            plan_invert_vertical_look: self.plan_invert_vertical_look,
+            plan_invert_horizontal_look: self.plan_invert_horizontal_look,
+            plan_zoom_towards_cursor: self.plan_zoom_towards_cursor,
+            fly_field_of_view_degrees: self.fly_field_of_view_degrees,
+            fly_mouse_look_sensitivity: self.fly_mouse_look_sensitivity,
+            fly_invert_vertical_look: self.fly_invert_vertical_look,
+            fly_invert_horizontal_look: self.fly_invert_horizontal_look,
+            fly_near_clip_limit: self.fly_near_clip_limit,
+            fly_max_clip_span: self.fly_max_clip_span,
         }
     }
 
@@ -754,8 +1002,10 @@ impl EditorState {
             frozen_handles: HashSet::new(),
             translucent_handles: HashSet::new(),
             topology_wireframes_enabled: false,
+            show_points: false,
+            visible_points_screen_px: Vec::new(),
             dark_mode: false,
-            show_console: true,
+            show_console: crate::app::io::default_show_console(),
             show_world_axis_gizmo: crate::app::io::default_show_world_axis_gizmo(),
             renderer_background_color: crate::app::io::default_renderer_background_color(),
             preferences_draft: None,
@@ -768,6 +1018,19 @@ impl EditorState {
             measured_fps: None,
             debug_chunk_coloring: false,
             debug_chunk_stats: None,
+            debug_clip_plane_distances: None,
+            debug_clip_planes: false,
+            plan_orbit_sensitivity: crate::app::io::default_plan_orbit_sensitivity(),
+            plan_zoom_sensitivity: crate::app::io::default_plan_zoom_sensitivity(),
+            plan_invert_vertical_look: false,
+            plan_invert_horizontal_look: false,
+            plan_zoom_towards_cursor: crate::app::io::default_plan_zoom_towards_cursor(),
+            fly_field_of_view_degrees: crate::app::io::default_fly_field_of_view_degrees(),
+            fly_mouse_look_sensitivity: crate::app::io::default_fly_mouse_look_sensitivity(),
+            fly_invert_vertical_look: false,
+            fly_invert_horizontal_look: false,
+            fly_near_clip_limit: crate::app::io::default_fly_near_clip_limit(),
+            fly_max_clip_span: crate::app::io::default_fly_max_clip_span(),
             status_message: None,
             active_tool: ActiveTool::None,
             cursor_mode: CursorMode::Select,
@@ -778,7 +1041,6 @@ impl EditorState {
             cursor_world: None,
             new_layer_dialog_open: false,
             new_layer_name: "design".to_owned(),
-            new_layer_project_index: None,
             renaming_layer: None,
             pending_delete_layer: None,
             pending_stroke: Vec::new(),
@@ -804,12 +1066,24 @@ impl EditorState {
             canvas_context_menu_px: None,
             move_to_layer_dialog: None,
             set_selection_z_dialog: None,
+            insert_point_at_elevation_dialog: None,
             move_layer_dialog: None,
             xray_enabled: false,
             vertical_exaggeration_dialog_open: false,
             vertical_exaggeration: 1.0,
             vertical_exaggeration_input: 1.,
             fly_mode_enabled: false,
+            slice_pending_start: None,
+            slice_mode_enabled: false,
+            slice_preview_detached: false,
+            slice_preview_texture: None,
+            slice_preview_size_px: [440, 440],
+            slice_width_input: 25.0,
+            slice_speed_input: 50.0,
+            slice_rotate_input: 45.0,
+            slice_center: [0.0; 3],
+            slice_direction: [1.0, 0.0],
+            slice_half_length: 0.0,
             selection_box_start_px: None,
             selection_box_current_px: None,
             offset_dialog_open: false,
@@ -890,12 +1164,11 @@ impl EditorState {
             delete_confirm_open: false,
             can_undo: false,
             can_redo: false,
-            pending_close_project: None,
-            pending_unload_queue: Vec::new(),
+            pending_close_pidb: None,
             confirm_load_all_folder: None,
             tri_create_open: false,
             tri_create_phase: TriCreatePhase::MainDialog,
-            tri_create_source: TriCreateSource::Polygons,
+            tri_create_source: TriCreateSource::Polylines,
             tri_create_failure: None,
             tri_create_picker_px: None,
             tri_hover_handles: HashSet::new(),
@@ -928,13 +1201,13 @@ impl EditorState {
             tri_include_solid_topology_id: None,
             tri_include_solid_shape_id: None,
             tri_include_solid_name_input: String::new(),
+            tri_include_solid_save_as_two: false,
             tri_contour_open: false,
             tri_contour_tri_id: None,
             tri_contour_major_interval_input: 10.0,
             tri_contour_minor_interval_input: 2.0,
             tri_contour_major_color: [1.0, 0.5, 0.0, 1.0],
             tri_contour_minor_color: [0.8, 0.8, 0.8, 1.0],
-            tri_contour_project_index: 0,
             tri_contour_use_z_range: false,
             tri_contour_z_min_input: 0.0,
             tri_contour_z_max_input: 100.0,
@@ -1003,11 +1276,9 @@ impl EditorState {
             import_source_menu: DataMenu::None,
             import_source_paths: Vec::new(),
             import_dxf_as_pidb: true,
-            import_dxf_project_index: None,
             import_bmf_path: None,
             import_bdf_path: None,
             export_dxf_layer: false,
-            export_project_index: None,
             export_layer: None,
             export_triangulation: None,
         }
@@ -1064,12 +1335,15 @@ impl EditorState {
                 true
             }
             EditorAction::FreezeSelection => {
-                self.frozen_handles
-                    .extend(self.selected_handles.iter().copied());
-                userspace_log!("Froze {} object(s)", self.selected_handles.len());
-                // Frozen entities render identically; only picking is affected,
-                // so no geometry rebuild is required.
-                false
+                let newly_frozen = std::mem::take(&mut self.selected_handles);
+                let count = newly_frozen.len();
+                self.frozen_handles.extend(newly_frozen.iter().copied());
+                self.tri_selected_object_ids
+                    .retain(|object_id| !newly_frozen.contains(&SceneEntityId::Object(*object_id)));
+                userspace_log!("Froze {count} object(s)");
+                // Deselecting removes selection highlights and can move a
+                // cached stroke between scene streams, so rebuild geometry.
+                count > 0
             }
         }
     }
@@ -1104,6 +1378,7 @@ pub(crate) enum ActiveTool {
     Chamfer,
     BatterBermOffset,
     Bezier,
+    VerticalSlice,
 }
 
 /// Immediate commands applied to the current selection (or whole drawing).
@@ -1172,14 +1447,23 @@ impl ToolHatch {
 pub(crate) enum UiCommand {
     SetActiveTool(ActiveTool),
     SetFlyModeEnabled(bool),
+    SetSliceModeEnabled(bool),
+    SetSlicePreviewDetached(bool),
     NewPidb,
     OpenPidb,
     CloseStartupDialog,
-    SaveAllPidbs,
     ImportAsPidbPaths(DataMenu, Vec<PathBuf>),
-    ImportDxfPathsInto(usize, Vec<PathBuf>),
+    ImportDxfPathsInto(Vec<PathBuf>),
     ImportTriangulationPaths(Vec<PathBuf>),
     ImportPointCloudPaths(Vec<PathBuf>),
+    ImportRasterPaths(Vec<PathBuf>),
+    LoadRaster(PathBuf),
+    UnloadRaster(PathBuf),
+    RemoveRaster(PathBuf),
+    RevealRaster(PathBuf),
+    DrapeRaster(PathBuf),
+    UndrapeRaster(PathBuf),
+    ClearActiveTriangulationRaster,
     LoadPointCloud(PathBuf),
     ClosePointCloud(crate::model::point_cloud::PointCloudId),
     TogglePointCloudVisible(crate::model::point_cloud::PointCloudId),
@@ -1193,9 +1477,10 @@ pub(crate) enum UiCommand {
         bmf_path: PathBuf,
         bdf_path: Option<PathBuf>,
     },
-    ExportPidbDxf(usize),
-    ExportPidbCopy(usize),
-    ExportLayerDxf(usize, LayerId),
+    ExportPidbDxf,
+    ExportPidbCopy,
+    ExportViewportImage,
+    ExportLayerDxf(LayerId),
     ExportTriangulationAs(TriangulationId, MeshFormat),
     SaveTriangulationAs(TriangulationId),
     SaveAndCloseTriangulationAs(TriangulationId),
@@ -1206,7 +1491,6 @@ pub(crate) enum UiCommand {
     ExitWithoutSaving,
     CancelExit,
     CreateLayer {
-        project_index: usize,
         name: String,
     },
     FinishPolyClose,
@@ -1215,6 +1499,7 @@ pub(crate) enum UiCommand {
     CancelRelimit,
     ResetView,
     SetTopologyWireframes(bool),
+    SetShowPoints(bool),
     SetDarkMode(bool),
     SetShowConsole(bool),
     SetShowWorldAxisGizmo(bool),
@@ -1222,26 +1507,26 @@ pub(crate) enum UiCommand {
     SetStandardView(StandardView),
     ApplyPreferences(PreferencesDraft),
     OpenPreferences,
-    SaveNamedPidb(usize),
-    SaveNamedPidbAs(usize),
-    ClosePidb(usize),
-    SaveAndClosePidb(usize),
-    ClosePidbForce(usize),
-    RequestDeleteLayer(usize, LayerId),
-    DeleteLayer(usize, LayerId),
-    DuplicateLayer(usize, LayerId),
-    BeginMoveLayer(usize, LayerId),
-    MoveLayerToProject {
-        source_project_index: usize,
+    SaveAllPidbs,
+    SavePidb(u32),
+    SavePidbAs(u32),
+    ActivatePidb(u32),
+    ClosePidb(u32),
+    SaveAndClosePidb(u32),
+    ClosePidbForce(u32),
+    RequestDeleteLayer(LayerId),
+    DeleteLayer(LayerId),
+    DuplicateLayer(LayerId),
+    BeginMoveLayer(LayerId),
+    MoveLayerToPidb {
         layer_id: LayerId,
-        target_project_index: usize,
+        target_project: u32,
     },
     RenameLayer {
-        project_index: usize,
         layer_id: LayerId,
         new_name: String,
     },
-    BeginRenameLayer(usize, LayerId),
+    BeginRenameLayer(LayerId),
     /// Preview the move delta without committing (updates the live document view).
     PreviewMoveDelta(glam::DVec3),
     /// Apply a world-space delta to all selected objects.
@@ -1251,9 +1536,9 @@ pub(crate) enum UiCommand {
     CancelBezier,
     ApplyMoveDelta(glam::DVec3),
     CancelMoveDelta,
-    LoadLayer(usize, LayerId),
-    UnloadLayer(usize, LayerId),
-    SelectAllObjectsInLayer(usize, LayerId),
+    LoadLayer(LayerId),
+    UnloadLayer(LayerId),
+    SelectAllObjectsInLayer(LayerId),
     OpenTriangulationFolder,
     ActivateTriangulation(TriangulationId),
     ToggleTriangulationVisible(TriangulationId),
@@ -1264,7 +1549,6 @@ pub(crate) enum UiCommand {
     BatchSetObjectFill(Vec<ObjectId>, FillStyle),
     BatchSetPolylineLineWeight(Vec<ObjectId>, f32),
     MoveObjectsToLayer {
-        project_index: usize,
         object_ids: Vec<ObjectId>,
         target_layer: LayerId,
         copy: bool,
@@ -1305,7 +1589,7 @@ pub(crate) enum UiCommand {
     },
     RemoveTriangulation(PathBuf),
     RemoveTriangulationFolder(PathBuf),
-    RevealPidb(usize),
+    RevealPidb(PathBuf),
     RevealAllTriangulations,
     ZoomToExtents,
     /// Dialog "Apply" pressed — begin the canvas side-pick phase.
@@ -1347,6 +1631,15 @@ pub(crate) enum UiCommand {
     ConvertSelectedRoadsToPolylines,
     /// Open the Set selections to Z value.
     OpenSetSelectionZValueDialog,
+    /// Insert vertices at every plan-view crossing between selected polylines.
+    InsertPointsAtIntersections,
+    /// Open the elevation input for inserting vertices into selected polylines.
+    OpenInsertPointAtElevationDialog,
+    /// Insert vertices where selected polylines cross an elevation.
+    InsertPointsAtElevation {
+        object_ids: Vec<ObjectId>,
+        elevation: f64,
+    },
     /// Run CDT on the supplied object list and add the result as a loaded triangulation.
     ExecuteCreateTriangulation {
         name: String,
@@ -1374,22 +1667,16 @@ pub(crate) enum UiCommand {
         max_edge: f64,
         max_points: u32,
     },
-    /// Load all layers in the given project (no confirmation needed).
-    LoadAllLayersInProject(usize),
-    /// Unload all layers in the given project (shows dirty-check dialog if needed).
-    UnloadAllLayersInProject(usize),
+    /// Load all layers in one open project without changing the editing target.
+    LoadAllLayers(u32),
+    /// Unload all layers in one open project without changing the editing target.
+    UnloadAllLayers(u32),
     /// Show the "load all in folder?" confirmation dialog for the given folder.
     ConfirmLoadAllTriangulationsInFolder(PathBuf),
     /// Actually load every triangulation file in the given folder.
     LoadAllTriangulationsInFolder(PathBuf),
     /// Close (unload) every loaded triangulation in the given folder.
     CloseAllTriangulationsInFolder(PathBuf),
-    /// Save the .pidb project that contains a specific layer (the "Save Layer" menu entry).
-    SaveProjectForLayer(usize, LayerId),
-    /// Unload a layer without checking for unsaved changes (confirmed by the user).
-    UnloadLayerConfirmed(usize, LayerId),
-    /// Save the project and then unload a specific layer.
-    SaveAndUnloadLayer(usize, LayerId),
     /// Close an unsaved triangulation without saving (user confirmed the discard).
     CloseTriangulationForce(TriangulationId),
     /// User confirmed deletion of all selected objects via the confirm dialog.
@@ -1437,6 +1724,7 @@ pub(crate) enum UiCommand {
         topology_id: TriangulationId,
         shape_id: TriangulationId,
         name: String,
+        save_as_two: bool,
     },
     /// Open the "Generate Contour Lines" dialog.
     OpenContourTriangulation,
@@ -1444,14 +1732,13 @@ pub(crate) enum UiCommand {
     CancelRoad,
     Undo,
     Redo,
-    /// Execute contour generation and store lines as a new layer in the given pidb.
+    /// Execute contour generation and store lines as a new layer in the active pidb.
     ExecuteContourTriangulation {
         tri_id: TriangulationId,
         major_interval: f64,
         minor_interval: f64,
         major_color: [f32; 4],
         minor_color: [f32; 4],
-        project_index: usize,
         /// Optional `(min, max)` RL band to contour instead of the full mesh.
         z_range: Option<(f64, f64)>,
     },
@@ -1459,7 +1746,9 @@ pub(crate) enum UiCommand {
 
 /// Output produced by a single UI frame.
 pub(crate) struct UiFrameOutput {
-    pub(crate) repaint: bool,
+    /// Delay requested by egui for its next frame. `None` means egui has no
+    /// pending timed repaint; zero requests another frame immediately.
+    pub(crate) repaint_after: Option<std::time::Duration>,
     pub(crate) geometry_dirty: bool,
     /// The pointer is actively pressed on an egui widget this frame (e.g.
     /// dragging a colour-gradient stop). Used to drop the volume raycaster to
@@ -1474,17 +1763,17 @@ pub(crate) struct UiLayerEntry {
     pub(crate) id: LayerId,
     pub(crate) name: String,
     pub(crate) is_loaded: bool,
-    pub(crate) dirty: bool,
 }
 
-/// One .pidb project entry shown in the explorer tree.
+/// One open .pidb entry shown in the explorer tree.
 #[derive(Clone, Debug)]
 pub(crate) struct UiProjectEntry {
+    pub(crate) runtime_id: u32,
     pub(crate) name: String,
     pub(crate) dirty: bool,
-    pub(crate) index: usize,
     pub(crate) is_active: bool,
     pub(crate) layers: Vec<UiLayerEntry>,
+    /// `None` only for a never-saved active project.
     pub(crate) path: Option<PathBuf>,
 }
 
@@ -1497,6 +1786,18 @@ pub(crate) struct UiPointCloudEntry {
     pub(crate) visible: bool,
     pub(crate) is_loaded: bool,
     pub(crate) point_count: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct UiRasterTextureEntry {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    pub(crate) is_loaded: bool,
+    /// Currently draped over at least one triangulation.
+    pub(crate) is_draped: bool,
+    pub(crate) source_size: [u32; 2],
+    pub(crate) driver_name: String,
+    pub(crate) projection: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1534,7 +1835,8 @@ pub(crate) struct UiProjectView {
     pub(crate) triangulations: Vec<UiTriangulationEntry>,
     pub(crate) block_models: Vec<UiBlockModelEntry>,
     pub(crate) point_clouds: Vec<UiPointCloudEntry>,
-    pub(crate) active_index: Option<usize>,
+    pub(crate) raster_textures: Vec<UiRasterTextureEntry>,
+    pub(crate) has_active_project: bool,
     pub(crate) needs_startup_dialog: bool,
     /// Full filesystem path of the currently active PIDB, if any.
     pub(crate) active_path: Option<PathBuf>,
@@ -1545,6 +1847,7 @@ pub(crate) struct UiProjectView {
 #[derive(PartialEq)]
 pub(crate) enum PreferenceCategory {
     Interface,
+    Camera,
     Performance,
     Developer,
 }
@@ -1564,4 +1867,5 @@ pub(crate) enum DataMenu {
     Xyz,
     Pcd,
     Bmf,
+    Geotiff,
 }

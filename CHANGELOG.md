@@ -31,3 +31,11 @@
 - Improved Import / Export
 
 - Moved configs to appdata/.config from executable location for compatabaility
+
+## V0.1.4
+
+- Slice viewing
+
+- Improvements to precision, clipping and triangulation shading
+
+- Create triangulations with open polylines

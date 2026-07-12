@@ -124,6 +124,7 @@ impl DgdColorTable {
 pub enum IsisError {
     Io(io::Error),
     Decompress(String),
+    InvalidData(String),
 }
 
 impl fmt::Display for IsisError {
@@ -131,6 +132,7 @@ impl fmt::Display for IsisError {
         match self {
             IsisError::Io(e) => write!(f, "{e}"),
             IsisError::Decompress(msg) => write!(f, "vulZ decompression failed: {msg}"),
+            IsisError::InvalidData(msg) => write!(f, "invalid DGD ISIS data: {msg}"),
         }
     }
 }
@@ -175,6 +177,16 @@ pub fn read_dgd_design_bytes(bytes: &[u8]) -> Result<DgdDesignData, IsisError> {
     let mut text_coord_offsets = std::collections::HashSet::new();
     let mut texts = extract_dgd_texts(&data, &objects, &mut text_coord_offsets);
     let mut points = scan_dgd_points(&data);
+    if layer_headers.is_empty()
+        && saves.is_empty()
+        && objects.is_empty()
+        && points.is_empty()
+        && texts.is_empty()
+    {
+        return Err(IsisError::InvalidData(
+            "stream contains no recognizable layer, object, text, or coordinate records".to_owned(),
+        ));
+    }
     points.retain(|point| !text_coord_offsets.contains(&point.offset));
     attribute_dgd_closed(&mut points, &objects);
     attribute_dgd_layers(&mut points, &mut texts, &layer_headers, &saves);
@@ -532,7 +544,7 @@ impl<'a> DgdLayerHeaderResolver<'a> {
             .checked_sub(1)
             .and_then(|index| self.headers.get(index))
         else {
-            return LayerResolution::Dropped;
+            return LayerResolution::Unattributed;
         };
         if is_live_dgd_layer_header(header) {
             LayerResolution::Live(&header.name)

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, error::Error, fmt, fs, path::Path, sync::Arc};
+use std::{collections::BTreeMap, error::Error, fmt, fs, mem::size_of, path::Path, sync::Arc};
 
 use glam::{DMat3, DVec3};
 
@@ -9,6 +9,14 @@ const PAGE_STRIDE: usize = 0x808;
 const PAGE_HEADER_LEN: usize = 8;
 const PAGE_PAYLOAD_LEN: usize = 0x800;
 const METADATA_PAGE_KIND: [u8; 2] = [0x00, 0x02];
+const PAGE_TABLE_SLOTS: usize = PAGE_PAYLOAD_LEN / size_of::<u64>();
+const TWO_LEVEL_PAGE_TABLE_SLOTS: usize = PAGE_TABLE_SLOTS * PAGE_TABLE_SLOTS;
+/// Hard ceiling for any one decoded BMF buffer. BMF loading currently needs
+/// materialized block bounds/indices, so a corrupt `n_blocks` must not be able
+/// to request an effectively unbounded allocation before the file structure
+/// is checked. Large valid models remain supported (the ceiling is 2 GiB per
+/// buffer), while every allocation below it is still made fallibly.
+const MAX_BMF_ALLOCATION_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct BmfModel {
@@ -119,6 +127,49 @@ impl From<std::io::Error> for BmfError {
     }
 }
 
+fn validate_allocation<T>(len: usize, description: &str) -> Result<(), BmfError> {
+    let bytes = len.checked_mul(size_of::<T>()).ok_or_else(|| {
+        BmfError::Invalid(format!(
+            "BMF {description} allocation size overflows ({len} items)"
+        ))
+    })?;
+    if bytes > MAX_BMF_ALLOCATION_BYTES {
+        return Err(BmfError::Invalid(format!(
+            "BMF {description} allocation would require {bytes} bytes, exceeding the \
+             {MAX_BMF_ALLOCATION_BYTES}-byte import limit"
+        )));
+    }
+    Ok(())
+}
+
+fn try_vec_with_capacity<T>(len: usize, description: &str) -> Result<Vec<T>, BmfError> {
+    validate_allocation::<T>(len, description)?;
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).map_err(|error| {
+        BmfError::Invalid(format!(
+            "could not allocate BMF {description} buffer for {len} items: {error}"
+        ))
+    })?;
+    Ok(values)
+}
+
+fn filled_vec<T: Clone>(len: usize, value: T, description: &str) -> Result<Vec<T>, BmfError> {
+    let mut values = try_vec_with_capacity(len, description)?;
+    values.resize(len, value);
+    Ok(values)
+}
+
+fn require_exact_len<T>(values: &[T], expected: usize, description: &str) -> Result<(), BmfError> {
+    if values.len() == expected {
+        Ok(())
+    } else {
+        Err(BmfError::Invalid(format!(
+            "BMF {description} returned {} values; expected exactly {expected}",
+            values.len()
+        )))
+    }
+}
+
 impl BmfModel {
     pub(crate) fn from_path(path: impl AsRef<Path>) -> Result<Self, BmfError> {
         let file = fs::File::open(path)?;
@@ -141,6 +192,11 @@ impl BmfModel {
         }
         let root = parse_bmf_metadata_root(slice)?;
         let metadata = BmfMetadata::from_node(&root)?;
+        // Every loaded model materializes both of these buffers. Validate the
+        // metadata-derived sizes before decoding any variable column or
+        // asking the allocator for memory.
+        validate_allocation::<usize>(metadata.n_blocks, "renderable block indices")?;
+        validate_allocation::<BlockBounds>(metadata.n_blocks, "block bounds")?;
         let rotation = compute_rotation_matrix(metadata.orientation);
         Ok(Self {
             metadata,
@@ -219,22 +275,33 @@ impl BmfModel {
 
     pub(crate) fn renderable_block_indices(&self) -> Result<Vec<usize>, BmfError> {
         let Some(variable) = self.empty_marker_variable() else {
-            return Ok((0..self.metadata.n_blocks).collect());
+            return self.all_block_indices();
         };
-        let empty_codes: std::collections::HashSet<u32> = variable
-            .strings
-            .iter()
-            .filter_map(|(&code, label)| is_empty_block_label(label).then_some(code))
-            .collect();
+        let mut empty_codes = try_vec_with_capacity(variable.strings.len(), "empty-block codes")?;
+        empty_codes.extend(
+            variable
+                .strings
+                .iter()
+                .filter_map(|(&code, label)| is_empty_block_label(label).then_some(code)),
+        );
         if empty_codes.is_empty() {
-            return Ok((0..self.metadata.n_blocks).collect());
+            return self.all_block_indices();
         }
         let codes = self.named_code_values(&variable.name)?;
-        Ok(codes
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, code)| (!empty_codes.contains(&code)).then_some(index))
-            .collect())
+        require_exact_len(&codes, self.metadata.n_blocks, "empty-block marker column")?;
+        let mut indices =
+            try_vec_with_capacity(self.metadata.n_blocks, "renderable block indices")?;
+        indices.extend(codes.into_iter().enumerate().filter_map(|(index, code)| {
+            empty_codes.binary_search(&code).is_err().then_some(index)
+        }));
+        Ok(indices)
+    }
+
+    fn all_block_indices(&self) -> Result<Vec<usize>, BmfError> {
+        let mut indices =
+            try_vec_with_capacity(self.metadata.n_blocks, "renderable block indices")?;
+        indices.extend(0..self.metadata.n_blocks);
+        Ok(indices)
     }
 
     pub(crate) fn block_bounds(&self) -> Result<Vec<BlockBounds>, BmfError> {
@@ -270,16 +337,29 @@ impl BmfModel {
         // model size.
         const BOUNDS_SLICE_BLOCKS: usize = 1 << 20;
         let n = self.metadata.n_blocks;
-        let mut blocks = Vec::with_capacity(n);
+        let mut blocks = try_vec_with_capacity(n, "block bounds")?;
         let mut start = 0;
         while start < n {
-            let end = (start + BOUNDS_SLICE_BLOCKS).min(n);
+            let end = start
+                .checked_add(BOUNDS_SLICE_BLOCKS)
+                .map_or(n, |candidate| candidate.min(n));
             let lower_x = self.numeric_values_range("__lower_x", start, end)?;
             let lower_y = self.numeric_values_range("__lower_y", start, end)?;
             let lower_z = self.numeric_values_range("__lower_z", start, end)?;
             let upper_x = self.numeric_values_range("__upper_x", start, end)?;
             let upper_y = self.numeric_values_range("__upper_y", start, end)?;
             let upper_z = self.numeric_values_range("__upper_z", start, end)?;
+            let expected = end - start;
+            for (name, values) in [
+                ("__lower_x", &lower_x),
+                ("__lower_y", &lower_y),
+                ("__lower_z", &lower_z),
+                ("__upper_x", &upper_x),
+                ("__upper_y", &upper_y),
+                ("__upper_z", &upper_z),
+            ] {
+                require_exact_len(values, expected, name)?;
+            }
             let rows = lower_x
                 .into_iter()
                 .zip(lower_y)
@@ -295,6 +375,7 @@ impl BmfModel {
             }
             start = end;
         }
+        require_exact_len(&blocks, n, "block bounds")?;
         Ok(blocks)
     }
 
@@ -321,7 +402,7 @@ impl BmfModel {
             (self.metadata.upper.y - self.metadata.lower.y) / dim_y as f64,
             (self.metadata.upper.z - self.metadata.lower.z) / dim_z as f64,
         );
-        let mut blocks = Vec::with_capacity(self.metadata.n_blocks);
+        let mut blocks = try_vec_with_capacity(self.metadata.n_blocks, "regular block bounds")?;
         for z in 0..dim_z {
             for y in 0..dim_y {
                 for x in 0..dim_x {
@@ -369,11 +450,16 @@ impl BmfModel {
         start: usize,
         end: usize,
     ) -> Result<Vec<f64>, BmfError> {
-        let end = end.min(self.metadata.n_blocks);
-        let start = start.min(end);
+        if start > end || end > self.metadata.n_blocks {
+            return Err(BmfError::Invalid(format!(
+                "BMF variable '{}' requested invalid block range {start}..{end}; model has {} blocks",
+                variable.name, self.metadata.n_blocks
+            )));
+        }
+        let requested_values = end - start;
         if variable.location == 0 {
             let value = parse_default_f64(variable);
-            return Ok(vec![value; end - start]);
+            return filled_vec(requested_values, value, "constant numeric values");
         }
 
         let values_per_page = match variable.physical_type.as_str() {
@@ -391,57 +477,110 @@ impl BmfModel {
         let first_page = start / values_per_page;
         let last_page = end.div_ceil(values_per_page);
         let page_offsets = self.value_page_offsets(variable.location, first_page..last_page)?;
-        let mut values = Vec::with_capacity(end - start + values_per_page);
-        for offset in page_offsets {
+        let expected_pages = last_page - first_page;
+        require_exact_len(&page_offsets, expected_pages, "numeric value page offsets")?;
+        let mut values = try_vec_with_capacity(requested_values, "numeric values")?;
+        for (relative_page, offset) in page_offsets.into_iter().enumerate() {
+            let page_index = first_page
+                .checked_add(relative_page)
+                .ok_or_else(|| BmfError::Invalid("BMF numeric page index overflowed".into()))?;
+            let page_start = page_index.checked_mul(values_per_page).ok_or_else(|| {
+                BmfError::Invalid("BMF numeric page block range overflowed".into())
+            })?;
+            let page_end = page_start
+                .checked_add(values_per_page)
+                .ok_or_else(|| BmfError::Invalid("BMF numeric page end overflowed".into()))?;
+            let value_start = start.saturating_sub(page_start);
+            let value_end = end.min(page_end).checked_sub(page_start).ok_or_else(|| {
+                BmfError::Invalid("BMF numeric page starts beyond the requested range".into())
+            })?;
+            let values_from_page = value_end.checked_sub(value_start).ok_or_else(|| {
+                BmfError::Invalid("BMF numeric page range is inconsistent".into())
+            })?;
             if offset == 0 {
-                values.extend(std::iter::repeat_n(
-                    parse_default_f64(variable),
-                    values_per_page,
-                ));
+                let new_len = values.len().checked_add(values_from_page).ok_or_else(|| {
+                    BmfError::Invalid("BMF numeric value count overflowed".into())
+                })?;
+                if new_len > requested_values {
+                    return Err(BmfError::Invalid(
+                        "BMF numeric pages produced more values than requested".into(),
+                    ));
+                }
+                values.resize(new_len, parse_default_f64(variable));
                 continue;
             }
             let payload = self.page_payload(offset)?;
+            let before = values.len();
             match variable.physical_type.as_str() {
                 "float" => {
-                    for chunk in payload.chunks_exact(4) {
+                    for chunk in payload
+                        .chunks_exact(4)
+                        .skip(value_start)
+                        .take(values_from_page)
+                    {
                         values.push(f32::from_le_bytes(read_chunk(chunk)?) as f64);
                     }
                 }
                 "short" => {
-                    for chunk in payload.chunks_exact(2) {
+                    for chunk in payload
+                        .chunks_exact(2)
+                        .skip(value_start)
+                        .take(values_from_page)
+                    {
                         values.push(i16::from_le_bytes(read_chunk(chunk)?) as f64);
                     }
                 }
                 "int" => {
-                    for chunk in payload.chunks_exact(4) {
+                    for chunk in payload
+                        .chunks_exact(4)
+                        .skip(value_start)
+                        .take(values_from_page)
+                    {
                         values.push(i32::from_le_bytes(read_chunk(chunk)?) as f64);
                     }
                 }
                 "longlong" => {
-                    for chunk in payload.chunks_exact(8) {
+                    for chunk in payload
+                        .chunks_exact(8)
+                        .skip(value_start)
+                        .take(values_from_page)
+                    {
                         values.push(i64::from_le_bytes(read_chunk(chunk)?) as f64);
                     }
                 }
                 "double" => {
-                    for chunk in payload.chunks_exact(8) {
+                    for chunk in payload
+                        .chunks_exact(8)
+                        .skip(value_start)
+                        .take(values_from_page)
+                    {
                         values.push(f64::from_le_bytes(read_chunk(chunk)?));
                     }
                 }
                 _ => unreachable!(),
             }
+            let produced = values.len().checked_sub(before).ok_or_else(|| {
+                BmfError::Invalid("BMF numeric value count moved backwards".into())
+            })?;
+            if produced != values_from_page {
+                return Err(BmfError::Invalid(format!(
+                    "BMF numeric data page yielded {} values; expected exactly {values_from_page}",
+                    produced
+                )));
+            }
         }
-        // `values` starts at block `first_page * values_per_page`; trim to
-        // the requested block range.
-        let skip = start - first_page * values_per_page;
-        values.drain(..skip.min(values.len()));
-        values.truncate(end - start);
+        require_exact_len(&values, requested_values, "numeric variable")?;
         Ok(values)
     }
 
     fn decode_named_variable(&self, variable: &BmfVariable) -> Result<Vec<u32>, BmfError> {
         if variable.location == 0 {
             let value = parse_default_code(variable);
-            return Ok(vec![value; self.metadata.n_blocks]);
+            return filled_vec(
+                self.metadata.n_blocks,
+                value,
+                "constant named variable values",
+            );
         }
 
         let values_per_page = match variable.physical_type.as_str() {
@@ -455,27 +594,61 @@ impl BmfModel {
         };
         let required_pages = self.metadata.n_blocks.div_ceil(values_per_page);
         let page_offsets = self.value_page_offsets(variable.location, 0..required_pages)?;
-        let mut values = Vec::with_capacity(self.metadata.n_blocks);
-        for offset in page_offsets {
+        require_exact_len(&page_offsets, required_pages, "named value page offsets")?;
+        let mut values = try_vec_with_capacity(self.metadata.n_blocks, "named variable values")?;
+        for (page_index, offset) in page_offsets.into_iter().enumerate() {
+            let page_start = page_index
+                .checked_mul(values_per_page)
+                .ok_or_else(|| BmfError::Invalid("BMF named page block range overflowed".into()))?;
+            let values_from_page = self
+                .metadata
+                .n_blocks
+                .checked_sub(page_start)
+                .ok_or_else(|| {
+                    BmfError::Invalid("BMF named page starts beyond the block count".into())
+                })?
+                .min(values_per_page);
             if offset == 0 {
-                values.extend(std::iter::repeat_n(
-                    parse_default_code(variable),
-                    values_per_page,
-                ));
+                let new_len = values
+                    .len()
+                    .checked_add(values_from_page)
+                    .ok_or_else(|| BmfError::Invalid("BMF named value count overflowed".into()))?;
+                if new_len > self.metadata.n_blocks {
+                    return Err(BmfError::Invalid(
+                        "BMF named pages produced more values than declared".into(),
+                    ));
+                }
+                values.resize(new_len, parse_default_code(variable));
                 continue;
             }
             let payload = self.page_payload(offset)?;
+            let before = values.len();
             match variable.physical_type.as_str() {
-                "namedbyte" => values.extend(payload.iter().map(|&value| u32::from(value))),
+                "namedbyte" => values.extend(
+                    payload
+                        .iter()
+                        .take(values_from_page)
+                        .map(|&value| u32::from(value)),
+                ),
                 "namedshort" => {
-                    for chunk in payload.chunks_exact(2) {
+                    for chunk in payload.chunks_exact(2).take(values_from_page) {
                         values.push(u32::from(u16::from_le_bytes(read_chunk(chunk)?)));
                     }
                 }
                 _ => unreachable!(),
             }
+            let produced = values
+                .len()
+                .checked_sub(before)
+                .ok_or_else(|| BmfError::Invalid("BMF named value count moved backwards".into()))?;
+            if produced != values_from_page {
+                return Err(BmfError::Invalid(format!(
+                    "BMF named data page yielded {} values; expected exactly {values_from_page}",
+                    produced
+                )));
+            }
         }
-        values.truncate(self.metadata.n_blocks);
+        require_exact_len(&values, self.metadata.n_blocks, "named variable")?;
         Ok(values)
     }
 
@@ -506,35 +679,76 @@ impl BmfModel {
         table_offset: u64,
         pages: std::ops::Range<usize>,
     ) -> Result<Vec<u64>, BmfError> {
+        if pages.start > pages.end {
+            return Err(BmfError::Invalid(format!(
+                "invalid BMF value-page range {}..{}",
+                pages.start, pages.end
+            )));
+        }
         let page = self.page(table_offset)?;
         let kind = &page[..2];
         let payload = &page[PAGE_HEADER_LEN..PAGE_HEADER_LEN + PAGE_PAYLOAD_LEN];
         match kind {
-            [0x01, 0x01] => Ok(read_u64_slots(payload)?
-                .into_iter()
-                .take(pages.end)
-                .skip(pages.start)
-                .collect()),
+            [0x01, 0x01] => {
+                validate_page_table_range(&pages, PAGE_TABLE_SLOTS, "leaf")?;
+                let expected = pages.len();
+                let mut offsets = try_vec_with_capacity(expected, "value page offsets")?;
+                for slot in pages {
+                    offsets.push(read_u64_slot(payload, slot)?);
+                }
+                require_exact_len(&offsets, expected, "value page offsets")?;
+                Ok(offsets)
+            }
             [0x02, 0x01] => {
-                let child_tables = read_u64_slots(payload)?;
-                let mut offsets = Vec::with_capacity(pages.len());
-                for page_index in pages {
-                    let child_index = page_index / 256;
-                    let child_slot = page_index % 256;
-                    let child_offset = child_tables.get(child_index).copied().unwrap_or(0);
+                validate_page_table_range(&pages, TWO_LEVEL_PAGE_TABLE_SLOTS, "two-level")?;
+                let mut offsets = try_vec_with_capacity(pages.len(), "value page offsets")?;
+                if pages.is_empty() {
+                    return Ok(offsets);
+                }
+
+                let first_child = pages.start / PAGE_TABLE_SLOTS;
+                let last_child = (pages.end - 1) / PAGE_TABLE_SLOTS;
+                for child_index in first_child..=last_child {
+                    let child_page_start =
+                        child_index.checked_mul(PAGE_TABLE_SLOTS).ok_or_else(|| {
+                            BmfError::Invalid("BMF child-table page range overflowed".into())
+                        })?;
+                    let requested_start = pages.start.max(child_page_start) - child_page_start;
+                    let requested_end =
+                        pages
+                            .end
+                            .min(child_page_start.checked_add(PAGE_TABLE_SLOTS).ok_or_else(
+                                || BmfError::Invalid("BMF child-table page end overflowed".into()),
+                            )?)
+                            - child_page_start;
+                    let requested_slots = requested_end - requested_start;
+                    let child_offset = read_u64_slot(payload, child_index)?;
                     if child_offset == 0 {
-                        offsets.push(0);
+                        // A present zero root slot explicitly denotes a sparse
+                        // run. It is distinct from asking beyond the 256 root
+                        // slots, which `validate_page_table_range` rejects.
+                        let new_len =
+                            offsets.len().checked_add(requested_slots).ok_or_else(|| {
+                                BmfError::Invalid("BMF value-page offset count overflowed".into())
+                            })?;
+                        offsets.resize(new_len, 0);
                         continue;
                     }
+
+                    // Decode/visit a child table once for the whole requested
+                    // slot group, rather than once for every value page.
                     let child = self.page(child_offset)?;
                     if child[..2] != [0x01, 0x01] {
-                        return Err(BmfError::Invalid("expected BMF leaf page table".into()));
+                        return Err(BmfError::Invalid(format!(
+                            "expected BMF leaf page table at offset {child_offset}"
+                        )));
                     }
-                    let slots = read_u64_slots(
-                        &child[PAGE_HEADER_LEN..PAGE_HEADER_LEN + PAGE_PAYLOAD_LEN],
-                    )?;
-                    offsets.push(slots.get(child_slot).copied().unwrap_or(0));
+                    let child_payload = &child[PAGE_HEADER_LEN..PAGE_HEADER_LEN + PAGE_PAYLOAD_LEN];
+                    for slot in requested_start..requested_end {
+                        offsets.push(read_u64_slot(child_payload, slot)?);
+                    }
                 }
+                require_exact_len(&offsets, pages.len(), "value page offsets")?;
                 Ok(offsets)
             }
             _ => Err(BmfError::Invalid(format!(
@@ -546,9 +760,17 @@ impl BmfModel {
     fn page(&self, offset: u64) -> Result<&[u8], BmfError> {
         let offset = usize::try_from(offset)
             .map_err(|_| BmfError::Invalid("BMF page offset does not fit in memory".into()))?;
+        if offset < PAGE_STRIDE || offset % PAGE_STRIDE != 0 {
+            return Err(BmfError::Invalid(format!(
+                "BMF page offset {offset} is not page-aligned"
+            )));
+        }
+        let end = offset.checked_add(PAGE_STRIDE).ok_or_else(|| {
+            BmfError::Invalid(format!("BMF page offset {offset} overflows the file range"))
+        })?;
         let bytes = self.bytes.as_ref().as_ref();
         bytes
-            .get(offset..offset + PAGE_STRIDE)
+            .get(offset..end)
             .ok_or_else(|| BmfError::Invalid(format!("BMF page offset {offset} is outside file")))
     }
 
@@ -564,18 +786,21 @@ impl BmfMetadata {
             .as_object()
             .ok_or_else(|| BmfError::Invalid("BMF metadata root is not an object".into()))?;
         let dims = [
-            object.usize("dim_x").unwrap_or(0),
-            object.usize("dim_y").unwrap_or(0),
-            object.usize("dim_z").unwrap_or(0),
+            metadata_usize(object, "dim_x")?.unwrap_or(0),
+            metadata_usize(object, "dim_y")?.unwrap_or(0),
+            metadata_usize(object, "dim_z")?.unwrap_or(0),
         ];
-        let inferred_blocks = dims
-            .into_iter()
-            .try_fold(1usize, |acc, value| {
-                (value > 0).then(|| acc.checked_mul(value)).flatten()
-            })
-            .unwrap_or(0);
+        let inferred_blocks = if dims.contains(&0) {
+            0
+        } else {
+            dims.into_iter()
+                .try_fold(1usize, |blocks, dimension| blocks.checked_mul(dimension))
+                .ok_or_else(|| {
+                    BmfError::Invalid("BMF metadata dimensions overflow the block count".into())
+                })?
+        };
         let mut metadata = Self {
-            n_blocks: object.usize("n_blocks").unwrap_or(inferred_blocks),
+            n_blocks: metadata_usize(object, "n_blocks")?.unwrap_or(inferred_blocks),
             origin: DVec3::new(
                 object.f64("origin_x").unwrap_or(0.0),
                 object.f64("origin_y").unwrap_or(0.0),
@@ -597,7 +822,7 @@ impl BmfMetadata {
                 object.f64("upper_z").unwrap_or(0.0),
             ),
             dims,
-            is_irregular: object.usize("is_irregular").unwrap_or(0) != 0,
+            is_irregular: metadata_usize(object, "is_irregular")?.unwrap_or(0) != 0,
             schemas: Vec::new(),
             variables: Vec::new(),
             raw_top_level: BTreeMap::new(),
@@ -611,7 +836,7 @@ impl BmfMetadata {
                     metadata.schemas.push(schema);
                 }
             } else if (key.starts_with("var_") || key.starts_with("special_"))
-                && let Some(mut variable) = BmfVariable::from_node(value)
+                && let Some(mut variable) = BmfVariable::from_node(value)?
             {
                 variable.special = key.starts_with("special_");
                 metadata.variables.push(variable);
@@ -656,8 +881,10 @@ impl BmfSchema {
 }
 
 impl BmfVariable {
-    fn from_node(node: &MetaNode) -> Option<Self> {
-        let object = node.as_object()?;
+    fn from_node(node: &MetaNode) -> Result<Option<Self>, BmfError> {
+        let Some(object) = node.as_object() else {
+            return Ok(None);
+        };
         let mut strings = BTreeMap::new();
         for (key, value) in object {
             if let Some(index) = key
@@ -668,7 +895,7 @@ impl BmfVariable {
                 strings.insert(index, label.clone());
             }
         }
-        Some(Self {
+        Ok(Some(Self {
             name: object.string("name").unwrap_or_default().trim().to_owned(),
             // Vulcan writes some metadata strings space-padded to a fixed
             // width; normalize so type matching doesn't depend on padding or
@@ -679,12 +906,12 @@ impl BmfVariable {
                 .trim()
                 .to_ascii_lowercase(),
             description: object.string("description").unwrap_or_default(),
-            location: object.u64("location").unwrap_or(0),
+            location: metadata_u64(object, "location")?.unwrap_or(0),
             default: object.string("default").unwrap_or_default(),
             global: object.string("global").unwrap_or_default(),
             strings,
             special: false,
-        })
+        }))
     }
 }
 
@@ -865,7 +1092,8 @@ fn header_primary_table_pointer(bytes: &[u8]) -> Option<usize> {
             .ok()?,
     );
     let pointer = usize::try_from(pointer).ok()?;
-    if pointer % PAGE_STRIDE != 0 || pointer < PAGE_STRIDE || pointer + PAGE_STRIDE > bytes.len() {
+    let end = pointer.checked_add(PAGE_STRIDE)?;
+    if pointer % PAGE_STRIDE != 0 || pointer < PAGE_STRIDE || end > bytes.len() {
         return None;
     }
     match bytes.get(pointer..pointer + 2)? {
@@ -926,17 +1154,20 @@ struct MetadataPage {
 fn collect_metadata_pages(bytes: &[u8]) -> Vec<MetadataPage> {
     let mut pages = Vec::new();
     let mut offset = FILE_HEADER_LEN + PAGE_HEADER_LEN;
-    let mut previous_metadata_offset = None;
-    while offset + PAGE_STRIDE <= bytes.len() {
-        let page = &bytes[offset..offset + PAGE_STRIDE];
+    let mut previous_metadata_offset: Option<usize> = None;
+    while let Some(end) = offset.checked_add(PAGE_STRIDE) {
+        if end > bytes.len() {
+            break;
+        }
+        let page = &bytes[offset..end];
         if page[..2] == METADATA_PAGE_KIND {
             let payload_len =
                 usize::from(u16::from_le_bytes([page[2], page[3]])).clamp(1, PAGE_PAYLOAD_LEN);
             let payload = &page[PAGE_HEADER_LEN..PAGE_HEADER_LEN + payload_len];
             let text = String::from_utf8_lossy(payload).replace('\0', "");
             let starts_root = text.trim_start().starts_with('{');
-            let contiguous_with_previous =
-                previous_metadata_offset.is_some_and(|previous| previous + PAGE_STRIDE == offset);
+            let contiguous_with_previous = previous_metadata_offset
+                .is_some_and(|previous| previous.checked_add(PAGE_STRIDE) == Some(offset));
             pages.push(MetadataPage {
                 text,
                 offset,
@@ -945,7 +1176,7 @@ fn collect_metadata_pages(bytes: &[u8]) -> Vec<MetadataPage> {
             });
             previous_metadata_offset = Some(offset);
         }
-        offset += PAGE_STRIDE;
+        offset = end;
     }
     pages
 }
@@ -1085,11 +1316,32 @@ fn push_metadata_run_candidates(run: &[&MetadataPage], candidates: &mut Vec<Meta
     }
 }
 
-fn read_u64_slots(payload: &[u8]) -> Result<Vec<u64>, BmfError> {
-    payload
-        .chunks_exact(8)
-        .map(|chunk| Ok(u64::from_le_bytes(read_chunk(chunk)?)))
-        .collect()
+fn validate_page_table_range(
+    pages: &std::ops::Range<usize>,
+    capacity: usize,
+    table_kind: &str,
+) -> Result<(), BmfError> {
+    if pages.end <= capacity {
+        Ok(())
+    } else {
+        Err(BmfError::Invalid(format!(
+            "BMF {table_kind} page table contains {capacity} slots, but pages {}..{} were requested",
+            pages.start, pages.end
+        )))
+    }
+}
+
+fn read_u64_slot(payload: &[u8], slot: usize) -> Result<u64, BmfError> {
+    let start = slot
+        .checked_mul(size_of::<u64>())
+        .ok_or_else(|| BmfError::Invalid("BMF page-table slot offset overflowed".into()))?;
+    let end = start
+        .checked_add(size_of::<u64>())
+        .ok_or_else(|| BmfError::Invalid("BMF page-table slot end overflowed".into()))?;
+    let bytes = payload.get(start..end).ok_or_else(|| {
+        BmfError::Invalid(format!("BMF page table is missing structural slot {slot}"))
+    })?;
+    Ok(u64::from_le_bytes(read_chunk(bytes)?))
 }
 
 /// Converts a byte slice into a fixed-size array, returning a `BmfError`
@@ -1167,7 +1419,6 @@ impl MetaNode {
 trait MetaObjectExt {
     fn string(&self, key: &str) -> Option<String>;
     fn f64(&self, key: &str) -> Option<f64>;
-    fn u64(&self, key: &str) -> Option<u64>;
     fn usize(&self, key: &str) -> Option<usize>;
 }
 
@@ -1180,13 +1431,40 @@ impl MetaObjectExt for BTreeMap<String, MetaNode> {
         self.string(key)?.trim().parse().ok()
     }
 
-    fn u64(&self, key: &str) -> Option<u64> {
-        self.string(key)?.trim().parse().ok()
-    }
-
     fn usize(&self, key: &str) -> Option<usize> {
         self.string(key)?.trim().parse().ok()
     }
+}
+
+fn metadata_usize(
+    object: &BTreeMap<String, MetaNode>,
+    key: &str,
+) -> Result<Option<usize>, BmfError> {
+    let Some(node) = object.get(key) else {
+        return Ok(None);
+    };
+    let value = node
+        .as_scalar()
+        .ok_or_else(|| BmfError::Invalid(format!("BMF metadata field '{key}' must be a scalar")))?;
+    value.trim().parse::<usize>().map(Some).map_err(|error| {
+        BmfError::Invalid(format!(
+            "invalid BMF metadata field '{key}' value {value:?}: {error}"
+        ))
+    })
+}
+
+fn metadata_u64(object: &BTreeMap<String, MetaNode>, key: &str) -> Result<Option<u64>, BmfError> {
+    let Some(node) = object.get(key) else {
+        return Ok(None);
+    };
+    let value = node
+        .as_scalar()
+        .ok_or_else(|| BmfError::Invalid(format!("BMF metadata field '{key}' must be a scalar")))?;
+    value.trim().parse::<u64>().map(Some).map_err(|error| {
+        BmfError::Invalid(format!(
+            "invalid BMF metadata field '{key}' value {value:?}: {error}"
+        ))
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1244,10 +1522,11 @@ fn metadata_root_score(node: &MetaNode) -> usize {
         .keys()
         .filter(|key| key.starts_with("schema_"))
         .count();
-    variables * 10
-        + schemas * 3
-        + usize::from(object.contains_key("n_blocks"))
-        + usize::from(object.contains_key("dim_x"))
+    variables
+        .saturating_mul(10)
+        .saturating_add(schemas.saturating_mul(3))
+        .saturating_add(usize::from(object.contains_key("n_blocks")))
+        .saturating_add(usize::from(object.contains_key("dim_x")))
 }
 
 fn tokenize(text: &str) -> Vec<Token> {

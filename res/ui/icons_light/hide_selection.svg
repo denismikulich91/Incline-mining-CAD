@@ -1,78 +1,11 @@
-<?xml version="1.0" encoding="UTF-8" standalone="no"?>
-<!-- Uploaded to: SVG Repo, www.svgrepo.com, Generator: SVG Repo Mixer Tools -->
-
-<svg
-   width="800px"
-   height="800px"
-   viewBox="0 0 24 24"
-   fill="none"
-   version="1.1"
-   id="svg2"
-   sodipodi:docname="hide_selection.svg"
-   inkscape:version="1.4.4 (dcaf3e7d9e, 2026-05-05)"
-   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
-   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
-   xmlns:xlink="http://www.w3.org/1999/xlink"
-   xmlns="http://www.w3.org/2000/svg"
-   xmlns:svg="http://www.w3.org/2000/svg">
-  <defs
-     id="defs2">
-    <pattern
-       inkscape:collect="always"
-       xlink:href="#pattern8350"
-       id="pattern2"
-       patternTransform="matrix(0.5636977,0,0,0.44211584,136.89768,661.91028)"
-       x="0"
-       y="0"
-       preserveAspectRatio="none" />
-    <pattern
-       patternUnits="userSpaceOnUse"
-       width="5"
-       height="5"
-       style="fill:#434343"
-       patternTransform="translate(125,600) scale(2)"
-       id="pattern8350"
-       inkscape:label="Triangles 1"
-       inkscape:collect="always"
-       inkscape:isstock="true">
-      <path
-         style="opacity:1;stroke:none;stroke-width:4.8561;stroke-linecap:square;paint-order:stroke markers fill;stop-color:#000000"
-         d="M 0,0 V 5 H 5 Z"
-         id="path8348" />
-    </pattern>
-  </defs>
-  <sodipodi:namedview
-     id="namedview2"
-     pagecolor="#ffffff"
-     bordercolor="#000000"
-     borderopacity="0.25"
-     inkscape:showpageshadow="2"
-     inkscape:pageopacity="0.0"
-     inkscape:pagecheckerboard="0"
-     inkscape:deskcolor="#d1d1d1"
-     inkscape:zoom="0.51132659"
-     inkscape:cx="275.75331"
-     inkscape:cy="595.50981"
-     inkscape:window-width="2560"
-     inkscape:window-height="1366"
-     inkscape:window-x="0"
-     inkscape:window-y="0"
-     inkscape:window-maximized="1"
-     inkscape:current-layer="svg2" />
-  <path
-     d="M 1.4114176,12.788293 C 1.2608992,12.549882 1.185629,12.430731 1.1434954,12.246922 c -0.031644,-0.138051 -0.031644,-0.355793 0,-0.493844 0.042134,-0.183809 0.1174038,-0.30296 0.2679222,-0.541371 C 2.6553215,9.2421256 6.357898,4.2629728 12.000401,4.2629728 c 5.642504,0 9.345113,4.9791528 10.589006,6.9487342 0.150541,0.238411 0.225811,0.357562 0.267922,0.541371 0.03161,0.138051 0.03161,0.355793 0,0.493844 -0.04211,0.183809 -0.117381,0.30296 -0.267922,0.541371 -1.243893,1.969626 -4.946502,6.948734 -10.589006,6.948734 -5.642503,0 -9.3450795,-4.979108 -10.5889834,-6.948734 z"
-     stroke="#000000"
-     stroke-width="2.21058"
-     stroke-linecap="round"
-     stroke-linejoin="round"
-     id="path1"
-     style="fill:url(#pattern2);stroke:#1c1c1e;stroke-opacity:1" />
-  <path
-     d="m 12.000401,15.315869 c 1.831355,0 3.315869,-1.484515 3.315869,-3.315869 0,-1.831354 -1.484514,-3.3158688 -3.315869,-3.3158688 -1.831354,0 -3.3158684,1.4845148 -3.3158684,3.3158688 0,1.831354 1.4845144,3.315869 3.3158684,3.315869 z"
-     stroke="#000000"
-     stroke-width="2.21058"
-     stroke-linecap="round"
-     stroke-linejoin="round"
-     id="path2"
-     style="fill:#ffffff;fill-opacity:1;stroke:#1c1c1e;stroke-opacity:1" />
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="800px" height="800px" fill="none" version="1.1" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+ <defs>
+  <pattern id="b" xlink:href="#a" patternTransform="matrix(.5637 0 0 .44212 136.9 661.91)" preserveAspectRatio="none"/>
+  <pattern id="a" width="5" height="5" style="fill:#434343" patternTransform="translate(125,600) scale(2)" patternUnits="userSpaceOnUse">
+   <path d="m0 0v5h5z" style="paint-order:stroke markers fill;stop-color:#000000"/>
+  </pattern>
+ </defs>
+ <path d="m1.4114 12.788c-0.15052-0.23841-0.22579-0.35756-0.26792-0.54137-0.031644-0.13805-0.031644-0.35579 0-0.49384 0.042134-0.18381 0.1174-0.30296 0.26792-0.54137 1.2439-1.9696 4.9465-6.9487 10.589-6.9487 5.6425 0 9.3451 4.9792 10.589 6.9487 0.15054 0.23841 0.22581 0.35756 0.26792 0.54137 0.03161 0.13805 0.03161 0.35579 0 0.49384-0.04211 0.18381-0.11738 0.30296-0.26792 0.54137-1.2439 1.9696-4.9465 6.9487-10.589 6.9487-5.6425 0-9.3451-4.9791-10.589-6.9487z" stroke="#000" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2106" style="fill:url(#b);stroke:#1c1c1e"/>
+ <path d="m12 15.316c1.8314 0 3.3159-1.4845 3.3159-3.3159s-1.4845-3.3159-3.3159-3.3159c-1.8314 0-3.3159 1.4845-3.3159 3.3159s1.4845 3.3159 3.3159 3.3159z" stroke="#000" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2106" style="fill:#fff;stroke:#1c1c1e"/>
 </svg>

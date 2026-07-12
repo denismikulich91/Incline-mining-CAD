@@ -1,11 +1,13 @@
 //! Editable mine-design document model and source of truth for the editor.
 
+pub(crate) mod atomic_file;
 pub(crate) mod block_model;
 pub(crate) mod formats;
 pub(crate) mod geometry;
 pub(crate) mod kernel;
 pub(crate) mod pidb;
 pub(crate) mod point_cloud;
+pub(crate) mod raster;
 pub(crate) mod road_network;
 pub(crate) mod spatial;
 pub(crate) mod triangulation;
@@ -180,6 +182,171 @@ impl Object {
         }
     }
 
+    /// Content fingerprint for dirty tracking. Ids are masked to their local
+    /// 32-bit half so the hash is stable across runtime namespacing; floats
+    /// hash by bit pattern so a reverted edit hashes back to the saved value.
+    pub(crate) fn content_hash(&self) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        const LOCAL_MASK: u64 = u32::MAX as u64;
+
+        fn hash_color(hasher: &mut DefaultHasher, color: ObjectColor) {
+            match color {
+                ObjectColor::ByLayer => 0u8.hash(hasher),
+                ObjectColor::Fixed(rgba) => {
+                    1u8.hash(hasher);
+                    for channel in rgba {
+                        channel.to_bits().hash(hasher);
+                    }
+                }
+            }
+        }
+        fn hash_pos(hasher: &mut DefaultHasher, pos: DVec3) {
+            pos.x.to_bits().hash(hasher);
+            pos.y.to_bits().hash(hasher);
+            pos.z.to_bits().hash(hasher);
+        }
+        fn hash_verts(hasher: &mut DefaultHasher, verts: &[PolyVertex]) {
+            verts.len().hash(hasher);
+            for vertex in verts {
+                hash_pos(hasher, vertex.pos);
+                vertex.bulge.to_bits().hash(hasher);
+            }
+        }
+
+        let mut hasher = DefaultHasher::new();
+        (self.id().0 & LOCAL_MASK).hash(&mut hasher);
+        (self.layer().0 & LOCAL_MASK).hash(&mut hasher);
+        match self {
+            Object::Point { pos, color, .. } => {
+                0u8.hash(&mut hasher);
+                hash_pos(&mut hasher, *pos);
+                hash_color(&mut hasher, *color);
+            }
+            Object::Polyline {
+                verts,
+                closed,
+                color,
+                fill,
+                line_weight,
+                ..
+            } => {
+                1u8.hash(&mut hasher);
+                hash_verts(&mut hasher, verts);
+                closed.hash(&mut hasher);
+                hash_color(&mut hasher, *color);
+                std::mem::discriminant(fill).hash(&mut hasher);
+                line_weight.to_bits().hash(&mut hasher);
+            }
+            Object::Text {
+                pos,
+                content,
+                height,
+                rotation,
+                color,
+                ..
+            } => {
+                2u8.hash(&mut hasher);
+                hash_pos(&mut hasher, *pos);
+                content.hash(&mut hasher);
+                height.to_bits().hash(&mut hasher);
+                rotation.to_bits().hash(&mut hasher);
+                hash_color(&mut hasher, *color);
+            }
+            Object::Road {
+                centerline,
+                width,
+                camber_degrees,
+                shape,
+                color,
+                ..
+            } => {
+                3u8.hash(&mut hasher);
+                hash_verts(&mut hasher, centerline);
+                width.to_bits().hash(&mut hasher);
+                camber_degrees.to_bits().hash(&mut hasher);
+                std::mem::discriminant(shape).hash(&mut hasher);
+                hash_color(&mut hasher, *color);
+            }
+        }
+        hasher.finish()
+    }
+
+    /// Check variant-specific geometry invariants: finite coordinates,
+    /// non-negative sizes/widths, and minimum vertex counts.
+    pub(crate) fn validate_geometry(&self) -> Result<(), String> {
+        fn require_finite_verts(verts: &[PolyVertex], what: &str) -> Result<(), String> {
+            if verts.len() < 2 {
+                return Err(format!("{what} needs at least 2 vertices"));
+            }
+            for vertex in verts {
+                if !vertex.pos.is_finite() {
+                    return Err(format!("{what} contains a non-finite vertex"));
+                }
+                if !vertex.bulge.is_finite() {
+                    return Err(format!("{what} contains a non-finite bulge"));
+                }
+            }
+            Ok(())
+        }
+        if let ObjectColor::Fixed(rgba) = self.color()
+            && rgba.iter().any(|channel| !channel.is_finite())
+        {
+            return Err("non-finite colour".to_string());
+        }
+        match self {
+            Object::Point { pos, .. } => {
+                if !pos.is_finite() {
+                    return Err("non-finite point position".to_string());
+                }
+            }
+            Object::Polyline {
+                verts,
+                closed,
+                line_weight,
+                ..
+            } => {
+                require_finite_verts(verts, "polyline")?;
+                if *closed && verts.len() < 3 {
+                    return Err("closed polyline needs at least 3 vertices".to_string());
+                }
+                if !line_weight.is_finite() || *line_weight < 0.0 {
+                    return Err("invalid polyline line weight".to_string());
+                }
+            }
+            Object::Text {
+                pos,
+                height,
+                rotation,
+                ..
+            } => {
+                if !pos.is_finite() {
+                    return Err("non-finite text position".to_string());
+                }
+                if !height.is_finite() || *height < 0.0 {
+                    return Err("invalid text height".to_string());
+                }
+                if !rotation.is_finite() {
+                    return Err("non-finite text rotation".to_string());
+                }
+            }
+            Object::Road {
+                centerline,
+                width,
+                camber_degrees,
+                ..
+            } => {
+                require_finite_verts(centerline, "road centerline")?;
+                if !width.is_finite() || *width < 0.0 {
+                    return Err("invalid road width".to_string());
+                }
+                if !camber_degrees.is_finite() {
+                    return Err("non-finite road camber".to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn translate(&mut self, delta: DVec3) {
         match self {
             Object::Point { pos, .. } | Object::Text { pos, .. } => *pos += delta,
@@ -298,6 +465,95 @@ impl Document {
         &self.objects
     }
 
+    /// Convert impossible two-vertex closed polylines into open polylines.
+    ///
+    /// Some legacy design files encode ordinary two-point strings as closed
+    /// polygons. Keeping the vertices and opening the string preserves the
+    /// useful geometry while restoring the model invariant that polygons have
+    /// at least three vertices.
+    pub(crate) fn repair_degenerate_closed_polylines(&mut self) -> usize {
+        let mut repaired = 0;
+        for object in &mut self.objects {
+            if let Object::Polyline { verts, closed, .. } = object
+                && *closed
+                && verts.len() == 2
+            {
+                *closed = false;
+                repaired += 1;
+            }
+        }
+        if repaired > 0 {
+            self.touch();
+        }
+        repaired
+    }
+
+    /// Validate on-disk model invariants. Runs on deserialized documents
+    /// before runtime namespacing, so all ids must still be in the local
+    /// 32-bit namespace. Identity collisions are reported, never silently
+    /// repaired: a repaired duplicate would alias a different object than the
+    /// file author intended.
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        use anyhow::bail;
+        const LOCAL_MASK: u64 = u32::MAX as u64;
+
+        let mut layer_ids = std::collections::HashSet::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            if layer.id.0 > LOCAL_MASK {
+                bail!(
+                    "layer '{}' has id {} outside the 32-bit PIDB id range",
+                    layer.name,
+                    layer.id.0
+                );
+            }
+            if !layer_ids.insert(layer.id) {
+                bail!("duplicate layer id {} ('{}')", layer.id.0, layer.name);
+            }
+            if !layer.elevation.is_finite() {
+                bail!("layer '{}' has a non-finite elevation", layer.name);
+            }
+            if layer.color.iter().any(|channel| !channel.is_finite()) {
+                bail!("layer '{}' has a non-finite colour", layer.name);
+            }
+        }
+
+        let mut object_ids = std::collections::HashSet::with_capacity(self.objects.len());
+        for object in &self.objects {
+            let id = object.id();
+            if id.0 > LOCAL_MASK {
+                bail!(
+                    "{} object has id {} outside the 32-bit PIDB id range",
+                    object.kind_name(),
+                    id.0
+                );
+            }
+            if !object_ids.insert(id) {
+                bail!("duplicate object id {}", id.0);
+            }
+            if !layer_ids.contains(&object.layer()) {
+                bail!(
+                    "{} object {} references missing layer {}",
+                    object.kind_name(),
+                    id.0,
+                    object.layer().0
+                );
+            }
+            object
+                .validate_geometry()
+                .map_err(|error| anyhow::anyhow!("object {}: {error}", id.0))?;
+        }
+        Ok(())
+    }
+
+    /// Recompute the id counters from the actual ids present, instead of
+    /// trusting serialized counters that may be stale or malicious.
+    pub(crate) fn recompute_id_counters(&mut self) {
+        let max_layer = self.layers.iter().map(|layer| layer.id.0).max();
+        let max_object = self.objects.iter().map(|object| object.id().0).max();
+        self.next_layer_id = max_layer.map_or(0, |id| id.saturating_add(1));
+        self.next_object_id = max_object.map_or(0, |id| id.saturating_add(1));
+    }
+
     pub(crate) fn rebuild_object_index(&mut self) {
         self.object_index = self
             .objects
@@ -344,6 +600,7 @@ impl Document {
     pub(crate) fn allocate_layer_id(&mut self) -> LayerId {
         let id = LayerId(self.next_layer_id);
         self.next_layer_id += 1;
+        self.touch();
         id
     }
 
@@ -361,6 +618,7 @@ impl Document {
     pub(crate) fn allocate_object_id(&mut self) -> ObjectId {
         let id = ObjectId(self.next_object_id);
         self.next_object_id += 1;
+        self.touch();
         id
     }
 
@@ -441,19 +699,65 @@ impl Document {
         Some(object)
     }
 
-    pub(crate) fn layer(&self, id: LayerId) -> Option<&Layer> {
-        self.layers.iter().find(|layer| layer.id == id)
+    /// Remove many objects in one retain/reindex pass. Returns each object's
+    /// original draw-order index for exact undo restoration.
+    fn remove_objects_bulk(
+        &mut self,
+        ids: &std::collections::HashSet<ObjectId>,
+    ) -> HashMap<ObjectId, usize> {
+        let positions: HashMap<_, _> = self
+            .objects
+            .iter()
+            .enumerate()
+            .filter(|(_, object)| ids.contains(&object.id()))
+            .map(|(index, object)| (object.id(), index))
+            .collect();
+        if positions.is_empty() {
+            return positions;
+        }
+        self.objects.retain(|object| !ids.contains(&object.id()));
+        for id in positions.keys() {
+            self.object_revisions.remove(id);
+        }
+        self.rebuild_object_index();
+        self.touch();
+        positions
     }
 
-    /// Replace a layer's record in place (preserving its list position), or
-    /// append it if absent.
-    pub(crate) fn upsert_layer(&mut self, layer: &Layer) {
-        self.next_layer_id = self.next_layer_id.max(layer.id.0.saturating_add(1));
-        match self.layers.iter_mut().find(|l| l.id == layer.id) {
-            Some(existing) => *existing = layer.clone(),
-            None => self.layers.push(layer.clone()),
+    fn restore_objects_bulk(&mut self, mut inserts: Vec<(usize, Object)>) {
+        if inserts.is_empty() {
+            return;
         }
+        inserts.sort_by_key(|(index, _)| *index);
+        let total = self.objects.len().saturating_add(inserts.len());
+        let existing = std::mem::take(&mut self.objects);
+        let mut existing = existing.into_iter();
+        let mut inserts = inserts.into_iter().peekable();
+        self.objects = Vec::with_capacity(total);
+        for index in 0..total {
+            if inserts
+                .peek()
+                .is_some_and(|(insert_at, _)| *insert_at == index)
+            {
+                let (_, object) = inserts.next().expect("peeked insert disappeared");
+                self.bump_next_object_id(object.id());
+                self.objects.push(object);
+            } else if let Some(object) = existing.next() {
+                self.objects.push(object);
+            }
+        }
+        self.objects.extend(existing);
+        self.objects.extend(inserts.map(|(_, object)| object));
+        self.rebuild_object_index();
         self.touch();
+        let revision = self.revision;
+        for object in &self.objects {
+            self.object_revisions.entry(object.id()).or_insert(revision);
+        }
+    }
+
+    pub(crate) fn layer(&self, id: LayerId) -> Option<&Layer> {
+        self.layers.iter().find(|layer| layer.id == id)
     }
 
     /// Remove a layer by id. Returns false if the layer did not exist.
@@ -514,11 +818,6 @@ impl Document {
         self.touch();
     }
 
-    /// Normalize ids for serialization without marking the document as edited.
-    pub(crate) fn apply_runtime_namespace_for_io(&mut self, namespace: u32) {
-        self.apply_runtime_namespace_inner(namespace);
-    }
-
     fn apply_runtime_namespace_inner(&mut self, namespace: u32) {
         const LOCAL_MASK: u64 = u32::MAX as u64;
         let prefix = u64::from(namespace) << 32;
@@ -561,6 +860,30 @@ impl Document {
         }
         for object in objects {
             self.insert_object(object.clone());
+        }
+        self.touch();
+    }
+
+    /// Bulk variant of [`Self::append_layer_snapshot`] for composite-scene
+    /// construction: objects are appended without per-insert index
+    /// maintenance or duplicate-id probing, while retaining their source
+    /// revisions for renderer cache invalidation. The caller must guarantee
+    /// unique ids (runtime namespacing does, across projects) and call
+    /// [`Self::rebuild_object_index`] once after the final append.
+    pub(crate) fn append_layer_snapshot_unindexed<'a>(
+        &mut self,
+        layer: &Layer,
+        objects: impl Iterator<Item = (&'a Object, u64)>,
+    ) {
+        if self.layer(layer.id).is_none() {
+            self.next_layer_id = self.next_layer_id.max(layer.id.0.saturating_add(1));
+            self.layers.push(layer.clone());
+        }
+        for (object, source_revision) in objects {
+            let id = object.id();
+            self.bump_next_object_id(id);
+            self.objects.push(object.clone());
+            self.object_revisions.insert(id, source_revision);
         }
         self.touch();
     }
@@ -616,6 +939,55 @@ impl Document {
         self.touch();
         self.object_revisions.insert(id, self.revision);
     }
+
+    /// Namespace-invariant content fingerprint used for dirty tracking.
+    ///
+    /// Per-object hashes are cached in `cache` keyed by object revision, so
+    /// after an edit only the touched objects re-hash — unlike serializing
+    /// the whole document to JSON, which interactive drags used to repeat on
+    /// every pointer event. Ids are masked to their 32-bit local half so the
+    /// fingerprint is identical before and after runtime namespacing.
+    pub(crate) fn content_hash(&self, cache: &mut HashMap<ObjectId, (u64, u64)>) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        const LOCAL_MASK: u64 = u32::MAX as u64;
+
+        let mut hasher = DefaultHasher::new();
+        // These counters are serialized too. Masking keeps the savepoint
+        // stable after a project receives its runtime namespace, while still
+        // detecting an allocated-but-not-yet-inserted id.
+        (self.next_layer_id & LOCAL_MASK).hash(&mut hasher);
+        (self.next_object_id & LOCAL_MASK).hash(&mut hasher);
+        self.layers.len().hash(&mut hasher);
+        for layer in &self.layers {
+            (layer.id.0 & LOCAL_MASK).hash(&mut hasher);
+            layer.name.hash(&mut hasher);
+            layer.color_index.hash(&mut hasher);
+            for channel in layer.color {
+                channel.to_bits().hash(&mut hasher);
+            }
+            layer.visible.hash(&mut hasher);
+            layer.elevation.to_bits().hash(&mut hasher);
+        }
+        self.objects.len().hash(&mut hasher);
+        for object in &self.objects {
+            let id = object.id();
+            let object_revision = self.object_revision(id);
+            let object_hash = match cache.get(&id) {
+                Some(&(revision, hash)) if revision == object_revision => hash,
+                _ => {
+                    let hash = object.content_hash();
+                    cache.insert(id, (object_revision, hash));
+                    hash
+                }
+            };
+            object_hash.hash(&mut hasher);
+        }
+        // Prune deleted objects once stale entries dominate the cache.
+        if cache.len() > self.objects.len().saturating_mul(2).max(64) {
+            cache.retain(|id, _| self.object_index.contains_key(id));
+        }
+        hasher.finish()
+    }
 }
 
 /// A reversible edit to the document.
@@ -661,6 +1033,50 @@ impl Command {
         }
     }
 
+    fn estimated_bytes(&self) -> usize {
+        fn object_bytes(object: &Object) -> usize {
+            std::mem::size_of::<Object>()
+                + match object {
+                    Object::Polyline { verts, .. } => verts
+                        .len()
+                        .saturating_mul(std::mem::size_of::<PolyVertex>()),
+                    Object::Road { centerline, .. } => centerline
+                        .len()
+                        .saturating_mul(std::mem::size_of::<PolyVertex>()),
+                    Object::Text { content, .. } => content.len(),
+                    Object::Point { .. } => 0,
+                }
+        }
+        fn layer_bytes(layer: &Layer) -> usize {
+            std::mem::size_of::<Layer>() + layer.name.len()
+        }
+
+        std::mem::size_of::<Command>()
+            + match self {
+                Command::AddObject(object) | Command::DeleteObject { object, .. } => {
+                    object_bytes(object)
+                }
+                Command::Replace { before, after } => {
+                    object_bytes(before).saturating_add(object_bytes(after))
+                }
+                Command::Batch(commands) => commands
+                    .iter()
+                    .map(Command::estimated_bytes)
+                    .fold(0usize, usize::saturating_add),
+                Command::RenameLayer { before, after, .. } => {
+                    before.len().saturating_add(after.len())
+                }
+                Command::AddLayerSnapshot { layer, objects }
+                | Command::DeleteLayerSnapshot { layer, objects } => layer_bytes(layer)
+                    .saturating_add(
+                        objects
+                            .iter()
+                            .map(object_bytes)
+                            .fold(0usize, usize::saturating_add),
+                    ),
+            }
+    }
+
     fn apply(&mut self, doc: &mut Document) {
         match self {
             Command::AddObject(object) => doc.insert_object(object.clone()),
@@ -672,8 +1088,27 @@ impl Command {
                 doc.replace_object(after.clone());
             }
             Command::Batch(cmds) => {
-                for cmd in cmds {
-                    cmd.apply(doc);
+                if cmds
+                    .iter()
+                    .all(|command| matches!(command, Command::DeleteObject { .. }))
+                {
+                    let ids: std::collections::HashSet<_> = cmds
+                        .iter()
+                        .filter_map(|command| match command {
+                            Command::DeleteObject { object, .. } => Some(object.id()),
+                            _ => None,
+                        })
+                        .collect();
+                    let positions = doc.remove_objects_bulk(&ids);
+                    for command in cmds {
+                        if let Command::DeleteObject { object, index } = command {
+                            *index = positions.get(&object.id()).copied();
+                        }
+                    }
+                } else {
+                    for cmd in cmds {
+                        cmd.apply(doc);
+                    }
                 }
             }
             Command::RenameLayer { id, after, .. } => doc.rename_layer(*id, after.clone()),
@@ -702,8 +1137,25 @@ impl Command {
                 doc.replace_object(before.clone());
             }
             Command::Batch(cmds) => {
-                for cmd in cmds.iter().rev() {
-                    cmd.revert(doc);
+                if cmds
+                    .iter()
+                    .all(|command| matches!(command, Command::DeleteObject { .. }))
+                {
+                    let inserts = cmds
+                        .iter()
+                        .filter_map(|command| match command {
+                            Command::DeleteObject {
+                                object,
+                                index: Some(index),
+                            } => Some((*index, object.clone())),
+                            _ => None,
+                        })
+                        .collect();
+                    doc.restore_objects_bulk(inserts);
+                } else {
+                    for cmd in cmds.iter().rev() {
+                        cmd.revert(doc);
+                    }
                 }
             }
             Command::RenameLayer { id, before, .. } => doc.rename_layer(*id, before.clone()),
@@ -720,11 +1172,40 @@ impl Command {
     }
 }
 
-/// Undo/redo stacks. Every document edit goes through `execute`.
+struct HistoryEntry {
+    command: Command,
+    estimated_bytes: usize,
+    sequence: u64,
+}
+
 #[derive(Default)]
+struct ProjectHistory {
+    undo: Vec<HistoryEntry>,
+    redo: Vec<HistoryEntry>,
+}
+
+/// Per-project undo/redo histories with a high global retained-memory cap.
+/// Switching PIDBs changes the active stack instead of deleting it.
 pub(crate) struct History {
-    undo: Vec<Command>,
-    redo: Vec<Command>,
+    projects: HashMap<u32, ProjectHistory>,
+    active_project: Option<u32>,
+    retained_bytes: usize,
+    next_sequence: u64,
+    max_retained_bytes: usize,
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self {
+            projects: HashMap::new(),
+            active_project: None,
+            retained_bytes: 0,
+            next_sequence: 0,
+            // Large enough for production geometry edits, but finite so a
+            // long session cannot retain unbounded cloned meshes forever.
+            max_retained_bytes: 1024 * 1024 * 1024,
+        }
+    }
 }
 
 impl History {
@@ -732,30 +1213,97 @@ impl History {
         Self::default()
     }
 
+    pub(crate) fn activate(&mut self, runtime_id: u32) {
+        self.active_project = Some(runtime_id);
+        self.projects.entry(runtime_id).or_default();
+    }
+
+    pub(crate) fn deactivate(&mut self) {
+        self.active_project = None;
+    }
+
+    pub(crate) fn remove_project(&mut self, runtime_id: u32) {
+        if let Some(history) = self.projects.remove(&runtime_id) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(
+                history
+                    .undo
+                    .iter()
+                    .chain(&history.redo)
+                    .map(|entry| entry.estimated_bytes)
+                    .sum::<usize>(),
+            );
+        }
+        if self.active_project == Some(runtime_id) {
+            self.active_project = None;
+        }
+    }
+
     pub(crate) fn clear(&mut self) {
-        self.undo.clear();
-        self.redo.clear();
+        let Some(runtime_id) = self.active_project else {
+            return;
+        };
+        self.clear_project(runtime_id);
+    }
+
+    pub(crate) fn clear_project(&mut self, runtime_id: u32) {
+        if let Some(history) = self.projects.get_mut(&runtime_id) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(
+                history
+                    .undo
+                    .iter()
+                    .chain(&history.redo)
+                    .map(|entry| entry.estimated_bytes)
+                    .sum::<usize>(),
+            );
+            history.undo.clear();
+            history.redo.clear();
+        }
     }
 
     pub(crate) fn execute(&mut self, doc: &mut Document, mut command: Command) {
         command.apply(doc);
-        self.undo.push(command);
-        self.redo.clear();
+        self.push_applied(command);
     }
 
     /// Record a command whose effect is already applied to the document
     /// (e.g. an interactive drag-move committed on mouse release).
     pub(crate) fn push_applied(&mut self, command: Command) {
-        self.undo.push(command);
-        self.redo.clear();
+        let Some(runtime_id) = self.active_project else {
+            return;
+        };
+        let history = self.projects.entry(runtime_id).or_default();
+        self.retained_bytes = self.retained_bytes.saturating_sub(
+            history
+                .redo
+                .iter()
+                .map(|entry| entry.estimated_bytes)
+                .sum::<usize>(),
+        );
+        history.redo.clear();
+        let estimated_bytes = command.estimated_bytes();
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        history.undo.push(HistoryEntry {
+            command,
+            estimated_bytes,
+            sequence,
+        });
+        self.retained_bytes = self.retained_bytes.saturating_add(estimated_bytes);
+        self.enforce_memory_budget();
     }
 
     /// Revert the most recent command. Returns `true` if something was undone.
     pub(crate) fn undo(&mut self, doc: &mut Document) -> bool {
-        match self.undo.pop() {
-            Some(command) => {
-                command.revert(doc);
-                self.redo.push(command);
+        let Some(history) = self
+            .active_project
+            .and_then(|runtime_id| self.projects.get_mut(&runtime_id))
+        else {
+            return false;
+        };
+        match history.undo.pop() {
+            Some(entry) => {
+                entry.command.revert(doc);
+                history.redo.push(entry);
                 true
             }
             None => false,
@@ -763,22 +1311,75 @@ impl History {
     }
 
     pub(crate) fn can_undo(&self) -> bool {
-        !self.undo.is_empty()
+        self.active_project
+            .and_then(|runtime_id| self.projects.get(&runtime_id))
+            .is_some_and(|history| !history.undo.is_empty())
     }
 
     pub(crate) fn can_redo(&self) -> bool {
-        !self.redo.is_empty()
+        self.active_project
+            .and_then(|runtime_id| self.projects.get(&runtime_id))
+            .is_some_and(|history| !history.redo.is_empty())
     }
 
     /// Re-apply the most recently undone command. Returns `true` on success.
     pub(crate) fn redo(&mut self, doc: &mut Document) -> bool {
-        match self.redo.pop() {
-            Some(mut command) => {
-                command.apply(doc);
-                self.undo.push(command);
+        let Some(history) = self
+            .active_project
+            .and_then(|runtime_id| self.projects.get_mut(&runtime_id))
+        else {
+            return false;
+        };
+        match history.redo.pop() {
+            Some(mut entry) => {
+                entry.command.apply(doc);
+                history.undo.push(entry);
                 true
             }
             None => false,
+        }
+    }
+
+    fn enforce_memory_budget(&mut self) {
+        while self.retained_bytes > self.max_retained_bytes {
+            let oldest =
+                self.projects
+                    .iter()
+                    .flat_map(|(&runtime_id, history)| {
+                        history
+                            .undo
+                            .iter()
+                            .enumerate()
+                            .map(move |(index, entry)| (entry.sequence, runtime_id, true, index))
+                            .chain(history.redo.iter().enumerate().map(move |(index, entry)| {
+                                (entry.sequence, runtime_id, false, index)
+                            }))
+                    })
+                    .min_by_key(|(sequence, _, _, _)| *sequence);
+            let Some((_, runtime_id, from_undo, index)) = oldest else {
+                self.retained_bytes = 0;
+                break;
+            };
+            let history = self
+                .projects
+                .get_mut(&runtime_id)
+                .expect("history disappeared");
+            if from_undo {
+                let entry = history.undo.remove(index);
+                self.retained_bytes = self.retained_bytes.saturating_sub(entry.estimated_bytes);
+            } else {
+                // Redo entries form a dependency chain (the last item must be
+                // replayed first). Evicting a middle/last predecessor would
+                // make the remaining redo commands invalid, so discard that
+                // project's complete redo branch together.
+                let bytes = history
+                    .redo
+                    .iter()
+                    .map(|entry| entry.estimated_bytes)
+                    .sum::<usize>();
+                history.redo.clear();
+                self.retained_bytes = self.retained_bytes.saturating_sub(bytes);
+            }
         }
     }
 }

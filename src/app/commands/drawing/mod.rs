@@ -3,6 +3,7 @@ pub(crate) mod bezier;
 pub(crate) mod chamfer;
 pub(crate) mod explode;
 pub(crate) mod fuse;
+pub(crate) mod insert_point;
 pub(crate) mod move_tool;
 pub(crate) mod offset;
 pub(crate) mod placement;

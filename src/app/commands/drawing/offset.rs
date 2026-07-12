@@ -26,37 +26,16 @@ impl<'a> App<'a> {
     }
 
     fn selected_offset_polyline_ids(&self) -> Vec<ObjectId> {
-        let first = self.editor.selected_handles.iter().find_map(|h| match h {
-            SceneEntityId::Object(id)
-                if self
-                    .workspace
-                    .project_index_for_object(*id)
-                    .and_then(|index| self.workspace.projects.get(index))
-                    .and_then(|project| project.pidb.document.get_object(*id))
-                    .is_some_and(|object| matches!(object, Object::Polyline { .. })) =>
-            {
-                Some(*id)
-            }
-            _ => None,
-        });
-        let Some(first_id) = first else {
-            return Vec::new();
-        };
-        let Some(project_index) = self.workspace.project_index_for_object(first_id) else {
-            return vec![first_id];
-        };
         self.editor
             .selected_handles
             .iter()
             .filter_map(|h| match h {
                 SceneEntityId::Object(id)
-                    if self.workspace.project_index_for_object(*id) == Some(project_index)
-                        && self
-                            .workspace
-                            .projects
-                            .get(project_index)
-                            .and_then(|project| project.pidb.document.get_object(*id))
-                            .is_some_and(|object| matches!(object, Object::Polyline { .. })) =>
+                    if self
+                        .workspace
+                        .active_document()
+                        .and_then(|document| document.get_object(*id))
+                        .is_some_and(|object| matches!(object, Object::Polyline { .. })) =>
                 {
                     Some(*id)
                 }
@@ -272,9 +251,10 @@ impl<'a> App<'a> {
 
         for object_id in object_ids {
             let (src_verts, closed) = match self.active_document().get_object(object_id) {
-                Some(Object::Polyline { verts, closed, .. }) => {
-                    (verts.iter().map(|v| v.pos).collect::<Vec<_>>(), *closed)
-                }
+                Some(Object::Polyline { verts, closed, .. }) => (
+                    crate::model::geometry::tessellate_polyline_bulges(verts, *closed),
+                    *closed,
+                ),
                 _ => continue,
             };
             let preview = self.compute_offset_result(&src_verts, closed, cursor_world_xy);
@@ -336,7 +316,7 @@ impl<'a> App<'a> {
             else {
                 continue;
             };
-            let src_verts = verts.iter().map(|v| v.pos).collect::<Vec<_>>();
+            let src_verts = crate::model::geometry::tessellate_polyline_bulges(verts, *closed);
             let new_positions = self.compute_offset_result(&src_verts, *closed, cursor_world_xy);
             let new_verts: Vec<PolyVertex> = new_positions
                 .into_iter()

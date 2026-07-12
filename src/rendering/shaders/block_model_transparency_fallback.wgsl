@@ -111,7 +111,7 @@ fn fs_main(in: VertexOutput) -> TransparencyOutput {
     let pixel = vec2<i32>(in.clip_position.xy);
     let depth = in.clip_position.z;
     let opaque_depth = textureLoad(scene_depth, pixel, 0);
-    if (depth >= opaque_depth - DEPTH_EPSILON) {
+    if (depth <= opaque_depth + DEPTH_EPSILON) {
         discard;
     }
 

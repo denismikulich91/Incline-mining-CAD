@@ -1,11 +1,197 @@
+use std::collections::HashSet;
+
 use winit::keyboard::PhysicalKey;
 
+use crate::rendering::pick::{clamped_range, triangle_weights};
+
 use super::*;
+
+#[derive(Clone, Copy, Debug)]
+struct ScreenRect {
+    min_x: f64,
+    max_x: f64,
+    min_y: f64,
+    max_y: f64,
+}
+
+impl ScreenRect {
+    fn new(start: (f32, f32), end: (f32, f32)) -> Self {
+        Self {
+            min_x: f64::from(start.0.min(end.0)),
+            max_x: f64::from(start.0.max(end.0)),
+            min_y: f64::from(start.1.min(end.1)),
+            max_y: f64::from(start.1.max(end.1)),
+        }
+    }
+
+    fn contains(self, point: glam::DVec2) -> bool {
+        point.x >= self.min_x
+            && point.x <= self.max_x
+            && point.y >= self.min_y
+            && point.y <= self.max_y
+    }
+
+    fn corners(self) -> [glam::DVec2; 4] {
+        [
+            glam::DVec2::new(self.min_x, self.min_y),
+            glam::DVec2::new(self.max_x, self.min_y),
+            glam::DVec2::new(self.max_x, self.max_y),
+            glam::DVec2::new(self.min_x, self.max_y),
+        ]
+    }
+}
+
+fn triangle_touches_rect(triangle: [glam::DVec2; 3], rect: ScreenRect) -> bool {
+    if triangle.iter().any(|&point| rect.contains(point)) {
+        return true;
+    }
+    if triangle
+        .iter()
+        .copied()
+        .zip(triangle.iter().copied().cycle().skip(1))
+        .take(3)
+        .any(|(a, b)| segment_intersects_rect(a, b, rect.min_x, rect.max_x, rect.min_y, rect.max_y))
+    {
+        return true;
+    }
+    rect.corners()
+        .iter()
+        .any(|&corner| triangle_weights(corner, triangle[0], triangle[1], triangle[2]).is_some())
+}
+
+fn quad_touches_rect(corners: [glam::DVec2; 4], rect: ScreenRect) -> bool {
+    triangle_touches_rect([corners[0], corners[1], corners[2]], rect)
+        || triangle_touches_rect([corners[0], corners[2], corners[3]], rect)
+}
+
+fn projected_text_corners(
+    record: &TextPickRecord,
+    view_proj: &DMat4,
+    screen: Size,
+) -> Option<[glam::DVec2; 4]> {
+    let [Some(a), Some(b), Some(c), Some(d)] = record
+        .corners
+        .map(|corner| crate::rendering::pick::world_to_screen(view_proj, corner, screen))
+    else {
+        return None;
+    };
+    Some([a, b, c, d])
+}
+
+fn local_vertex_to_screen(
+    position: [f32; 3],
+    scene_origin: DVec3,
+    view_proj: &DMat4,
+    screen: Size,
+) -> Option<glam::DVec2> {
+    let world = DVec3::from_array(position.map(f64::from)) + scene_origin;
+    crate::rendering::pick::world_to_screen(view_proj, world, screen)
+}
+
+fn pick_record_touches_rect(
+    group: &PickGeometry<'_>,
+    record: &PickRecord,
+    scene_origin: DVec3,
+    view_proj: &DMat4,
+    screen: Size,
+    rect: ScreenRect,
+) -> bool {
+    if !pick_record_bounds_may_touch_rect(record, view_proj, screen, rect) {
+        return false;
+    }
+    let stroke_range = clamped_range(record.stroke_range, group.stroke_verts.len());
+    let fill_range = clamped_range(record.fill_range, group.fill_verts.len());
+    if group.stroke_verts[stroke_range]
+        .iter()
+        .map(|vertex| vertex.pos)
+        .chain(group.fill_verts[fill_range].iter().map(|vertex| vertex.pos))
+        .filter_map(|position| local_vertex_to_screen(position, scene_origin, view_proj, screen))
+        .any(|point| rect.contains(point))
+    {
+        return true;
+    }
+
+    let stroke_indices =
+        &group.stroke_indices[clamped_range(record.stroke_index_range, group.stroke_indices.len())];
+    for indices in stroke_indices.chunks_exact(3) {
+        let [Some(a), Some(b), Some(c)] = [
+            group.stroke_verts.get(indices[0] as usize),
+            group.stroke_verts.get(indices[1] as usize),
+            group.stroke_verts.get(indices[2] as usize),
+        ] else {
+            continue;
+        };
+        let [Some(a), Some(b), Some(c)] = [a, b, c]
+            .map(|vertex| local_vertex_to_screen(vertex.pos, scene_origin, view_proj, screen))
+        else {
+            continue;
+        };
+        if triangle_touches_rect([a, b, c], rect) {
+            return true;
+        }
+    }
+
+    let fill_indices =
+        &group.fill_indices[clamped_range(record.fill_index_range, group.fill_indices.len())];
+    for indices in fill_indices.chunks_exact(3) {
+        let [Some(a), Some(b), Some(c)] = [
+            group.fill_verts.get(indices[0] as usize),
+            group.fill_verts.get(indices[1] as usize),
+            group.fill_verts.get(indices[2] as usize),
+        ] else {
+            continue;
+        };
+        let [Some(a), Some(b), Some(c)] = [a, b, c]
+            .map(|vertex| local_vertex_to_screen(vertex.pos, scene_origin, view_proj, screen))
+        else {
+            continue;
+        };
+        if triangle_touches_rect([a, b, c], rect) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn pick_record_bounds_may_touch_rect(
+    record: &PickRecord,
+    view_proj: &DMat4,
+    screen: Size,
+    rect: ScreenRect,
+) -> bool {
+    let cursor = glam::DVec2::new(
+        (rect.min_x + rect.max_x) * 0.5,
+        (rect.min_y + rect.max_y) * 0.5,
+    );
+    // `projected_box_overlaps` accepts one symmetric threshold. Using the
+    // larger half-extent is conservative for a non-square selection box and
+    // still rejects records wholly outside it before walking their streams.
+    let threshold = ((rect.max_x - rect.min_x) * 0.5).max((rect.max_y - rect.min_y) * 0.5);
+    crate::model::spatial::projected_box_overlaps(
+        record.world_bounds.0,
+        record.world_bounds.1,
+        view_proj,
+        screen,
+        cursor,
+        threshold,
+    )
+}
 
 impl<'a> Graphics<'a> {
     pub(crate) fn process_mouse_motion(&mut self, dx: f64, dy: f64) -> bool {
         if self.fly_mode_enabled && self.mouse_pressed == Some(MouseButton::Right) {
             self.fly_camera_controller.process_mouse_motion(dx, dy);
+            return true;
+        }
+
+        if self.mouse_pressed == Some(MouseButton::Middle)
+            && let Some(slice) = self.slice_view.as_mut()
+        {
+            // Same accumulation convention as the camera controller's pan so
+            // the drag feel matches; consumed by `update_slice_camera`.
+            slice.pan.x += -dx;
+            slice.pan.y += dy;
             return true;
         }
 
@@ -22,7 +208,10 @@ impl<'a> Graphics<'a> {
         let previous_mouse_loc = self.camera_controller.mouse_loc;
         self.camera_controller.mouse_loc = mouse_loc;
 
-        if self.mouse_pressed == Some(MouseButton::Right) && !self.fly_mode_enabled {
+        if self.mouse_pressed == Some(MouseButton::Right)
+            && !self.fly_mode_enabled
+            && self.slice_view.is_none()
+        {
             let dx = mouse_loc.0 - previous_mouse_loc.0;
             let dy = mouse_loc.1 - previous_mouse_loc.1;
             return self
@@ -81,8 +270,8 @@ impl<'a> Graphics<'a> {
         let cursor = self.camera_controller.mouse_loc;
         let ndc = crate::rendering::camera::point(cursor.0, cursor.1, screen);
         let inverse = self.view_proj().inverse();
-        let near_h = inverse * DVec4::new(ndc.x, ndc.y, 0.0, 1.0);
-        let far_h = inverse * DVec4::new(ndc.x, ndc.y, 1.0, 1.0);
+        let near_h = inverse * DVec4::new(ndc.x, ndc.y, 1.0, 1.0);
+        let far_h = inverse * DVec4::new(ndc.x, ndc.y, 0.0, 1.0);
         let near = near_h.truncate() / near_h.w;
         let far = far_h.truncate() / far_h.w;
         (near, (far - near).normalize())
@@ -111,6 +300,7 @@ impl<'a> Graphics<'a> {
     /// the stream path where hidden objects emit no pick records.
     pub(super) fn pick_geometry_groups(&self) -> Vec<PickGeometry<'_>> {
         let mut groups = vec![PickGeometry {
+            world_bounds: None,
             records: &self.pick_records,
             stroke_verts: &self.stroke_vertex_buf,
             stroke_indices: &self.stroke_index_buf,
@@ -122,6 +312,7 @@ impl<'a> Graphics<'a> {
                 continue;
             }
             groups.push(PickGeometry {
+                world_bounds: chunk.world_bounds,
                 records: &chunk.records,
                 stroke_verts: &chunk.vertices,
                 stroke_indices: &chunk.indices,
@@ -184,7 +375,7 @@ impl<'a> Graphics<'a> {
             direction,
         );
 
-        match (document_hit, surface_hit) {
+        let hit = match (document_hit, surface_hit) {
             (Some(document), Some(surface)) => {
                 // In x-ray mode visible lines render through surfaces, so a document
                 // hit always takes precedence over the surface beneath it.
@@ -206,7 +397,46 @@ impl<'a> Graphics<'a> {
             }
             (Some(document), None) => Some((document.entity, document.world)),
             (None, surface) => surface,
+        };
+        if xray_enabled {
+            return hit;
         }
+        hit.filter(|(_, world)| {
+            !self.nonselectable_asset_occludes(*world, hidden, &view_proj, screen)
+        })
+    }
+
+    fn nonselectable_asset_occludes(
+        &self,
+        candidate: DVec3,
+        hidden: &HashSet<SceneEntityId>,
+        view_proj: &DMat4,
+        screen: Size,
+    ) -> bool {
+        let clip = *view_proj * candidate.extend(1.0);
+        if clip.w.abs() <= f64::EPSILON {
+            return false;
+        }
+        let candidate_depth = clip.z / clip.w;
+        let block_depth = crate::rendering::query::ray_through_world_point(view_proj, candidate)
+            .and_then(|(origin, direction)| {
+                self.block_model_gpu
+                    .nearest_opaque_hit(origin, direction, hidden)
+            })
+            .and_then(|point| {
+                let clip = *view_proj * point.extend(1.0);
+                (clip.w.abs() > f64::EPSILON).then_some(clip.z / clip.w)
+            });
+        let point_depth = crate::rendering::pick::world_to_screen(view_proj, candidate, screen)
+            .and_then(|screen_point| {
+                self.point_cloud_gpu
+                    .nearest_depth_at_screen(view_proj, screen, screen_point)
+            });
+        block_depth
+            .into_iter()
+            .chain(point_depth)
+            .max_by(f64::total_cmp)
+            .is_some_and(|depth| candidate_depth < depth - 1.0e-6)
     }
 
     /// Return design entities whose rendered geometry is fully enclosed by a
@@ -215,21 +445,24 @@ impl<'a> Graphics<'a> {
         &self,
         start_px: (f32, f32),
         end_px: (f32, f32),
+        frozen: &HashSet<SceneEntityId>,
     ) -> Vec<SceneEntityId> {
-        let min_x = f64::from(start_px.0.min(end_px.0));
-        let max_x = f64::from(start_px.0.max(end_px.0));
-        let min_y = f64::from(start_px.1.min(end_px.1));
-        let max_y = f64::from(start_px.1.max(end_px.1));
+        let rect = ScreenRect::new(start_px, end_px);
         let view_proj = self.view_proj();
         let screen = self.screen_size();
+        let mut hits = Vec::new();
+        let mut seen = HashSet::new();
 
-        let groups = self.pick_geometry_groups();
-        let geometry_hits = groups.iter().flat_map(|group| {
-            group.records.iter().filter_map(|record| {
-                let stroke = record.stroke_range.0 as usize
-                    ..(record.stroke_range.1 as usize).min(group.stroke_verts.len());
-                let fill = record.fill_range.0 as usize
-                    ..(record.fill_range.1 as usize).min(group.fill_verts.len());
+        for group in self.pick_geometry_groups() {
+            for record in group.records {
+                if frozen.contains(&record.entity) {
+                    continue;
+                }
+                if !pick_record_bounds_may_touch_rect(record, &view_proj, screen, rect) {
+                    continue;
+                }
+                let stroke = clamped_range(record.stroke_range, group.stroke_verts.len());
+                let fill = clamped_range(record.fill_range, group.fill_verts.len());
                 let points = group.stroke_verts[stroke]
                     .iter()
                     .map(|vertex| vertex.pos)
@@ -242,97 +475,75 @@ impl<'a> Graphics<'a> {
                     })
                     .all(|point| {
                         any = true;
-                        point.x >= min_x && point.x <= max_x && point.y >= min_y && point.y <= max_y
+                        rect.contains(point)
                     });
-                (any && enclosed).then_some(record.entity)
-            })
-        });
-
-        let text_hits = self.text_pick_records.iter().filter_map(|record| {
-            let screen_corners: Vec<_> = record
-                .corners
-                .iter()
-                .filter_map(|&corner| {
-                    crate::rendering::pick::world_to_screen(&view_proj, corner, screen)
-                })
-                .collect();
-            if screen_corners.len() < 4 {
-                return None;
+                if any && enclosed && seen.insert(record.entity) {
+                    hits.push(record.entity);
+                }
             }
-            let enclosed = screen_corners.iter().all(|point| {
-                point.x >= min_x && point.x <= max_x && point.y >= min_y && point.y <= max_y
-            });
-            enclosed.then_some(record.entity)
-        });
+        }
 
-        geometry_hits.chain(text_hits).collect()
+        for record in &self.text_pick_records {
+            if frozen.contains(&record.entity) {
+                continue;
+            }
+            let Some(corners) = projected_text_corners(record, &view_proj, screen) else {
+                continue;
+            };
+            if corners.iter().all(|&point| rect.contains(point)) && seen.insert(record.entity) {
+                hits.push(record.entity);
+            }
+        }
+
+        hits
     }
 
-    /// Cross-select: entities where ANY vertex falls inside the rectangle.
-    /// Used for left-to-right drag (Vulcan-style touch/cross selection).
+    /// Cross-select entities whose visible rendered geometry touches the box,
+    /// including a box wholly inside a fill or text quad.
     pub(crate) fn entities_touching_screen_rect(
         &self,
         start_px: (f32, f32),
         end_px: (f32, f32),
+        frozen: &HashSet<SceneEntityId>,
     ) -> Vec<SceneEntityId> {
-        let min_x = f64::from(start_px.0.min(end_px.0));
-        let max_x = f64::from(start_px.0.max(end_px.0));
-        let min_y = f64::from(start_px.1.min(end_px.1));
-        let max_y = f64::from(start_px.1.max(end_px.1));
+        let rect = ScreenRect::new(start_px, end_px);
         let view_proj = self.view_proj();
         let screen = self.screen_size();
+        let mut hits = Vec::new();
+        let mut seen = HashSet::new();
 
-        let groups = self.pick_geometry_groups();
-        let geometry_hits = groups.iter().flat_map(|group| {
-            group.records.iter().filter_map(|record| {
-                let stroke = record.stroke_range.0 as usize
-                    ..(record.stroke_range.1 as usize).min(group.stroke_verts.len());
-                let fill = record.fill_range.0 as usize
-                    ..(record.fill_range.1 as usize).min(group.fill_verts.len());
-                let points = group.stroke_verts[stroke]
-                    .iter()
-                    .map(|vertex| vertex.pos)
-                    .chain(group.fill_verts[fill].iter().map(|vertex| vertex.pos));
-                let any_vertex_inside = points
-                    .filter_map(|position| {
-                        let world = DVec3::from_array(position.map(f64::from)) + self.scene_origin;
-                        crate::rendering::pick::world_to_screen(&view_proj, world, screen)
-                    })
-                    .any(|point| {
-                        point.x >= min_x && point.x <= max_x && point.y >= min_y && point.y <= max_y
-                    });
-                if any_vertex_inside {
-                    return Some(record.entity);
+        for group in self.pick_geometry_groups() {
+            for record in group.records {
+                if frozen.contains(&record.entity) {
+                    continue;
                 }
-                // Cross-select: also include if any segment crosses the box boundary.
-                let any_segment_crosses = record.segments.iter().any(|&[a3, b3]| {
-                    let (Some(a), Some(b)) = (
-                        crate::rendering::pick::world_to_screen(&view_proj, a3, screen),
-                        crate::rendering::pick::world_to_screen(&view_proj, b3, screen),
-                    ) else {
-                        return false;
-                    };
-                    segment_intersects_rect(a, b, min_x, max_x, min_y, max_y)
-                });
-                any_segment_crosses.then_some(record.entity)
-            })
-        });
+                if pick_record_touches_rect(
+                    &group,
+                    record,
+                    self.scene_origin,
+                    &view_proj,
+                    screen,
+                    rect,
+                ) && seen.insert(record.entity)
+                {
+                    hits.push(record.entity);
+                }
+            }
+        }
 
-        let text_hits = self.text_pick_records.iter().filter_map(|record| {
-            let screen_corners: Vec<_> = record
-                .corners
-                .iter()
-                .filter_map(|&corner| {
-                    crate::rendering::pick::world_to_screen(&view_proj, corner, screen)
-                })
-                .collect();
-            let any_inside = screen_corners.iter().any(|point| {
-                point.x >= min_x && point.x <= max_x && point.y >= min_y && point.y <= max_y
-            });
-            any_inside.then_some(record.entity)
-        });
+        for record in &self.text_pick_records {
+            if frozen.contains(&record.entity) {
+                continue;
+            }
+            let Some(corners) = projected_text_corners(record, &view_proj, screen) else {
+                continue;
+            };
+            if quad_touches_rect(corners, rect) && seen.insert(record.entity) {
+                hits.push(record.entity);
+            }
+        }
 
-        geometry_hits.chain(text_hits).collect()
+        hits
     }
 
     /// Begin an orbit with the anchor at the surface or geometry point under the cursor.
@@ -409,7 +620,7 @@ impl<'a> Graphics<'a> {
         }
         let view_proj = self.view_proj();
         let screen = self.screen_size();
-        SceneQuery::snap(
+        let candidate = SceneQuery::snap(
             document,
             snap_index,
             road_network,
@@ -422,7 +633,13 @@ impl<'a> Graphics<'a> {
             self.camera_controller.mouse_loc,
             SNAP_THRESHOLD_PX,
             xray_enabled,
-        )
+        )?;
+        if !xray_enabled && self.nonselectable_asset_occludes(candidate, hidden, &view_proj, screen)
+        {
+            None
+        } else {
+            Some(candidate)
+        }
     }
 
     /// Reset the camera to a top-down plan view that fits all visible content.
@@ -460,7 +677,7 @@ impl<'a> Graphics<'a> {
         let zoom = zoom.max(1e-4);
         self.projection.zoom = zoom;
         let camera_distance = if self.fly_mode_enabled {
-            zoom / (crate::rendering::camera::PERSPECTIVE_FOV_Y * 0.5).tan()
+            zoom / (self.projection.perspective_fov_y() * 0.5).tan()
         } else {
             zoom
         };
@@ -468,7 +685,6 @@ impl<'a> Graphics<'a> {
         self.scene_origin = center;
         self.triangulation_gpu.clear();
         self.block_model_gpu.clear();
-        self.point_cloud_gpu.clear();
         self.geometry_dirty = true;
         // Update znear/zfar immediately so snap/pick work before the first render.
         self.fit_depth_to_scene(document, triangulations, block_models, point_clouds, hidden);
@@ -521,11 +737,15 @@ impl<'a> Graphics<'a> {
         };
 
         self.projection.zoom = zoom;
-        self.camera.frame_keep_orientation(center, zoom);
+        let camera_distance = if self.projection.is_perspective() {
+            zoom / (self.projection.perspective_fov_y() * 0.5).tan()
+        } else {
+            zoom
+        };
+        self.camera.frame_keep_orientation(center, camera_distance);
         self.scene_origin = center;
         self.triangulation_gpu.clear();
         self.block_model_gpu.clear();
-        self.point_cloud_gpu.clear();
         self.geometry_dirty = true;
         // Update znear/zfar immediately so snap/pick work before the first render.
         self.fit_depth_to_scene(document, triangulations, block_models, point_clouds, hidden);
@@ -550,9 +770,9 @@ impl<'a> Graphics<'a> {
         self.orbit_marker = None;
     }
 
-    /// Keep the orthographic depth range tight around the current scene. A
-    /// billion-unit fixed range loses enough depth precision that back-side
-    /// mesh edges can compare equal to the front surface and bleed through it.
+    /// Keep the depth range tight around the current scene. An oversized range
+    /// loses enough precision that back-side mesh edges can compare equal to
+    /// the front surface and bleed through it, especially in perspective.
     pub(super) fn fit_depth_to_scene(
         &mut self,
         document: &Document,
@@ -567,12 +787,13 @@ impl<'a> Graphics<'a> {
             self.cached_bounds_document_revision = document.revision();
         }
         let Some((min, max)) = self.cached_scene_bounds else {
-            self.projection
-                .set_symmetric_depth_extent((self.projection.zoom * 4.0).max(10.0));
+            let depth = (self.projection.zoom * 4.0).max(10.0);
+            self.projection.set_view_depth_range(0.0, depth, 1.0);
             return;
         };
         let forward = self.camera.forward();
-        let mut half_depth = 0.0_f64;
+        let mut min_depth = f64::INFINITY;
+        let mut max_depth = f64::NEG_INFINITY;
         for i in 0..8 {
             let corner = DVec3::new(
                 if (i & 1) == 0 { min.x } else { max.x },
@@ -580,11 +801,13 @@ impl<'a> Graphics<'a> {
                 if (i & 4) == 0 { min.z } else { max.z },
             );
             let corner = self.exaggerate_point(corner);
-            half_depth = half_depth.max((corner - self.camera.position).dot(forward).abs());
+            let depth = (corner - self.camera.position).dot(forward);
+            min_depth = min_depth.min(depth);
+            max_depth = max_depth.max(depth);
         }
         let padding = (self.projection.zoom * 0.25).max(1.0);
         self.projection
-            .set_symmetric_depth_extent(half_depth + padding);
+            .set_view_depth_range(min_depth, max_depth, padding);
     }
 
     /// Ensure an in-progress line or polygon remains inside the camera's clip
@@ -597,15 +820,20 @@ impl<'a> Graphics<'a> {
         let forward = self.camera.forward();
         let depth_from_camera = |point: DVec3| {
             let point = self.exaggerate_point(point);
-            (point - self.camera.position).dot(forward).abs()
+            (point - self.camera.position).dot(forward)
         };
-        let mut half_depth = editor
+        let mut min_depth = f64::INFINITY;
+        let mut max_depth = f64::NEG_INFINITY;
+        for depth in editor
             .pending_stroke
             .iter()
             .copied()
             .filter(|point| point.x.is_finite() && point.y.is_finite() && point.z.is_finite())
             .map(depth_from_camera)
-            .fold(0.0_f64, f64::max);
+        {
+            min_depth = min_depth.min(depth);
+            max_depth = max_depth.max(depth);
+        }
 
         if !editor.poly_finish_dialog
             && let Some(cursor) = editor.cursor_world
@@ -613,12 +841,16 @@ impl<'a> Graphics<'a> {
             && cursor.y.is_finite()
             && cursor.z.is_finite()
         {
-            half_depth = half_depth.max(depth_from_camera(cursor));
+            let depth = depth_from_camera(cursor);
+            min_depth = min_depth.min(depth);
+            max_depth = max_depth.max(depth);
         }
 
-        let padding = (self.projection.zoom * 0.25).max(1.0);
-        self.projection
-            .expand_symmetric_depth_extent(half_depth + padding);
+        if min_depth.is_finite() {
+            let padding = (self.projection.zoom * 0.25).max(1.0);
+            self.projection
+                .expand_view_depth_range(min_depth, max_depth, padding);
+        }
     }
 
     /// Keep generated batter/berm preview rings inside the clip volume. They
@@ -629,7 +861,7 @@ impl<'a> Graphics<'a> {
         }
 
         let forward = self.camera.forward();
-        let half_depth = editor
+        let (min_depth, max_depth) = editor
             .batter_berm_rings_world
             .iter()
             .flatten()
@@ -637,13 +869,17 @@ impl<'a> Graphics<'a> {
             .filter(|point| point.x.is_finite() && point.y.is_finite() && point.z.is_finite())
             .map(|point| {
                 let point = self.exaggerate_point(point);
-                (point - self.camera.position).dot(forward).abs()
+                (point - self.camera.position).dot(forward)
             })
-            .fold(0.0_f64, f64::max);
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), depth| {
+                (min.min(depth), max.max(depth))
+            });
 
-        let padding = (self.projection.zoom * 0.25).max(1.0);
-        self.projection
-            .expand_symmetric_depth_extent(half_depth + padding);
+        if min_depth.is_finite() {
+            let padding = (self.projection.zoom * 0.25).max(1.0);
+            self.projection
+                .expand_view_depth_range(min_depth, max_depth, padding);
+        }
     }
 
     pub(super) fn include_road_preview_in_depth(&mut self, editor: &EditorState) {
@@ -654,20 +890,22 @@ impl<'a> Graphics<'a> {
         let forward = self.camera.forward();
         let depth_from_camera = |point: glam::DVec3| {
             let point = self.exaggerate_point(point);
-            (point - self.camera.position).dot(forward).abs()
+            (point - self.camera.position).dot(forward)
         };
-        let half_depth = editor
+        let (min_depth, max_depth) = editor
             .road_preview_left_world
             .iter()
             .chain(editor.road_preview_right_world.iter())
             .copied()
             .filter(|p| p.x.is_finite() && p.y.is_finite() && p.z.is_finite())
             .map(depth_from_camera)
-            .fold(0.0_f64, f64::max);
-        if half_depth > 0.0 {
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), depth| {
+                (min.min(depth), max.max(depth))
+            });
+        if min_depth.is_finite() {
             let padding = (self.projection.zoom * 0.25).max(1.0);
             self.projection
-                .expand_symmetric_depth_extent(half_depth + padding);
+                .expand_view_depth_range(min_depth, max_depth, padding);
         }
     }
 
@@ -713,8 +951,78 @@ impl<'a> Graphics<'a> {
         );
     }
 
+    /// Slice-mode per-frame camera update: integrate held W/S/A/D movement
+    /// and Q/E rotation, consume accumulated pan/scroll deltas, then derive
+    /// the camera from the slice state (which stays the single source of
+    /// truth).
+    fn update_slice_camera(&mut self, dt: Duration) {
+        let screen = self.screen_size();
+        let mouse_loc = self.camera_controller.mouse_loc;
+        let Some(slice) = self.slice_view.as_mut() else {
+            return;
+        };
+        // Matches the zoom feel of the main `CameraController` (see init.rs).
+        const SLICE_ZOOM_SENSITIVITY: f64 = 0.005;
+        let step = dt.as_secs_f64().min(0.1);
+
+        // Q/E: rotate the slice line about its centre. Q turns the view left
+        // (counter-clockwise seen from above), E right.
+        let rotate_amount = f64::from(i8::from(slice.input.rotate_left))
+            - f64::from(i8::from(slice.input.rotate_right));
+        if rotate_amount != 0.0 {
+            let angle = rotate_amount * slice.rotate_speed * step;
+            slice.direction = glam::DVec2::from_angle(angle)
+                .rotate(slice.direction)
+                .normalize_or(slice.direction);
+        }
+
+        let strike = DVec3::new(slice.direction.x, slice.direction.y, 0.0);
+        let forward = slice.forward();
+
+        // W/S: move the slab along its normal.
+        let slab_amount =
+            f64::from(i8::from(slice.input.forward)) - f64::from(i8::from(slice.input.backward));
+        if slab_amount != 0.0 {
+            slice.center += forward * slab_amount * slice.move_speed * step;
+        }
+
+        // Middle-drag pan within the section plane: horizontal = strike,
+        // vertical = elevation. Pixel-to-world matches the ortho pan feel.
+        if slice.pan != glam::DVec2::ZERO {
+            let world_per_pixel = (2.0 * self.projection.zoom / screen.1.max(1.0) as f64).max(0.0);
+            slice.center += (strike * slice.pan.x + DVec3::Z * slice.pan.y) * world_per_pixel;
+            slice.pan = glam::DVec2::ZERO;
+        }
+
+        // Scroll: ortho zoom toward the cursor, mirroring the main controller.
+        if slice.scroll != 0.0 {
+            let zoom_scale = if slice.scroll > 0.0 {
+                1.0 - (1.0 / (1.0 + SLICE_ZOOM_SENSITIVITY * slice.scroll))
+            } else {
+                SLICE_ZOOM_SENSITIVITY * slice.scroll
+            };
+            let zoom_factor = self.projection.zoom * zoom_scale;
+            let mouse_ndc = crate::rendering::camera::point(mouse_loc.0, mouse_loc.1, screen);
+            let aspect = screen.0 as f64 / screen.1.max(1.0) as f64;
+            slice.center += (strike * mouse_ndc.x * aspect + DVec3::Z * mouse_ndc.y) * zoom_factor;
+            self.projection.zoom = (self.projection.zoom - zoom_factor).max(1.0e-4);
+            slice.scroll = 0.0;
+        }
+
+        // The camera sits on the slice plane itself so the symmetric
+        // znear/zfar slab is centred on the plane.
+        self.camera.look_to(
+            slice.center,
+            forward,
+            DVec3::Z,
+            self.projection.zoom.max(1.0),
+        );
+    }
+
     pub(crate) fn update(&mut self, dt: Duration, interaction_resolution_divisor: u32) {
-        if self.camera_controller.has_view_transition() {
+        if self.slice_view.is_some() {
+            self.update_slice_camera(dt);
+        } else if self.camera_controller.has_view_transition() {
             self.camera_controller.update_view_transition(
                 &mut self.camera,
                 &mut self.projection,
@@ -744,7 +1052,12 @@ impl<'a> Graphics<'a> {
                 // Mark interaction directly so the cooldown covers the whole
                 // burst (and 150 ms after), like camera drags and resizes.
                 self.mark_interaction();
-                if self.fly_mode_enabled {
+                if let Some(slice) = self.slice_view.as_mut() {
+                    slice.scroll += match delta {
+                        MouseScrollDelta::LineDelta(_, scroll) => f64::from(*scroll) * 100.0,
+                        MouseScrollDelta::PixelDelta(position) => position.y,
+                    };
+                } else if self.fly_mode_enabled {
                     self.fly_camera_controller.process_scroll(delta);
                 } else {
                     self.camera_controller.process_scroll(delta);

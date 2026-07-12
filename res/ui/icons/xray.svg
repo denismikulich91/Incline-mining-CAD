@@ -1,68 +1,10 @@
-<?xml version="1.0" encoding="UTF-8" standalone="no"?>
-<!-- Uploaded to: SVG Repo, www.svgrepo.com, Generator: SVG Repo Mixer Tools -->
-
-<svg
-   width="800px"
-   height="800px"
-   viewBox="0 0 24 24"
-   fill="none"
-   version="1.1"
-   id="svg1"
-   sodipodi:docname="xray.svg"
-   inkscape:version="1.4.4 (dcaf3e7d9e, 2026-05-05)"
-   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
-   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
-   xmlns="http://www.w3.org/2000/svg"
-   xmlns:svg="http://www.w3.org/2000/svg">
-  <defs
-     id="defs1">
-    <rect
-       x="307.04447"
-       y="228.81658"
-       width="246.41785"
-       height="289.44319"
-       id="rect661" />
-    <clipPath
-       clipPathUnits="userSpaceOnUse"
-       id="clipPath4">
-      <circle
-         style="fill:#ff524b;fill-opacity:1;stroke:none;stroke-width:2.79676;stroke-dasharray:none;stroke-opacity:1"
-         id="circle4"
-         cx="15.943424"
-         cy="2.8273456"
-         r="12"
-         transform="rotate(35.050181)" />
-    </clipPath>
-  </defs>
-  <sodipodi:namedview
-     id="namedview1"
-     pagecolor="#ffffff"
-     bordercolor="#000000"
-     borderopacity="0.25"
-     inkscape:showpageshadow="2"
-     inkscape:pageopacity="0.0"
-     inkscape:pagecheckerboard="0"
-     inkscape:deskcolor="#d1d1d1"
-     inkscape:zoom="1.0226532"
-     inkscape:cx="268.90837"
-     inkscape:cy="377.93848"
-     inkscape:window-width="2560"
-     inkscape:window-height="1366"
-     inkscape:window-x="0"
-     inkscape:window-y="0"
-     inkscape:window-maximized="1"
-     inkscape:current-layer="svg1" />
-  <circle
-     style="fill:#ff524b;fill-opacity:1;stroke:none;stroke-width:2.79676;stroke-dasharray:none;stroke-opacity:1"
-     id="path1"
-     cx="16.672802"
-     cy="-3.1650696"
-     r="12"
-     transform="rotate(55.748803)" />
-  <path
-     id="path3"
-     style="fill-rule:evenodd;stroke:#ffffff;stroke-width:1.47"
-     transform="matrix(0.94231301,0.35604452,-0.35604452,0.94231301,5.3150388,-2.8780962)"
-     d="m 12.88482,11.348431 c 0.946078,0.38943 0.909557,1.671963 0.38804,2.380092 -0.919458,1.248464 -2.770043,1.128107 -3.8450863,0.165628 C 7.8598364,12.490386 8.072547,10.011115 9.4845584,8.5840707 11.360042,6.6886198 14.486085,6.9978741 16.259632,8.8632675 18.486517,11.205475 18.078832,14.985959 15.758023,17.103335 12.951544,19.66381 8.5126444,19.156726 6.0529618,16.379314 3.1575974,13.109941 3.7646305,8.0102951 6.999395,5.2092588 10.730813,1.9781621 16.492692,2.6854862 19.634444,6.3781041 23.201849,10.571007 22.394009,16.996128 18.243187,20.478147 13.589186,24.38227 6.5001081,23.473759 2.6781499,18.864478 -1.5629931,13.749659 -0.55370009,5.9960977 4.5142316,1.834447 10.089659,-2.7439459 18.508103,-1.6337877 23.009256,3.8929407 c 0.457592,0.5618536 0.870333,1.1601468 1.233461,1.7872013"
-     clip-path="url(#clipPath4)" />
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="800px" height="800px" fill="none" version="1.1" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+ <defs>
+  <clipPath id="a">
+   <circle transform="rotate(35.05)" cx="15.943" cy="2.8273" r="12" style="fill:#ff524b"/>
+  </clipPath>
+ </defs>
+ <circle transform="rotate(55.749)" cx="16.673" cy="-3.1651" r="12" style="fill:#ff524b"/>
+ <path transform="matrix(.94231 .35604 -.35604 .94231 5.315 -2.8781)" d="m12.885 11.348c0.94608 0.38943 0.90956 1.672 0.38804 2.3801-0.91946 1.2485-2.77 1.1281-3.8451 0.16563-1.5679-1.4038-1.3552-3.883 0.056785-5.3101 1.8755-1.8955 5.0015-1.5862 6.7751 0.2792 2.2269 2.3422 1.8192 6.1227-0.50161 8.2401-2.8065 2.5605-7.2454 2.0534-9.7051-0.72402-2.8954-3.2694-2.2883-8.369 0.94643-11.17 3.7314-3.2311 9.4933-2.5238 12.635 1.1688 3.5674 4.1929 2.7596 10.618-1.3913 14.1-4.654 3.9041-11.743 2.9956-15.565-1.6137-4.2411-5.1148-3.2318-12.868 1.8361-17.03 5.5754-4.5784 13.994-3.4682 18.495 2.0585 0.45759 0.56185 0.87033 1.1601 1.2335 1.7872" clip-path="url(#a)" style="fill-rule:evenodd;stroke-width:1.47;stroke:#fff"/>
 </svg>

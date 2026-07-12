@@ -8,6 +8,8 @@
 //! junction corner, a seam miter) is computed exactly once by the node that
 //! owns it, so side lines meet exactly by construction.
 
+use std::collections::HashMap;
+
 use glam::{DVec2, DVec3};
 
 use super::{Document, Object, ObjectId, RoadShape, geometry::ROAD_INTERSECTION_FLAT_CLEARANCE_M};
@@ -593,23 +595,243 @@ fn dedup_centerline(points: impl Iterator<Item = DVec3>) -> Vec<DVec3> {
     out
 }
 
-// ---------------------------------------------------------------------------
-// Stage 1 — node discovery
-// ---------------------------------------------------------------------------
+type XyBounds = (DVec2, DVec2);
 
-fn build_nodes(sources: &[SourceRoad], document: &Document) -> Vec<Node> {
-    let mut nodes: Vec<Node> = Vec::new();
+/// Small immutable 2D BVH used only while resolving a road network. Query
+/// results are sorted by their original item index at call sites whenever the
+/// legacy scan order is observable (nearest-point ties and node creation).
+struct XyBvh {
+    item_bounds: Vec<XyBounds>,
+    order: Vec<usize>,
+    nodes: Vec<XyBvhNode>,
+}
 
-    // Broad-phase XY bounds per source: most pairs in a large network never
-    // come near each other, so the O(sources²) scans below reject on
-    // rectangle overlap before touching any segment math.
-    let source_bounds: Vec<(DVec2, DVec2)> = sources
-        .iter()
-        .map(|source| points_bounds_xy(source.centerline.iter().copied()))
-        .collect();
+#[derive(Clone, Copy)]
+struct XyBvhNode {
+    bounds: XyBounds,
+    left: usize,
+    right: usize,
+    start: usize,
+    count: usize,
+}
 
-    let find_or_create = |nodes: &mut Vec<Node>, pos: DVec3| -> usize {
-        for (index, node) in nodes.iter_mut().enumerate() {
+impl XyBvh {
+    const LEAF_ITEMS: usize = 8;
+
+    fn build(item_bounds: Vec<XyBounds>) -> Self {
+        let mut index = Self {
+            order: (0..item_bounds.len()).collect(),
+            item_bounds,
+            nodes: Vec::new(),
+        };
+        if !index.order.is_empty() {
+            index.build_node(0, index.order.len());
+        }
+        index
+    }
+
+    fn build_node(&mut self, start: usize, end: usize) -> usize {
+        let mut min = DVec2::splat(f64::INFINITY);
+        let mut max = DVec2::splat(f64::NEG_INFINITY);
+        let mut center_min = DVec2::splat(f64::INFINITY);
+        let mut center_max = DVec2::splat(f64::NEG_INFINITY);
+        for &item in &self.order[start..end] {
+            let bounds = self.item_bounds[item];
+            min = min.min(bounds.0);
+            max = max.max(bounds.1);
+            let center = (bounds.0 + bounds.1) * 0.5;
+            center_min = center_min.min(center);
+            center_max = center_max.max(center);
+        }
+
+        let node_index = self.nodes.len();
+        self.nodes.push(XyBvhNode {
+            bounds: (min, max),
+            left: 0,
+            right: 0,
+            start,
+            count: end - start,
+        });
+        if end - start <= Self::LEAF_ITEMS {
+            return node_index;
+        }
+
+        let axis = usize::from((center_max.y - center_min.y) > (center_max.x - center_min.x));
+        let middle = start + (end - start) / 2;
+        let item_bounds = &self.item_bounds;
+        self.order[start..end].select_nth_unstable_by(middle - start, |&a, &b| {
+            let ca = (item_bounds[a].0 + item_bounds[a].1)[axis];
+            let cb = (item_bounds[b].0 + item_bounds[b].1)[axis];
+            ca.total_cmp(&cb).then_with(|| a.cmp(&b))
+        });
+        let left = self.build_node(start, middle);
+        let right = self.build_node(middle, end);
+        self.nodes[node_index].left = left;
+        self.nodes[node_index].right = right;
+        self.nodes[node_index].count = 0;
+        node_index
+    }
+
+    /// Fill `matches` with original item indices whose bounds overlap `query`.
+    /// Returns the number of leaf items examined, useful for scaling tests.
+    fn query(
+        &self,
+        query: XyBounds,
+        margin: f64,
+        matches: &mut Vec<usize>,
+        stack: &mut Vec<usize>,
+    ) -> usize {
+        matches.clear();
+        stack.clear();
+        if self.nodes.is_empty() {
+            return 0;
+        }
+        stack.push(0);
+        let mut examined = 0;
+        while let Some(node_index) = stack.pop() {
+            let node = self.nodes[node_index];
+            if !bounds_overlap_xy(node.bounds, query, margin) {
+                continue;
+            }
+            if node.count == 0 {
+                stack.push(node.left);
+                stack.push(node.right);
+                continue;
+            }
+            for &item in &self.order[node.start..node.start + node.count] {
+                examined += 1;
+                if bounds_overlap_xy(self.item_bounds[item], query, margin) {
+                    matches.push(item);
+                }
+            }
+        }
+        examined
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RoadSegmentRef {
+    road: usize,
+    segment: usize,
+}
+
+#[derive(Clone, Copy)]
+struct RoadVertexRef {
+    road: usize,
+    vertex: usize,
+}
+
+/// Reusable broad-phase indexes over source bounds, per-road segments, all
+/// segments, and vertices. The per-road indexes preserve the original
+/// source-pair/segment-pair iteration order after candidate sorting.
+struct RoadSpatialIndex {
+    source_bounds: Vec<XyBounds>,
+    sources: XyBvh,
+    road_segments: Vec<XyBvh>,
+    interior_vertices: Vec<XyBvh>,
+    all_segments: Vec<RoadSegmentRef>,
+    all_segment_index: XyBvh,
+    all_vertices: Vec<RoadVertexRef>,
+    all_vertex_index: XyBvh,
+    max_half_width: f64,
+}
+
+impl RoadSpatialIndex {
+    fn build(sources: &[SourceRoad]) -> Self {
+        let source_bounds: Vec<XyBounds> = sources
+            .iter()
+            .map(|source| points_bounds_xy(source.centerline.iter().copied()))
+            .collect();
+        let source_index = XyBvh::build(source_bounds.clone());
+        let mut road_segments = Vec::with_capacity(sources.len());
+        let mut interior_vertices = Vec::with_capacity(sources.len());
+        let mut all_segments = Vec::new();
+        let mut all_segment_bounds = Vec::new();
+        let mut all_vertices = Vec::new();
+        let mut all_vertex_bounds = Vec::new();
+
+        for (road, source) in sources.iter().enumerate() {
+            let segment_bounds: Vec<XyBounds> = source
+                .centerline
+                .windows(2)
+                .enumerate()
+                .map(|(segment, points)| {
+                    let bounds = points_bounds_xy(points.iter().copied());
+                    all_segments.push(RoadSegmentRef { road, segment });
+                    all_segment_bounds.push(bounds);
+                    bounds
+                })
+                .collect();
+            road_segments.push(XyBvh::build(segment_bounds));
+
+            let interior_bounds: Vec<XyBounds> = source.centerline[1..source.centerline.len() - 1]
+                .iter()
+                .map(|point| {
+                    let xy = point.truncate();
+                    (xy, xy)
+                })
+                .collect();
+            interior_vertices.push(XyBvh::build(interior_bounds));
+
+            for (vertex, point) in source.centerline.iter().enumerate() {
+                let xy = point.truncate();
+                all_vertices.push(RoadVertexRef { road, vertex });
+                all_vertex_bounds.push((xy, xy));
+            }
+        }
+
+        Self {
+            source_bounds,
+            sources: source_index,
+            road_segments,
+            interior_vertices,
+            all_segments,
+            all_segment_index: XyBvh::build(all_segment_bounds),
+            all_vertices,
+            all_vertex_index: XyBvh::build(all_vertex_bounds),
+            max_half_width: sources
+                .iter()
+                .map(|source| source.width * 0.5)
+                .fold(0.0_f64, f64::max),
+        }
+    }
+}
+
+#[derive(Default)]
+struct NodeGrid {
+    cells: HashMap<(i64, i64), Vec<usize>>,
+    candidates: Vec<usize>,
+}
+
+impl NodeGrid {
+    fn cell(pos: DVec2) -> (i64, i64) {
+        (
+            (pos.x / NODE_XY_EPS).floor() as i64,
+            (pos.y / NODE_XY_EPS).floor() as i64,
+        )
+    }
+
+    fn find_or_create(&mut self, nodes: &mut Vec<Node>, pos: DVec3) -> usize {
+        self.candidates.clear();
+        let cell = Self::cell(pos.truncate());
+        for dx in -1..=1 {
+            let Some(x) = cell.0.checked_add(dx) else {
+                continue;
+            };
+            for dy in -1..=1 {
+                let Some(y) = cell.1.checked_add(dy) else {
+                    continue;
+                };
+                if let Some(indices) = self.cells.get(&(x, y)) {
+                    self.candidates.extend_from_slice(indices);
+                }
+            }
+        }
+        // The old linear scan always selected the earliest compatible node.
+        self.candidates.sort_unstable();
+        self.candidates.dedup();
+        for &index in &self.candidates {
+            let node = &mut nodes[index];
             if (node.pos.truncate() - pos.truncate()).length() < NODE_XY_EPS
                 && (node.pos.z - pos.z).abs() <= NODE_Z_TOL
             {
@@ -619,9 +841,129 @@ fn build_nodes(sources: &[SourceRoad], document: &Document) -> Vec<Node> {
                 return index;
             }
         }
+
+        let index = nodes.len();
         nodes.push(Node::new(pos));
-        nodes.len() - 1
-    };
+        self.cells.entry(cell).or_default().push(index);
+        index
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AttachmentPolyline {
+    first_segment: usize,
+    segment_count: usize,
+    closed: bool,
+}
+
+struct PolylineAttachmentIndex {
+    polylines: Vec<AttachmentPolyline>,
+    segment_polylines: Vec<usize>,
+    segments: Vec<[DVec3; 2]>,
+    spatial: XyBvh,
+}
+
+impl PolylineAttachmentIndex {
+    fn build(document: &Document) -> Self {
+        let mut polylines = Vec::new();
+        let mut segment_polylines = Vec::new();
+        let mut segments = Vec::new();
+        let mut bounds = Vec::new();
+        for object in document.objects() {
+            let Object::Polyline { verts, closed, .. } = object else {
+                continue;
+            };
+            if verts.len() < 2 {
+                continue;
+            }
+            let closed = *closed && verts.len() >= 3;
+            let segment_count = if closed { verts.len() } else { verts.len() - 1 };
+            let polyline = polylines.len();
+            let first_segment = segments.len();
+            for segment in 0..segment_count {
+                let points = [verts[segment].pos, verts[(segment + 1) % verts.len()].pos];
+                segment_polylines.push(polyline);
+                segments.push(points);
+                bounds.push(points_bounds_xy(points.into_iter()));
+            }
+            polylines.push(AttachmentPolyline {
+                first_segment,
+                segment_count,
+                closed,
+            });
+        }
+        Self {
+            polylines,
+            segment_polylines,
+            segments,
+            spatial: XyBvh::build(bounds),
+        }
+    }
+
+    fn attached_segments(
+        &self,
+        junction: DVec3,
+        matches: &mut Vec<usize>,
+        stack: &mut Vec<usize>,
+    ) -> Vec<[DVec3; 2]> {
+        let xy = junction.truncate();
+        self.spatial.query((xy, xy), NODE_XY_EPS, matches, stack);
+        matches.sort_unstable();
+
+        let mut attached = Vec::new();
+        let mut cursor = 0;
+        while cursor < matches.len() {
+            let polyline_index = self.segment_polylines[matches[cursor]];
+            let polyline = self.polylines[polyline_index];
+            let mut wanted = Vec::new();
+            while cursor < matches.len()
+                && self.segment_polylines[matches[cursor]] == polyline_index
+            {
+                let flat_segment = matches[cursor];
+                let [a, b] = self.segments[flat_segment];
+                if point_on_segment_xy(junction, a, b)
+                    || points_coincident_3d(junction, a)
+                    || points_coincident_3d(junction, b)
+                {
+                    let local_segment = flat_segment - polyline.first_segment;
+                    for candidate in [
+                        local_segment.wrapping_sub(1),
+                        local_segment,
+                        local_segment + 1,
+                    ] {
+                        let local = if polyline.closed {
+                            candidate % polyline.segment_count
+                        } else if candidate < polyline.segment_count {
+                            candidate
+                        } else {
+                            continue;
+                        };
+                        let wanted_segment = polyline.first_segment + local;
+                        if !wanted.contains(&wanted_segment) {
+                            wanted.push(wanted_segment);
+                        }
+                    }
+                }
+                cursor += 1;
+            }
+            attached.extend(wanted.into_iter().map(|segment| self.segments[segment]));
+        }
+        attached
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 1 — node discovery
+// ---------------------------------------------------------------------------
+
+fn build_nodes(sources: &[SourceRoad], document: &Document) -> Vec<Node> {
+    let mut nodes: Vec<Node> = Vec::new();
+    let spatial = RoadSpatialIndex::build(sources);
+    let mut node_grid = NodeGrid::default();
+    let mut source_matches = Vec::new();
+    let mut segment_matches = Vec::new();
+    let mut vertex_matches = Vec::new();
+    let mut query_stack = Vec::new();
 
     // Road endpoints. An endpoint landing inside another road's body (within
     // the wider half-width of its stored centerline in plan, at compatible
@@ -631,23 +973,36 @@ fn build_nodes(sources: &[SourceRoad], document: &Document) -> Vec<Node> {
     // line; demanding exact contact would leave it dangling. The node goes
     // onto the target centerline and captures the ending road so the split
     // stage still terminates it here.
-    let mut attachments: Vec<(usize, usize, DVec2, f64)> = Vec::new();
+    let mut attachments: HashMap<(usize, usize), Vec<(DVec2, f64)>> = HashMap::new();
     for (road_index, source) in sources.iter().enumerate() {
         let first = source.centerline[0];
         let last = *source.centerline.last().expect("len >= 2");
         for endpoint in [first, last] {
-            let Some((pos, dist, other)) =
-                attach_endpoint_target(sources, &source_bounds, road_index, endpoint)
-            else {
-                find_or_create(&mut nodes, endpoint);
+            let Some((pos, dist, other)) = attach_endpoint_target(
+                sources,
+                &spatial,
+                road_index,
+                endpoint,
+                &mut segment_matches,
+                &mut query_stack,
+            ) else {
+                node_grid.find_or_create(&mut nodes, endpoint);
                 continue;
             };
-            let node = find_or_create(&mut nodes, pos);
+            let node = node_grid.find_or_create(&mut nodes, pos);
             nodes[node]
                 .capture_roads
                 .push((road_index, dist + NODE_XY_EPS));
             let tol = (source.width * 0.5).max(sources[other].width * 0.5);
-            attachments.push((road_index, other, pos.truncate(), tol));
+            let pair = if road_index < other {
+                (road_index, other)
+            } else {
+                (other, road_index)
+            };
+            attachments
+                .entry(pair)
+                .or_default()
+                .push((pos.truncate(), tol));
         }
     }
 
@@ -666,20 +1021,29 @@ fn build_nodes(sources: &[SourceRoad], document: &Document) -> Vec<Node> {
     // closest approach.
     let mut crossing_positions: Vec<(DVec3, Option<(usize, f64)>)> = Vec::new();
     for (ai, a) in sources.iter().enumerate() {
-        for (bi, b) in sources.iter().enumerate().skip(ai + 1) {
-            if !bounds_overlap_xy(source_bounds[ai], source_bounds[bi], NODE_XY_EPS) {
+        spatial.sources.query(
+            spatial.source_bounds[ai],
+            NODE_XY_EPS,
+            &mut source_matches,
+            &mut query_stack,
+        );
+        source_matches.sort_unstable();
+        for &bi in &source_matches {
+            if bi <= ai {
                 continue;
             }
+            let b = &sources[bi];
             for seg_a in a.centerline.windows(2) {
                 let seg_a_bounds = points_bounds_xy(seg_a.iter().copied());
-                if !bounds_overlap_xy(seg_a_bounds, source_bounds[bi], NODE_XY_EPS) {
-                    continue;
-                }
-                for seg_b in b.centerline.windows(2) {
-                    let seg_b_bounds = points_bounds_xy(seg_b.iter().copied());
-                    if !bounds_overlap_xy(seg_a_bounds, seg_b_bounds, NODE_XY_EPS) {
-                        continue;
-                    }
+                spatial.road_segments[bi].query(
+                    seg_a_bounds,
+                    NODE_XY_EPS,
+                    &mut segment_matches,
+                    &mut query_stack,
+                );
+                segment_matches.sort_unstable();
+                for &segment_b in &segment_matches {
+                    let seg_b = &b.centerline[segment_b..=segment_b + 1];
                     let Some((xy, ta, tb)) = segment_intersection_xy(
                         seg_a[0].truncate(),
                         seg_a[1].truncate(),
@@ -698,8 +1062,8 @@ fn build_nodes(sources: &[SourceRoad], document: &Document) -> Vec<Node> {
                     // hair past the centerline it attached to. Skip it so the
                     // junction stays one node instead of gaining a sliver
                     // twin (whose near-parallel ports read as a 0° turn).
-                    if attachments.iter().any(|&(x, y, pos, tol)| {
-                        ((x == ai && y == bi) || (x == bi && y == ai)) && (xy - pos).length() < tol
+                    if attachments.get(&(ai, bi)).is_some_and(|entries| {
+                        entries.iter().any(|&(pos, tol)| (xy - pos).length() < tol)
                     }) {
                         continue;
                     }
@@ -709,9 +1073,18 @@ fn build_nodes(sources: &[SourceRoad], document: &Document) -> Vec<Node> {
                     // tolerance, at compatible elevation. `other` is the road
                     // the node must capture at its closest approach.
                     let mut snapped: Option<(f64, DVec3, usize, [DVec3; 2])> = None;
-                    for (road, other, other_seg) in [(a, bi, seg_b), (b, ai, seg_a)] {
-                        let interior = &road.centerline[1..road.centerline.len() - 1];
-                        for vertex in interior {
+                    for (road_index, road, other, other_seg) in
+                        [(ai, a, bi, seg_b), (bi, b, ai, seg_a)]
+                    {
+                        spatial.interior_vertices[road_index].query(
+                            (xy, xy),
+                            snap_tol,
+                            &mut vertex_matches,
+                            &mut query_stack,
+                        );
+                        vertex_matches.sort_unstable();
+                        for &interior_index in &vertex_matches {
+                            let vertex = &road.centerline[interior_index + 1];
                             let d = (vertex.truncate() - xy).length();
                             if d < snap_tol
                                 && (vertex.z - cross.z).abs() <= NODE_Z_TOL
@@ -738,7 +1111,7 @@ fn build_nodes(sources: &[SourceRoad], document: &Document) -> Vec<Node> {
         }
     }
     for (pos, capture) in crossing_positions {
-        let index = find_or_create(&mut nodes, pos);
+        let index = node_grid.find_or_create(&mut nodes, pos);
         if let Some(capture) = capture {
             nodes[index].capture_roads.push(capture);
         }
@@ -754,87 +1127,56 @@ fn build_nodes(sources: &[SourceRoad], document: &Document) -> Vec<Node> {
             if vi == 0 || vi + 1 == a.centerline.len() {
                 continue;
             }
-            let touches_other_road = sources.iter().enumerate().any(|(bi, b)| {
-                if ai == bi || !bounds_contain_xy(source_bounds[bi], v.truncate(), NODE_XY_EPS) {
+            let xy = v.truncate();
+            spatial.all_vertex_index.query(
+                (xy, xy),
+                NODE_XY_EPS,
+                &mut vertex_matches,
+                &mut query_stack,
+            );
+            let touches_vertex = vertex_matches.iter().any(|&candidate| {
+                let candidate = spatial.all_vertices[candidate];
+                if candidate.road == ai {
                     return false;
                 }
-                b.centerline.iter().any(|w| {
-                    (w.truncate() - v.truncate()).length() < NODE_XY_EPS
-                        && (w.z - v.z).abs() <= NODE_Z_TOL
-                }) || b
-                    .centerline
-                    .windows(2)
-                    .any(|seg| point_on_segment_xy(*v, seg[0], seg[1]))
+                let other = sources[candidate.road].centerline[candidate.vertex];
+                (other.truncate() - xy).length() < NODE_XY_EPS
+                    && (other.z - v.z).abs() <= NODE_Z_TOL
             });
+            let touches_other_road = if touches_vertex {
+                true
+            } else {
+                spatial.all_segment_index.query(
+                    (xy, xy),
+                    NODE_XY_EPS,
+                    &mut segment_matches,
+                    &mut query_stack,
+                );
+                segment_matches.iter().any(|&candidate| {
+                    let candidate = spatial.all_segments[candidate];
+                    candidate.road != ai
+                        && point_on_segment_xy(
+                            *v,
+                            sources[candidate.road].centerline[candidate.segment],
+                            sources[candidate.road].centerline[candidate.segment + 1],
+                        )
+                })
+            };
             if touches_other_road {
                 interior_hits.push(*v);
             }
         }
     }
     for pos in interior_hits {
-        find_or_create(&mut nodes, pos);
+        node_grid.find_or_create(&mut nodes, pos);
     }
 
-    // Polyline attachments: nodes sitting on (or at a vertex of) a polyline
-    // pick up the nearby polyline segments as their termination boundary.
-    // Polyline bounds are computed once up front — documents with dense
-    // contour strings make nodes × polyline-vertices a hot product.
-    let polylines: Vec<(&Object, (DVec2, DVec2))> = document
-        .objects()
-        .iter()
-        .filter(|object| matches!(object, Object::Polyline { verts, .. } if verts.len() >= 2))
-        .map(|object| {
-            let Object::Polyline { verts, .. } = object else {
-                unreachable!("filtered to polylines");
-            };
-            (object, points_bounds_xy(verts.iter().map(|v| v.pos)))
-        })
-        .collect();
+    // Polyline attachments: query only segments whose bounds touch the node,
+    // then add the same immediate neighbours as the legacy full scan.
+    let attachment_index = PolylineAttachmentIndex::build(document);
     for node in &mut nodes {
-        let junction = node.pos;
-        let mut attached = Vec::new();
-        for &(object, bounds) in &polylines {
-            let Object::Polyline { verts, closed, .. } = object else {
-                continue;
-            };
-            if !bounds_contain_xy(bounds, junction.truncate(), NODE_XY_EPS) {
-                continue;
-            }
-            let segment_count = if *closed && verts.len() >= 3 {
-                verts.len()
-            } else {
-                verts.len() - 1
-            };
-            let segment_at = |index: usize| -> [DVec3; 2] {
-                [verts[index].pos, verts[(index + 1) % verts.len()].pos]
-            };
-            // Include immediate neighbours so side rays landing just past a
-            // kink at the attachment point still find a boundary.
-            let mut wanted: Vec<usize> = Vec::new();
-            for i in 0..segment_count {
-                let [a, b] = segment_at(i);
-                if !point_on_segment_xy(junction, a, b)
-                    && !points_coincident_3d(junction, a)
-                    && !points_coincident_3d(junction, b)
-                {
-                    continue;
-                }
-                for candidate in [i.wrapping_sub(1), i, i + 1] {
-                    let index = if *closed {
-                        candidate % segment_count
-                    } else if candidate < segment_count {
-                        candidate
-                    } else {
-                        continue;
-                    };
-                    if !wanted.contains(&index) {
-                        wanted.push(index);
-                    }
-                }
-            }
-            attached.extend(wanted.into_iter().map(segment_at));
-        }
-        node.attachment_segments = attached;
+        node.attachment_segments =
+            attachment_index.attached_segments(node.pos, &mut segment_matches, &mut query_stack);
     }
 
     nodes
@@ -846,40 +1188,51 @@ fn build_nodes(sources: &[SourceRoad], document: &Document) -> Vec<Node> {
 /// (which the strict node/split tolerances handle as before).
 fn attach_endpoint_target(
     sources: &[SourceRoad],
-    source_bounds: &[(DVec2, DVec2)],
+    spatial: &RoadSpatialIndex,
     road_index: usize,
     endpoint: DVec3,
+    matches: &mut Vec<usize>,
+    query_stack: &mut Vec<usize>,
 ) -> Option<(DVec3, f64, usize)> {
     let own_hw = sources[road_index].width * 0.5;
     let mut best: Option<(DVec3, f64, usize)> = None;
-    for (other_index, other) in sources.iter().enumerate() {
+    let xy = endpoint.truncate();
+    spatial.all_segment_index.query(
+        (xy, xy),
+        own_hw.max(spatial.max_half_width),
+        matches,
+        query_stack,
+    );
+    // Flat segment indices were built in road/segment order, matching the old
+    // nested scan so equal-distance ties keep the same target.
+    matches.sort_unstable();
+    for &candidate in matches.iter() {
+        let candidate = spatial.all_segments[candidate];
+        let other_index = candidate.road;
         if other_index == road_index {
             continue;
         }
+        let other = &sources[other_index];
         let tol = own_hw.max(other.width * 0.5);
-        if !bounds_contain_xy(source_bounds[other_index], endpoint.truncate(), tol) {
+        let seg = &other.centerline[candidate.segment..=candidate.segment + 1];
+        let (proj, t) = crate::model::kernel::project_onto_segment(
+            endpoint.truncate(),
+            seg[0].truncate(),
+            seg[1].truncate(),
+        );
+        let dist = (proj - endpoint.truncate()).length();
+        if dist >= tol {
             continue;
         }
-        for seg in other.centerline.windows(2) {
-            let (proj, t) = crate::model::kernel::project_onto_segment(
-                endpoint.truncate(),
-                seg[0].truncate(),
-                seg[1].truncate(),
-            );
-            let dist = (proj - endpoint.truncate()).length();
-            if dist >= tol {
-                continue;
-            }
-            // The endpoint may carry a junction-flattened z from snapping to
-            // the drawn line, hence the doubled window (mirrors the capture
-            // cuts in `split_roads_at_nodes`).
-            let z = seg[0].z + (seg[1].z - seg[0].z) * t;
-            if (z - endpoint.z).abs() > 2.0 * NODE_Z_TOL {
-                continue;
-            }
-            if best.is_none_or(|(_, d, _)| dist < d) {
-                best = Some((DVec3::new(proj.x, proj.y, z), dist, other_index));
-            }
+        // The endpoint may carry a junction-flattened z from snapping to
+        // the drawn line, hence the doubled window (mirrors the capture
+        // cuts in `split_roads_at_nodes`).
+        let z = seg[0].z + (seg[1].z - seg[0].z) * t;
+        if (z - endpoint.z).abs() > 2.0 * NODE_Z_TOL {
+            continue;
+        }
+        if best.is_none_or(|(_, d, _)| dist < d) {
+            best = Some((DVec3::new(proj.x, proj.y, z), dist, other_index));
         }
     }
     // Exactly on a line already: keep the endpoint itself as the node.
@@ -1913,13 +2266,6 @@ fn bounds_overlap_xy(a: (DVec2, DVec2), b: (DVec2, DVec2), margin: f64) -> bool 
         && a.1.x >= b.0.x - margin
         && a.0.y <= b.1.y + margin
         && a.1.y >= b.0.y - margin
-}
-
-fn bounds_contain_xy(bounds: (DVec2, DVec2), point: DVec2, margin: f64) -> bool {
-    point.x >= bounds.0.x - margin
-        && point.x <= bounds.1.x + margin
-        && point.y >= bounds.0.y - margin
-        && point.y <= bounds.1.y + margin
 }
 
 fn point_on_segment_xy(point: DVec3, a: DVec3, b: DVec3) -> bool {

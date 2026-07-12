@@ -16,10 +16,24 @@ const RIGHT_CLICK_DRAG_THRESHOLD_PX: f32 = 3.0;
 impl<'a> App<'a> {
     pub(crate) fn handle_window_event(
         &mut self,
-        _event_loop: &winit::event_loop::ActiveEventLoop,
-        _window_id: winit::window::WindowId,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
+        if self
+            .graphics
+            .as_ref()
+            .and_then(|graphics| graphics.slice_preview_window_id())
+            == Some(window_id)
+        {
+            self.handle_slice_preview_event(event);
+            return;
+        }
+        // A dropped secondary window can still have a final queued event.
+        // Never feed such an event into the root window's egui/camera state.
+        if self.window.as_ref().map(|window| window.id()) != Some(window_id) {
+            return;
+        }
         if let WindowEvent::ModifiersChanged(modifiers) = &event {
             self.modifiers = modifiers.state();
         }
@@ -30,6 +44,7 @@ impl<'a> App<'a> {
                 self.finish_left_button_interactions();
                 if let Some(graphics) = self.graphics.as_mut() {
                     graphics.release_mouse_capture();
+                    graphics.release_slice_keys();
                 }
             }
             self.redraw_requested = true;
@@ -56,8 +71,39 @@ impl<'a> App<'a> {
         }
 
         let gui_consumed = gui_response.is_some_and(|response| response.consumed);
+
+        // Slice mode claims plain W/S (slab forward/back) and Q/E (rotate the
+        // line). Presses are dropped when the GUI consumed the event (e.g.
+        // typing in the slice panel), but releases always pass through so
+        // keys can't get stuck held.
+        if self.editor.slice_mode_enabled
+            && !self.modifiers.control_key()
+            && !(cfg!(target_os = "macos") && self.modifiers.super_key())
+            && let WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state,
+                        physical_key:
+                            PhysicalKey::Code(
+                                key @ (KeyCode::KeyW
+                                | KeyCode::KeyS
+                                | KeyCode::KeyQ
+                                | KeyCode::KeyE),
+                            ),
+                        ..
+                    },
+                ..
+            } = &event
+            && (!gui_consumed || *state == ElementState::Released)
+            && let Some(graphics) = self.graphics.as_mut()
+        {
+            graphics.slice_process_key(*key, *state == ElementState::Pressed);
+            self.redraw_requested = true;
+        }
+
         if !gui_consumed {
-            let suppress_fly_canvas_click = self.editor.fly_mode_enabled
+            let suppress_fly_canvas_click = (self.editor.fly_mode_enabled
+                || self.editor.slice_mode_enabled)
                 && matches!(
                     event,
                     WindowEvent::MouseInput {
@@ -97,16 +143,17 @@ impl<'a> App<'a> {
                     }
                 }
                 WindowEvent::KeyboardInput { .. } => self.handle_key_action(&event),
-                WindowEvent::Resized(physical_size) => {
-                    if physical_size.width > 0 && physical_size.height > 0 {
-                        self.pending_resize = Some(physical_size);
-                        self.redraw_requested = true;
-                    }
+                WindowEvent::Resized(physical_size)
+                    if physical_size.width > 0 && physical_size.height > 0 =>
+                {
+                    self.pending_resize = Some(physical_size);
+                    self.redraw_requested = true;
                 }
                 WindowEvent::RedrawRequested => {
                     self.poll_triangulation_loads();
                     self.poll_block_model_loads();
                     self.poll_point_cloud_loads();
+                    self.poll_raster_loads();
                     self.poll_saves();
                     self.poll_jobs();
                     let now = Instant::now();
@@ -129,7 +176,7 @@ impl<'a> App<'a> {
                     // redraws generated directly by the compositor during resize.
                     self.redraw_requested = false;
                     let project = self.project_view();
-                    let completing_topology_load = self.topology_load_pending_gpu;
+                    let completing_topology_load = self.topology_uploads_pending();
                     let applied_resize = self.pending_resize.take();
                     if let Some(graphics) = self.graphics.as_mut() {
                         if let Some(size) = applied_resize {
@@ -148,39 +195,52 @@ impl<'a> App<'a> {
                         graphics.update(dt, self.editor.block_model_interaction_resolution_divisor);
                         self.editor.can_undo = self.history.can_undo();
                         self.editor.can_redo = self.history.can_redo();
-                        match graphics.render(
-                            &mut self.editor,
-                            &mut self.scene_document,
-                            &self.triangulations,
-                            &self.block_models,
-                            &self.point_clouds,
-                            &project,
-                        ) {
+                        match graphics.render(crate::rendering::graphics::frame::RenderInput {
+                            editor: &mut self.editor,
+                            document: &mut self.scene_document,
+                            triangulations: &self.triangulations,
+                            block_models: &self.block_models,
+                            point_clouds: &self.point_clouds,
+                            rasters: &self.raster_textures,
+                            project: &project,
+                        }) {
                             Ok(ui_output) => {
+                                self.render_validation_recovery_attempts = 0;
+                                self.next_ui_repaint_deadline = ui_output
+                                    .repaint_after
+                                    .and_then(|delay| Instant::now().checked_add(delay));
+                                if ui_output.repaint_after.is_some_and(|delay| delay.is_zero()) {
+                                    self.redraw_requested = true;
+                                }
                                 if let Some(graphics) = self.graphics.as_mut() {
                                     graphics.set_fly_mode_enabled(self.editor.fly_mode_enabled);
                                     self.editor.debug_chunk_stats =
                                         Some(graphics.chunk_render_stats);
                                 }
-                                if let Some(layer_id) = self.editor.active_layer
-                                    && let Some(index) =
-                                        self.workspace.project_index_for_loaded_layer(layer_id)
+                                if completing_topology_load
+                                    && !self.graphics.as_ref().is_some_and(|graphics| {
+                                        graphics.point_cloud_uploads_pending()
+                                    })
                                 {
-                                    if self.workspace.active_index != Some(index) {
-                                        self.history.clear();
-                                        self.editor.selected_handles.clear();
-                                    }
-                                    self.workspace.set_active_index(index);
-                                }
-                                if completing_topology_load {
                                     self.finish_topology_load();
                                 }
-                                if self.pending_loads > 0
+                                if self.background_tasks_pending()
                                     && let Some(window) = &self.window
                                 {
                                     window.set_cursor(CursorIcon::Progress);
                                 }
                                 self.handle_ui_commands(ui_output.commands);
+                                self.sync_slice_preview_window(event_loop);
+                                if let Some(graphics) = self.graphics.as_mut() {
+                                    graphics.request_slice_preview_redraw_if_scene_changed(
+                                        &self.editor,
+                                        &self.scene_document,
+                                        &self.triangulations,
+                                        &self.block_models,
+                                        &self.point_clouds,
+                                        &self.raster_textures,
+                                    );
+                                }
                                 // Keep move panel preview in sync — apply whenever the panel delta
                                 // differs from the last applied preview (catches typed values that
                                 // don't always trigger changed() on every frame).
@@ -229,6 +289,14 @@ impl<'a> App<'a> {
                                     self.editor.pending_stroke.clear();
                                     self.invalidate_overlay();
                                 }
+                                // Clear the pending slice line when switching
+                                // away from the slice tool.
+                                if self.editor.active_tool != ActiveTool::VerticalSlice
+                                    && self.editor.slice_pending_start.is_some()
+                                {
+                                    self.editor.slice_pending_start = None;
+                                    self.invalidate_overlay();
+                                }
                                 // Cancel fuse state when switching away from the fuse tool.
                                 if self.editor.active_tool != ActiveTool::FuseIntoPolygon
                                     && (self.editor.fuse_awaiting_endpoint.is_some()
@@ -257,7 +325,26 @@ impl<'a> App<'a> {
                             Err(RenderSurfaceError::Timeout | RenderSurfaceError::Occluded) => {
                                 self.redraw_requested = true;
                             }
-                            Err(RenderSurfaceError::Validation) => self.close_requested = true,
+                            Err(RenderSurfaceError::Validation) => {
+                                // Bounded surface/device recovery first; only
+                                // repeated failures without one good frame in
+                                // between are treated as fatal.
+                                const MAX_VALIDATION_RECOVERY_ATTEMPTS: u32 = 3;
+                                if self.render_validation_recovery_attempts
+                                    < MAX_VALIDATION_RECOVERY_ATTEMPTS
+                                {
+                                    self.render_validation_recovery_attempts += 1;
+                                    log::warn!(
+                                        "Renderer validation error; attempting surface recovery ({}/{})",
+                                        self.render_validation_recovery_attempts,
+                                        MAX_VALIDATION_RECOVERY_ATTEMPTS
+                                    );
+                                    graphics.reconfigure();
+                                    self.redraw_requested = true;
+                                } else {
+                                    self.begin_fatal_shutdown("renderer validation error");
+                                }
+                            }
                         }
                     }
                 }
@@ -285,6 +372,7 @@ impl<'a> App<'a> {
                             | ActiveTool::MeasureDistance
                             | ActiveTool::MeasureBermAngle
                             | ActiveTool::MakeRoad
+                            | ActiveTool::VerticalSlice
                     );
                     let is_scrolling = self
                         .last_scroll_instant
@@ -295,10 +383,10 @@ impl<'a> App<'a> {
                             | crate::ui::state::CursorMode::SnapToLine
                             | crate::ui::state::CursorMode::SnapToSurface
                     );
-                    let snap_eligible = is_drawing_tool
-                        && snap_mode_enabled
-                        && !self.graphics.as_ref().is_some_and(|g| g.is_camera_active())
-                        && !is_scrolling;
+                    let camera_active =
+                        self.graphics.as_ref().is_some_and(|g| g.is_camera_active());
+                    let snap_eligible =
+                        is_drawing_tool && snap_mode_enabled && !camera_active && !is_scrolling;
                     let now = Instant::now();
                     let snap_poll_due = self.last_snap_poll_instant.is_none_or(|last_poll| {
                         now.duration_since(last_poll)
@@ -332,8 +420,20 @@ impl<'a> App<'a> {
                         None
                     };
                     let was_snapped = self.editor.cursor_snapped;
-                    let effective = snapped.or(raw);
-                    self.editor.cursor_snapped = snapped.is_some();
+                    // During a camera drag the mouse steers the view, not the
+                    // cursor: keep the last world cursor (and its snapped flag)
+                    // so in-progress tool previews don't chase the unprojection
+                    // of a rotating camera.
+                    let effective = if camera_active {
+                        self.editor.cursor_world
+                    } else {
+                        snapped.or(raw)
+                    };
+                    self.editor.cursor_snapped = if camera_active {
+                        was_snapped
+                    } else {
+                        snapped.is_some()
+                    };
                     let cursor_world_changed = self.editor.cursor_world != effective;
                     if cursor_world_changed {
                         self.editor.cursor_world = effective;
@@ -541,12 +641,110 @@ impl<'a> App<'a> {
                         || self.editor.active_tool == ActiveTool::Chamfer
                         || self.editor.active_tool == ActiveTool::MakeRoad
                         || self.editor.active_tool == ActiveTool::Bezier
+                        || self.editor.slice_pending_start.is_some()
                     {
                         self.invalidate_overlay();
                     }
                 }
                 _ => {}
             }
+        }
+    }
+
+    fn handle_slice_preview_event(&mut self, event: WindowEvent) {
+        match event {
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+            }
+            WindowEvent::Focused(false) => {
+                if let Some(graphics) = self.graphics.as_mut() {
+                    graphics.release_slice_keys();
+                }
+                self.redraw_requested = true;
+            }
+            WindowEvent::CloseRequested => {
+                if let Some(graphics) = self.graphics.as_mut() {
+                    graphics.close_slice_preview();
+                }
+                self.editor.slice_preview_detached = false;
+                self.redraw_requested = true;
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        physical_key: PhysicalKey::Code(KeyCode::Escape),
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(graphics) = self.graphics.as_mut() {
+                    graphics.close_slice_preview();
+                }
+                self.editor.slice_preview_detached = false;
+                self.redraw_requested = true;
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state,
+                        physical_key:
+                            PhysicalKey::Code(
+                                key @ (KeyCode::KeyW
+                                | KeyCode::KeyS
+                                | KeyCode::KeyQ
+                                | KeyCode::KeyE),
+                            ),
+                        ..
+                    },
+                ..
+            } if !self.modifiers.control_key()
+                && !(cfg!(target_os = "macos") && self.modifiers.super_key()) =>
+            {
+                if let Some(graphics) = self.graphics.as_mut() {
+                    graphics.slice_process_key(key, state == ElementState::Pressed);
+                    graphics.request_slice_preview_redraw();
+                }
+                self.redraw_requested = true;
+            }
+            WindowEvent::Resized(size) => {
+                if let Some(graphics) = self.graphics.as_mut() {
+                    graphics.resize_slice_preview(size);
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                let result = self.graphics.as_mut().map(|graphics| {
+                    graphics.render_slice_preview(
+                        &self.scene_document,
+                        &self.triangulations,
+                        &self.block_models,
+                        &self.point_clouds,
+                        &self.raster_textures,
+                        &self.editor,
+                    )
+                });
+                match result {
+                    Some(Err(RenderSurfaceError::Lost | RenderSurfaceError::Outdated)) => {
+                        if let Some(graphics) = self.graphics.as_mut() {
+                            graphics.reconfigure_slice_preview();
+                            graphics.request_slice_preview_redraw();
+                        }
+                    }
+                    Some(Err(RenderSurfaceError::Timeout | RenderSurfaceError::Occluded)) => {
+                        if let Some(graphics) = self.graphics.as_ref() {
+                            graphics.request_slice_preview_redraw();
+                        }
+                    }
+                    Some(Err(RenderSurfaceError::Validation)) => {
+                        if let Some(graphics) = self.graphics.as_mut() {
+                            graphics.close_slice_preview();
+                        }
+                        self.editor.slice_preview_detached = false;
+                    }
+                    Some(Ok(())) | None => {}
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -596,6 +794,7 @@ impl<'a> App<'a> {
                 ActiveTool::MakeRoad => self.place_road_point(),
                 ActiveTool::MeasureDistance => self.measure_distance_click(),
                 ActiveTool::MeasureBermAngle => self.measure_berm_angle_click(),
+                ActiveTool::VerticalSlice => self.slice_line_click(),
                 ActiveTool::DeleteElement => {
                     self.editor.selection_box_start_px = self.editor.cursor_screen_px;
                     self.editor.selection_box_current_px = self.editor.cursor_screen_px;
@@ -688,7 +887,9 @@ impl<'a> App<'a> {
     }
 
     fn handle_right_release(&mut self, event: &WindowEvent) {
-        if self.editor.fly_mode_enabled {
+        if self.editor.fly_mode_enabled || self.editor.slice_mode_enabled {
+            // Slice mode: a right click has nothing to cancel and no context
+            // menu to open.
             self.right_press_px = None;
             self.right_orbit_active = false;
             return;
@@ -710,9 +911,17 @@ impl<'a> App<'a> {
                 _ => false,
             } && !orbit_was_active;
             if is_quick_press && self.editor.active_tool == ActiveTool::MakeRoad {
-                self.commit_road();
+                if self.editor.pending_stroke.is_empty() {
+                    self.cancel_road();
+                    userspace_log!("Right click exited road tool");
+                } else if self.editor.pending_stroke.len() == 1 {
+                    self.discard_road_stroke();
+                    userspace_log!("Right click cancelled road stroke");
+                } else {
+                    self.commit_road();
+                    userspace_log!("Right click finished road");
+                }
                 self.redraw_requested = true;
-                userspace_log!("Right click finished road");
             } else if is_quick_press
                 && matches!(
                     self.editor.active_tool,
@@ -745,19 +954,16 @@ impl<'a> App<'a> {
                 });
                 if let Some((handle, world)) = picked {
                     if let crate::model::SceneEntityId::Object(id) = handle {
-                        let Some(index) = self.workspace.project_index_for_object(id) else {
-                            return;
-                        };
-                        if self.workspace.active_index != Some(index) {
-                            self.history.clear();
-                            self.editor.selected_handles.clear();
-                        }
-                        self.workspace.set_active_index(index);
-                        self.editor.active_layer = self
+                        self.activate_project_for_object(id);
+                        let Some(layer) = self
                             .workspace
                             .active_document()
                             .and_then(|document| document.get_object(id))
-                            .map(crate::model::Object::layer);
+                            .map(crate::model::Object::layer)
+                        else {
+                            return;
+                        };
+                        self.editor.active_layer = Some(layer);
                     }
                     if !self.editor.selected_handles.contains(&handle) {
                         self.editor.on_canvas_pick(
@@ -783,7 +989,8 @@ impl<'a> App<'a> {
 
     fn handle_control_shortcuts(&mut self, event: &WindowEvent) {
         if !self.editor.text_editing_enabled
-            && self.modifiers.control_key()
+            && (self.modifiers.control_key()
+                || (cfg!(target_os = "macos") && self.modifiers.super_key()))
             && let WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -839,6 +1046,12 @@ impl<'a> App<'a> {
             return;
         }
 
+        if self.editor.slice_mode_enabled {
+            // No orbiting in slice mode; the camera is fully derived from the
+            // slice state (Q/E rotates the slice line instead).
+            return;
+        }
+
         self.refresh_snap_index();
         let Some(graphics) = self.graphics.as_mut() else {
             return;
@@ -880,6 +1093,14 @@ impl<'a> App<'a> {
                 } else if self.editor.text_editing_enabled {
                     self.cancel_text_edit();
                     userspace_log!("Escape cancelled text editing");
+                } else if self.editor.slice_mode_enabled {
+                    self.set_slice_mode_enabled(false);
+                    userspace_log!("Escape exited slice view");
+                } else if self.editor.active_tool == ActiveTool::VerticalSlice {
+                    self.editor.slice_pending_start = None;
+                    self.editor.active_tool = ActiveTool::None;
+                    self.invalidate_overlay();
+                    userspace_log!("Escape cancelled slice line placement");
                 } else if self.editor.offset_awaiting_side_pick || self.editor.offset_dialog_open {
                     self.cancel_offset();
                     userspace_log!("Escape cancelled offset tool");
@@ -950,22 +1171,22 @@ impl<'a> App<'a> {
                     userspace_log!("Backquote set Z level to cursor hit Z {:.4}", z);
                 }
             }
-            KeyCode::Enter | KeyCode::NumpadEnter => {
-                if !self.editor.text_editing_enabled {
-                    userspace_log!("Enter");
-                    if self.editor.active_tool == ActiveTool::MakeRoad {
-                        self.commit_road();
-                    } else if self.editor.active_tool == ActiveTool::Move {
-                        let d = self.editor.move_panel_delta;
-                        self.apply_move_delta(glam::DVec3::new(d[0], d[1], d[2]));
-                        self.editor.active_tool = ActiveTool::None;
-                    } else if self.editor.active_tool == ActiveTool::OffsetElement
-                        && self.editor.offset_awaiting_side_pick
-                    {
-                        self.commit_offset();
-                    } else {
-                        self.try_finish_tool();
-                    }
+            KeyCode::Enter | KeyCode::NumpadEnter if !self.editor.text_editing_enabled => {
+                userspace_log!("Enter");
+                if self.editor.active_tool == ActiveTool::MakeRoad {
+                    self.commit_road();
+                } else if self.editor.active_tool == ActiveTool::Move {
+                    let d = self.editor.move_panel_delta;
+                    self.apply_move_delta(glam::DVec3::new(d[0], d[1], d[2]));
+                    self.editor.active_tool = ActiveTool::None;
+                } else if self.editor.active_tool == ActiveTool::OffsetElement
+                    && self.editor.offset_awaiting_side_pick
+                {
+                    self.commit_offset();
+                } else if self.editor.active_tool == ActiveTool::Bezier {
+                    self.apply_bezier();
+                } else {
+                    self.try_finish_tool();
                 }
             }
             KeyCode::Delete | KeyCode::Backspace if !self.editor.text_editing_enabled => {
@@ -1027,6 +1248,10 @@ impl<'a> App<'a> {
             self.editor.berm_angle_points.clear();
             self.editor.active_tool = ActiveTool::None;
             self.invalidate_overlay();
+        } else if self.editor.active_tool == ActiveTool::VerticalSlice {
+            self.editor.slice_pending_start = None;
+            self.editor.active_tool = ActiveTool::None;
+            self.invalidate_overlay();
         } else if !self.editor.pending_stroke.is_empty() {
             self.discard_stroke();
         } else {
@@ -1038,7 +1263,9 @@ impl<'a> App<'a> {
         if self.editor.text_editing_enabled {
             return;
         }
-        if self.editor.fly_mode_enabled && tool != ActiveTool::None {
+        if (self.editor.fly_mode_enabled || self.editor.slice_mode_enabled)
+            && tool != ActiveTool::None
+        {
             return;
         }
 
@@ -1100,6 +1327,9 @@ impl<'a> App<'a> {
             } else {
                 self.cancel_active_tool();
             }
+            // Fly and slice modes are mutually exclusive: both claim W/S and
+            // right-drag.
+            self.set_slice_mode_enabled(false);
             self.finish_left_button_interactions();
             self.editor.canvas_context_menu_open = false;
             self.editor.cursor_snapped = false;

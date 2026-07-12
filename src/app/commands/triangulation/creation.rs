@@ -6,6 +6,22 @@ use crate::model::geometry::{points_coincident, signed_area_xy, triangle_xy_area
 /// treated as one intended shared vertex when the user opts in.
 pub(crate) const COARSE_WELD_TOL: f64 = 0.05;
 
+#[derive(Clone, Debug)]
+struct BreaklinePath {
+    points: Vec<glam::DVec3>,
+    closed: bool,
+}
+
+#[derive(Debug)]
+struct TriangulationInput {
+    /// Closed strings that define the finite surface domain. Nested rings are
+    /// terrain breaklines too; they are not holes.
+    boundaries: Vec<Vec<glam::DVec3>>,
+    /// Genuine open strings inside the domain. These constrain the CDT but do
+    /// not acquire an invented last-to-first edge.
+    constraints: Vec<Vec<glam::DVec3>>,
+}
+
 impl<'a> App<'a> {
     pub(crate) fn create_triangulation_from_objects(
         &mut self,
@@ -17,27 +33,34 @@ impl<'a> App<'a> {
         if object_ids.is_empty() {
             anyhow::bail!("No objects selected for triangulation");
         }
+        let project = self.workspace.active_project().ok_or_else(|| {
+            anyhow::anyhow!("Open a PIDB project before creating a triangulation")
+        })?;
+        let project_key = crate::app::jobs::JobKey::Project {
+            runtime_id: project.runtime_id,
+            document_revision: project.pidb.document.revision(),
+        };
 
-        // Snapshot the referenced geometry into owned rings on the UI thread —
+        // Snapshot the referenced geometry into owned paths on the UI thread —
         // the worker must not touch `self.scene_document`.
-        let (rings, rejected) = self.collect_triangulation_rings(&object_ids);
+        let (paths, rejected) = self.collect_triangulation_paths(&object_ids);
 
-        if rings.is_empty() {
+        if paths.is_empty() {
             anyhow::bail!(
-                "No closed polygons selected — triangulation requires closed polygons with at least 3 vertices"
+                "No usable polylines selected — triangulation requires a closed boundary, or open strings whose endpoints form one"
             );
         }
         if rejected > 0 {
             userspace_warn!(
-                "Ignored {} non-polygon object(s) during triangulation",
+                "Ignored {} non-polyline or degenerate object(s) during triangulation",
                 rejected
             );
         }
 
         // Whether a coarse-weld retry could help, computed from the un-welded
-        // rings on the UI thread so the async failure dialog can offer it.
+        // paths on the UI thread so the async failure dialog can offer it.
         let weld_retry_available = !coarse_weld && {
-            let mut probe = rings.clone();
+            let mut probe = paths.clone();
             weld_breakline_vertices(&mut probe, COARSE_WELD_TOL, COARSE_WELD_TOL) > 0
         };
         let name_for_failure = name.clone();
@@ -47,9 +70,16 @@ impl<'a> App<'a> {
         // feedback (the apply step re-sets it if this attempt also fails).
         self.editor.tri_create_failure = None;
 
-        let compute = move |_cancel: &crate::app::jobs::CancelFlag|
+        let compute = move |cancel: &crate::app::jobs::CancelFlag|
               -> Result<crate::model::triangulation::GeneratedTriangulation> {
-            build_created_triangulation(rings, name, surface_type, coarse_weld)
+            if cancel.is_cancelled() {
+                anyhow::bail!("Cancelled");
+            }
+            let generated = build_created_triangulation(paths, name, surface_type, coarse_weld)?;
+            if cancel.is_cancelled() {
+                anyhow::bail!("Cancelled");
+            }
+            Ok(generated)
         };
         let apply =
             move |app: &mut App,
@@ -70,55 +100,52 @@ impl<'a> App<'a> {
                     }
                 }
             };
-        self.spawn_job(
-            "Creating triangulation…",
-            crate::app::jobs::JobKey::Anonymous,
-            compute,
-            apply,
-        );
+        self.spawn_job("Creating triangulation…", vec![project_key], compute, apply);
         Ok(())
     }
 
-    /// Closed polygons from the selection as rings, plus the count of
-    /// rejected non-polygon objects. Open lines and points cannot form a
-    /// surface.
-    pub(crate) fn collect_triangulation_rings(
-        &self,
-        object_ids: &[ObjectId],
-    ) -> (Vec<Vec<glam::DVec3>>, usize) {
-        let mut rings: Vec<Vec<glam::DVec3>> = Vec::new();
+    /// Polyline geometry from the selection, preserving whether each source
+    /// string was explicitly closed. Open paths are assembled into boundary
+    /// cycles (where possible) by the worker after endpoint welding.
+    fn collect_triangulation_paths(&self, object_ids: &[ObjectId]) -> (Vec<BreaklinePath>, usize) {
+        let mut paths = Vec::new();
         let mut rejected = 0usize;
         for id in object_ids {
             let Some(obj) = self.scene_document.get_object(*id) else {
                 continue;
             };
             match obj {
-                Object::Polyline {
-                    verts,
-                    closed: true,
-                    ..
-                } if verts.len() >= 3 => {
-                    rings.push(verts.iter().map(|v| v.pos).collect());
+                Object::Polyline { verts, closed, .. } => {
+                    let points = crate::model::geometry::tessellate_polyline_bulges(verts, *closed);
+                    let minimum = if *closed { 3 } else { 2 };
+                    if points.len() >= minimum {
+                        paths.push(BreaklinePath {
+                            points,
+                            closed: *closed,
+                        });
+                    } else {
+                        rejected += 1;
+                    }
                 }
                 _ => {
                     rejected += 1;
                 }
             }
         }
-        (rings, rejected)
+        (paths, rejected)
     }
 
     /// Whether the coarse weld would actually move any vertex of the
     /// selection — if not, offering "weld & retry" would be a no-op lie.
     pub(crate) fn coarse_weld_would_change(&self, object_ids: &[ObjectId]) -> bool {
-        let (mut rings, _) = self.collect_triangulation_rings(object_ids);
-        weld_breakline_vertices(&mut rings, COARSE_WELD_TOL, COARSE_WELD_TOL) > 0
+        let (mut paths, _) = self.collect_triangulation_paths(object_ids);
+        weld_breakline_vertices(&mut paths, COARSE_WELD_TOL, COARSE_WELD_TOL) > 0
     }
 
     /// Create Triangulation with failure capture. The triangulation runs on a
     /// background thread; async CDT failures populate the failure dialog in the
     /// job's apply step. This wrapper only captures the *synchronous* early
-    /// errors (empty selection, no closed polygons) into the same dialog so the
+    /// errors (empty selection, no usable polylines) into the same dialog so the
     /// coarse-weld retry stays available.
     pub(crate) fn run_create_triangulation(
         &mut self,
@@ -152,13 +179,13 @@ impl<'a> App<'a> {
 /// Pure (no `App`, no scene access) so it can run off the UI thread. Emits the
 /// weld/creation log lines (the log sink is thread-safe).
 fn build_created_triangulation(
-    mut rings: Vec<Vec<glam::DVec3>>,
+    mut paths: Vec<BreaklinePath>,
     name: String,
     surface_type: TriSurfaceType,
     coarse_weld: bool,
 ) -> Result<crate::model::triangulation::GeneratedTriangulation> {
     let welded = weld_breakline_vertices(
-        &mut rings,
+        &mut paths,
         crate::model::kernel::XY_TOL,
         crate::model::kernel::Z_TOL,
     );
@@ -169,7 +196,7 @@ fn build_created_triangulation(
         );
     }
     if coarse_weld {
-        let coarse_welded = weld_breakline_vertices(&mut rings, COARSE_WELD_TOL, COARSE_WELD_TOL);
+        let coarse_welded = weld_breakline_vertices(&mut paths, COARSE_WELD_TOL, COARSE_WELD_TOL);
         userspace_log!(
             "Weld & retry: moved {} vertex/vertices onto shared positions (up to {} m); \
              source objects are unchanged",
@@ -178,18 +205,25 @@ fn build_created_triangulation(
         );
     }
 
-    let (all_verts, all_faces) = if rings.len() == 1 && surface_type == TriSurfaceType::Surface {
+    let input = assemble_triangulation_input(paths)?;
+    let boundary_count = input.boundaries.len();
+    let constraint_count = input.constraints.len();
+
+    let (all_verts, all_faces) = if boundary_count == 1
+        && constraint_count == 0
+        && surface_type == TriSurfaceType::Surface
+    {
         // Single ring: triangulate its flat interior (normal pointing up).
-        let flip = signed_area_xy(&rings[0]) <= 0.0; // CW ring needs flip for normal-up
-        cdt_fill_ring(&rings[0], flip)?
+        let flip = signed_area_xy(&input.boundaries[0]) <= 0.0; // CW ring needs flip for normal-up
+        cdt_fill_ring(&input.boundaries[0], flip)?
     } else if surface_type == TriSurfaceType::Surface {
         // Nested contours, benches and berms are terrain breaklines, not a
         // Z-sorted loft stack. Triangulate all selected boundaries in one XY
         // CDT so every string edge is preserved and its vertex Z drives the
         // resulting terrain surface.
-        cdt_surface_from_breaklines(&rings)?
+        cdt_surface_from_breaklines(&input.boundaries, &input.constraints)?
     } else {
-        closed_solid_from_breaklines(&rings)?
+        closed_solid_from_breaklines(&input.boundaries, &input.constraints)?
     };
 
     if all_faces.is_empty() {
@@ -197,8 +231,9 @@ fn build_created_triangulation(
     }
 
     userspace_log!(
-        "Created triangulation from {} polygon(s), surface type {:?}",
-        rings.len(),
+        "Created triangulation from {} boundary ring(s) and {} open constraint(s), surface type {:?}",
+        boundary_count,
+        constraint_count,
         surface_type
     );
     super::session::build_generated_triangulation(
@@ -212,14 +247,14 @@ fn build_created_triangulation(
 
 /// Snap breakline vertices that coincide within the given tolerances (XY
 /// horizontally, Z vertically, both metres) onto one canonical position,
-/// across all rings. At kernel tolerance, vertices this close come from
+/// across all paths. At kernel tolerance, vertices this close come from
 /// digitization or floating-point noise, never intent; welding them lets the
 /// CDT share one vertex instead of threading constraints between two points a
 /// fraction of a millimetre apart (sliver triangles) or rejecting the same XY
 /// at two noise-level elevations. At the coarse tolerance this deliberately
 /// moves user geometry and must be user-initiated. Returns the number of
 /// vertices moved.
-fn weld_breakline_vertices(rings: &mut [Vec<glam::DVec3>], xy_tol: f64, z_tol: f64) -> usize {
+fn weld_breakline_vertices(paths: &mut [BreaklinePath], xy_tol: f64, z_tol: f64) -> usize {
     let cell = |v: glam::DVec3| -> (i64, i64) {
         ((v.x / xy_tol).floor() as i64, (v.y / xy_tol).floor() as i64)
     };
@@ -228,8 +263,8 @@ fn weld_breakline_vertices(rings: &mut [Vec<glam::DVec3>], xy_tol: f64, z_tol: f
     };
     let mut grid: HashMap<(i64, i64), Vec<glam::DVec3>> = HashMap::new();
     let mut welded = 0usize;
-    for ring in rings.iter_mut() {
-        for point in ring.iter_mut() {
+    for path in paths.iter_mut() {
+        for point in path.points.iter_mut() {
             let (cx, cy) = cell(*point);
             let mut canonical = None;
             'search: for gx in cx - 1..=cx + 1 {
@@ -256,31 +291,217 @@ fn weld_breakline_vertices(rings: &mut [Vec<glam::DVec3>], xy_tol: f64, z_tol: f
     welded
 }
 
-/// Diagnose why breakline edge `edge_index` of `rings[ring_index]` failed to
-/// insert as a CDT constraint. Scans every other edge across all rings for a
+type EndpointKey = (u64, u64, u64);
+
+fn endpoint_key(point: glam::DVec3) -> EndpointKey {
+    (point.x.to_bits(), point.y.to_bits(), point.z.to_bits())
+}
+
+/// Separate explicit/inferred boundary cycles from genuine open constraints.
+///
+/// Open source objects are edges in an endpoint graph. Repeatedly peeling
+/// degree-one nodes removes dangling constraint branches and leaves the graph's
+/// cycle core. A degree-two core has an unambiguous set of closed walks, which
+/// we concatenate regardless of source order or direction. More complicated
+/// junctions remain constraints because guessing a boundary through them would
+/// change the user's geometry semantics.
+fn assemble_triangulation_input(paths: Vec<BreaklinePath>) -> Result<TriangulationInput> {
+    let mut boundaries = Vec::new();
+    let mut open = Vec::new();
+    for path in paths {
+        if path.closed {
+            boundaries.push(path.points);
+        } else {
+            open.push(path.points);
+        }
+    }
+
+    if open.is_empty() {
+        if boundaries.is_empty() {
+            anyhow::bail!("Triangulation has no closed boundary");
+        }
+        return Ok(TriangulationInput {
+            boundaries,
+            constraints: Vec::new(),
+        });
+    }
+
+    let mut node_for_key: HashMap<EndpointKey, usize> = HashMap::new();
+    let mut edge_nodes = Vec::with_capacity(open.len());
+    for points in &open {
+        let endpoints = [points[0], points[points.len() - 1]];
+        let mut nodes = [0usize; 2];
+        for (slot, point) in nodes.iter_mut().zip(endpoints) {
+            let next = node_for_key.len();
+            *slot = *node_for_key.entry(endpoint_key(point)).or_insert(next);
+        }
+        edge_nodes.push(nodes);
+    }
+
+    let mut incident = vec![Vec::<usize>::new(); node_for_key.len()];
+    let mut degree = vec![0usize; node_for_key.len()];
+    for (edge, [a, b]) in edge_nodes.iter().copied().enumerate() {
+        incident[a].push(edge);
+        incident[b].push(edge);
+        degree[a] += 1;
+        degree[b] += 1;
+    }
+    let original_degree = degree.clone();
+
+    // Peel every bridge-like tail. What remains is the 2-core containing all
+    // possible endpoint cycles, including a boundary with an attached open
+    // breakline.
+    let mut active = vec![true; open.len()];
+    let mut queue: std::collections::VecDeque<usize> = degree
+        .iter()
+        .enumerate()
+        .filter_map(|(node, degree)| (*degree <= 1).then_some(node))
+        .collect();
+    while let Some(node) = queue.pop_front() {
+        if degree[node] > 1 {
+            continue;
+        }
+        for &edge in &incident[node] {
+            if !active[edge] {
+                continue;
+            }
+            active[edge] = false;
+            let [a, b] = edge_nodes[edge];
+            for endpoint in [a, b] {
+                degree[endpoint] = degree[endpoint].saturating_sub(1);
+                if degree[endpoint] == 1 {
+                    queue.push_back(endpoint);
+                }
+            }
+        }
+    }
+
+    let core_is_unambiguous = degree.iter().all(|degree| *degree == 0 || *degree == 2);
+    let mut used = vec![false; open.len()];
+    let mut assembled_count = 0usize;
+    if core_is_unambiguous {
+        for first_edge in 0..open.len() {
+            if !active[first_edge] || used[first_edge] {
+                continue;
+            }
+            let start_node = edge_nodes[first_edge][0];
+            let mut node = start_node;
+            let mut edge = first_edge;
+            let mut ring = Vec::new();
+
+            loop {
+                let [a, b] = edge_nodes[edge];
+                let forward = a == node;
+                let points = &open[edge];
+                if forward {
+                    ring.extend(points.iter().copied().skip((!ring.is_empty()) as usize));
+                    node = b;
+                } else {
+                    ring.extend(
+                        points
+                            .iter()
+                            .rev()
+                            .copied()
+                            .skip((!ring.is_empty()) as usize),
+                    );
+                    node = a;
+                }
+                used[edge] = true;
+
+                if node == start_node {
+                    break;
+                }
+                edge = incident[node]
+                    .iter()
+                    .copied()
+                    .find(|candidate| active[*candidate] && !used[*candidate])
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Open-string boundary cycle ended unexpectedly")
+                    })?;
+            }
+
+            // The walk repeats its first endpoint at the end; rings elsewhere
+            // in the triangulator store that closure implicitly.
+            if ring.last() == ring.first() {
+                ring.pop();
+            }
+            if ring.len() < 3 || signed_area_xy(&ring).abs() <= 1e-12 {
+                anyhow::bail!(
+                    "Open strings form a closed boundary, but that boundary is degenerate or collinear"
+                );
+            }
+            boundaries.push(ring);
+            assembled_count += 1;
+        }
+    }
+
+    // Peeled paths are genuine open constraints. If a cycle core contains a
+    // branching junction, retain the whole core as constraints rather than
+    // choosing one of several possible boundary walks.
+    let constraints: Vec<Vec<glam::DVec3>> = open
+        .into_iter()
+        .enumerate()
+        .filter_map(|(edge, points)| (!used[edge]).then_some(points))
+        .collect();
+
+    if boundaries.is_empty() {
+        let unmatched = original_degree
+            .iter()
+            .filter(|degree| **degree == 1)
+            .count();
+        let junctions = original_degree.iter().filter(|degree| **degree > 2).count();
+        anyhow::bail!(
+            "Selected open strings do not define an unambiguous closed boundary ({unmatched} unmatched endpoint(s), {junctions} branching junction(s))"
+        );
+    }
+    if assembled_count > 0 {
+        userspace_log!(
+            "Assembled {} closed boundary ring(s) from fragmented open strings",
+            assembled_count
+        );
+    }
+
+    Ok(TriangulationInput {
+        boundaries,
+        constraints,
+    })
+}
+
+/// Diagnose why an edge failed to insert as a CDT constraint. Scans every
+/// other edge across all closed and open breaklines for a
 /// direct geometric conflict (spade doesn't say which edge or why it
 /// conflicted) and describes the first one found: a crossing point (with
 /// each edge's interpolated Z, to show whether it's even representable by a
 /// single-valued terrain), a collinear overlap, or near-but-not-exactly
 /// coincident endpoints — the common case when two breaklines were meant to
 /// share a boundary but were digitized independently.
+type BreaklineRef<'a> = (&'a [glam::DVec3], bool);
+
+fn breakline_edge_count(path: BreaklineRef<'_>) -> usize {
+    if path.1 {
+        path.0.len()
+    } else {
+        path.0.len().saturating_sub(1)
+    }
+}
+
+fn breakline_edge(path: BreaklineRef<'_>, edge_index: usize) -> (glam::DVec3, glam::DVec3) {
+    let points = path.0;
+    (points[edge_index], points[(edge_index + 1) % points.len()])
+}
+
 fn diagnose_breakline_conflict(
-    rings: &[Vec<glam::DVec3>],
-    ring_index: usize,
+    paths: &[BreaklineRef<'_>],
+    path_index: usize,
     edge_index: usize,
 ) -> String {
-    let ring = &rings[ring_index];
-    let n = ring.len();
-    let a = ring[edge_index];
-    let b = ring[(edge_index + 1) % n];
-    for (other_ring_index, other_ring) in rings.iter().enumerate() {
-        let m = other_ring.len();
-        for other_edge_index in 0..m {
-            if other_ring_index == ring_index && other_edge_index == edge_index {
+    let (a, b) = breakline_edge(paths[path_index], edge_index);
+    for (other_path_index, other_path) in paths.iter().copied().enumerate() {
+        for other_edge_index in 0..breakline_edge_count(other_path) {
+            if other_path_index == path_index && other_edge_index == edge_index {
                 continue;
             }
-            let c = other_ring[other_edge_index];
-            let d = other_ring[(other_edge_index + 1) % m];
+            let (c, d) = breakline_edge(other_path, other_edge_index);
             // Edges that legitimately share an endpoint (adjacent edges
             // within a ring, or two rings meeting at a shared vertex) are
             // not conflicts — skip them so a real conflict elsewhere isn't
@@ -294,13 +515,13 @@ fn diagnose_breakline_conflict(
             }
             if let Some(detail) = describe_edge_conflict(a, b, c, d) {
                 return format!(
-                    "breakline {ring_index} edge {edge_index} ({a:.3}->{b:.3}) vs breakline {other_ring_index} edge {other_edge_index} ({c:.3}->{d:.3}): {detail}"
+                    "breakline {path_index} edge {edge_index} ({a:.3}->{b:.3}) vs breakline {other_path_index} edge {other_edge_index} ({c:.3}->{d:.3}): {detail}"
                 );
             }
         }
     }
     format!(
-        "breakline {ring_index} edge {edge_index} ({a:.3}->{b:.3}): no conflicting edge found by direct geometric scan (likely a near-degenerate numerical case)"
+        "breakline {path_index} edge {edge_index} ({a:.3}->{b:.3}): no conflicting edge found by direct geometric scan (likely a near-degenerate numerical case)"
     )
 }
 
@@ -431,26 +652,21 @@ fn conflicting_z_detail(
 }
 
 fn validate_breakline_edge_z(
-    rings: &[Vec<glam::DVec3>],
-    ring_index: usize,
+    paths: &[BreaklineRef<'_>],
+    path_index: usize,
     edge_index: usize,
 ) -> Result<()> {
-    let ring = &rings[ring_index];
-    let n = ring.len();
-    let a = ring[edge_index];
-    let b = ring[(edge_index + 1) % n];
+    let (a, b) = breakline_edge(paths[path_index], edge_index);
 
-    for (other_ring_index, other_ring) in rings.iter().enumerate() {
-        let m = other_ring.len();
-        for other_edge_index in 0..m {
-            if other_ring_index == ring_index && other_edge_index == edge_index {
+    for (other_path_index, other_path) in paths.iter().copied().enumerate() {
+        for other_edge_index in 0..breakline_edge_count(other_path) {
+            if other_path_index == path_index && other_edge_index == edge_index {
                 continue;
             }
-            let c = other_ring[other_edge_index];
-            let d = other_ring[(other_edge_index + 1) % m];
+            let (c, d) = breakline_edge(other_path, other_edge_index);
             if let Some(detail) = conflicting_z_detail(a, b, c, d) {
                 anyhow::bail!(
-                    "Selected breakline edges intersect in XY at conflicting elevations and cannot form a single-valued terrain surface (breakline {ring_index} edge {edge_index} ({a:.3}->{b:.3}) vs breakline {other_ring_index} edge {other_edge_index} ({c:.3}->{d:.3}): {detail})"
+                    "Selected breakline edges intersect in XY at conflicting elevations and cannot form a single-valued terrain surface (breakline {path_index} edge {edge_index} ({a:.3}->{b:.3}) vs breakline {other_path_index} edge {other_edge_index} ({c:.3}->{d:.3}): {detail})"
                 );
             }
         }
@@ -471,25 +687,34 @@ fn interpolate_z_on_edge(a: glam::DVec3, b: glam::DVec3, point: glam::DVec2) -> 
 }
 
 pub(super) fn cdt_surface_from_breaklines(
-    rings: &[Vec<glam::DVec3>],
+    boundaries: &[Vec<glam::DVec3>],
+    constraints: &[Vec<glam::DVec3>],
 ) -> Result<(Vec<tri00t::Vertex>, Vec<[u32; 3]>)> {
     use spade::{ConstrainedDelaunayTriangulation, Point2};
 
-    if rings.is_empty() {
-        anyhow::bail!("No breakline rings supplied");
+    if boundaries.is_empty() {
+        anyhow::bail!("No closed breakline boundary supplied");
     }
+
+    let paths: Vec<BreaklineRef<'_>> = boundaries
+        .iter()
+        .map(|points| (points.as_slice(), true))
+        .chain(constraints.iter().map(|points| (points.as_slice(), false)))
+        .collect();
 
     let mut cdt: ConstrainedDelaunayTriangulation<Point2<f64>> =
         ConstrainedDelaunayTriangulation::new();
     let mut handle_z: HashMap<usize, f64> = HashMap::new();
 
-    for (ring_index, ring) in rings.iter().enumerate() {
-        if ring.len() < 3 {
-            anyhow::bail!("A selected breakline has fewer than 3 vertices");
+    for (path_index, path) in paths.iter().copied().enumerate() {
+        let (points, closed) = path;
+        let minimum = if closed { 3 } else { 2 };
+        if points.len() < minimum {
+            anyhow::bail!("A selected breakline has too few vertices");
         }
 
-        let mut handles = Vec::with_capacity(ring.len());
-        for point in ring {
+        let mut handles = Vec::with_capacity(points.len());
+        for point in points {
             if !point.is_finite() {
                 anyhow::bail!("A selected breakline contains non-finite coordinates");
             }
@@ -516,16 +741,15 @@ pub(super) fn cdt_surface_from_breaklines(
             handles.push(handle);
         }
 
-        for i in 0..handles.len() {
+        for i in 0..breakline_edge_count(path) {
             let a = handles[i];
-            let b = handles[(i + 1) % handles.len()];
+            let b = handles[(i + 1) % points.len()];
             if a == b {
                 continue;
             }
-            validate_breakline_edge_z(rings, ring_index, i)?;
+            validate_breakline_edge_z(&paths, path_index, i)?;
 
-            let edge_start = ring[i];
-            let edge_end = ring[(i + 1) % ring.len()];
+            let (edge_start, edge_end) = breakline_edge(path, i);
             // A panic here is spade failing to split a near-degenerate
             // crossing (the intersection point snaps onto blocking geometry);
             // report it as the overlap it is rather than crashing.
@@ -536,7 +760,7 @@ pub(super) fn cdt_surface_from_breaklines(
             if constraint_edges.is_empty() {
                 anyhow::bail!(
                     "Selected breakline edges intersect or overlap in XY and cannot form a terrain surface ({})",
-                    diagnose_breakline_conflict(rings, ring_index, i)
+                    diagnose_breakline_conflict(&paths, path_index, i)
                 );
             }
             for edge in constraint_edges {
@@ -589,7 +813,7 @@ pub(super) fn cdt_surface_from_breaklines(
             (positions[0].x + positions[1].x + positions[2].x) / 3.0,
             (positions[0].y + positions[1].y + positions[2].y) / 3.0,
         );
-        if !rings
+        if !boundaries
             .iter()
             .any(|ring| crate::model::geometry::point_in_polygon_xy(centroid, ring))
         {
@@ -622,10 +846,11 @@ pub(super) fn cdt_surface_from_breaklines(
 /// For a stockpile, the terrain is the upper shell and the closure cap lies
 /// below it. Nested rings remain terrain breaklines, not internal walls.
 pub(super) fn closed_solid_from_breaklines(
-    rings: &[Vec<glam::DVec3>],
+    boundaries: &[Vec<glam::DVec3>],
+    constraints: &[Vec<glam::DVec3>],
 ) -> Result<(Vec<tri00t::Vertex>, Vec<[u32; 3]>)> {
-    let (vertices, mut faces) = cdt_surface_from_breaklines(rings)?;
-    let roots = outer_breakline_indices(rings);
+    let (vertices, mut faces) = cdt_surface_from_breaklines(boundaries, constraints)?;
+    let roots = outer_breakline_indices(boundaries);
     let surface_indices: HashMap<(u64, u64, u64), u32> = vertices
         .iter()
         .enumerate()
@@ -638,12 +863,20 @@ pub(super) fn closed_solid_from_breaklines(
         .collect();
 
     for root_index in roots {
-        let ring = &rings[root_index];
-        let group_rings: Vec<&Vec<glam::DVec3>> = rings
+        let ring = &boundaries[root_index];
+        let group_rings: Vec<&Vec<glam::DVec3>> = boundaries
             .iter()
             .filter(|candidate| {
                 std::ptr::eq(*candidate, ring)
                     || crate::model::geometry::point_in_polygon_xy(candidate[0].truncate(), ring)
+            })
+            .collect();
+        let group_constraints: Vec<&Vec<glam::DVec3>> = constraints
+            .iter()
+            .filter(|candidate| {
+                candidate.iter().any(|point| {
+                    crate::model::geometry::point_in_polygon_xy(point.truncate(), ring)
+                })
             })
             .collect();
         let closure_z = ring.iter().map(|point| point.z).sum::<f64>() / ring.len() as f64;
@@ -662,11 +895,21 @@ pub(super) fn closed_solid_from_breaklines(
         let group_min_z = group_rings
             .iter()
             .flat_map(|group_ring| group_ring.iter())
+            .chain(
+                group_constraints
+                    .iter()
+                    .flat_map(|constraint| constraint.iter()),
+            )
             .map(|point| point.z)
             .fold(f64::INFINITY, f64::min);
         let group_max_z = group_rings
             .iter()
             .flat_map(|group_ring| group_ring.iter())
+            .chain(
+                group_constraints
+                    .iter()
+                    .flat_map(|constraint| constraint.iter()),
+            )
             .map(|point| point.z)
             .fold(f64::NEG_INFINITY, f64::max);
         let extends_below = group_min_z < closure_z - 1e-8;
@@ -763,6 +1006,7 @@ pub(super) fn cdt_fill_ring(
     if ring.len() < 3 {
         anyhow::bail!("A selected polygon has fewer than 3 vertices");
     }
+    validate_single_ring_crossing_z(ring)?;
 
     let mut cdt: ConstrainedDelaunayTriangulation<Point2<f64>> =
         ConstrainedDelaunayTriangulation::new();
@@ -798,9 +1042,9 @@ pub(super) fn cdt_fill_ring(
         if ha == hb {
             continue;
         }
-        // Self-intersecting edges are split at their crossing points rather
-        // than rejected; split vertices take their Z from the edge being
-        // inserted.
+        // Self-intersecting edges are split at their crossing points. Every
+        // edge that reaches a split must agree on its interpolated elevation;
+        // otherwise the ring cannot represent a single-valued surface.
         let constraint_edges = crate::logging::catch_panic_quietly(|| {
             cdt.add_constraint_and_split(ha, hb, |point| point)
         })
@@ -813,14 +1057,25 @@ pub(super) fn cdt_fill_ring(
             let edge = cdt.directed_edge(edge);
             for vertex in [edge.from(), edge.to()] {
                 let index = vertex.fix().index();
-                handle_z.entry(index).or_insert_with(|| {
-                    let position = vertex.position();
-                    interpolate_z_on_edge(
-                        ring[i],
-                        ring[j],
-                        glam::DVec2::new(position.x, position.y),
-                    )
-                });
+                let position = vertex.position();
+                let edge_z = interpolate_z_on_edge(
+                    ring[i],
+                    ring[j],
+                    glam::DVec2::new(position.x, position.y),
+                );
+                match handle_z.entry(index) {
+                    std::collections::hash_map::Entry::Occupied(existing) => {
+                        if (*existing.get() - edge_z).abs() > crate::model::kernel::Z_TOL {
+                            anyhow::bail!(
+                                "Selected polygon edges cross in XY at conflicting elevations ({:.3} and {edge_z:.3})",
+                                existing.get()
+                            );
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(vacant) => {
+                        vacant.insert(edge_z);
+                    }
+                }
             }
         }
     }
@@ -870,4 +1125,21 @@ pub(super) fn cdt_fill_ring(
         anyhow::bail!("Failed to triangulate polygon (may be degenerate or collinear)");
     }
     Ok((verts, faces))
+}
+
+fn validate_single_ring_crossing_z(ring: &[glam::DVec3]) -> Result<()> {
+    for edge_index in 0..ring.len() {
+        let a = ring[edge_index];
+        let b = ring[(edge_index + 1) % ring.len()];
+        for other_edge_index in edge_index + 1..ring.len() {
+            let c = ring[other_edge_index];
+            let d = ring[(other_edge_index + 1) % ring.len()];
+            if let Some(detail) = conflicting_z_detail(a, b, c, d) {
+                anyhow::bail!(
+                    "Selected polygon edges cross in XY at conflicting elevations (edge {edge_index} vs edge {other_edge_index}: {detail})"
+                );
+            }
+        }
+    }
+    Ok(())
 }

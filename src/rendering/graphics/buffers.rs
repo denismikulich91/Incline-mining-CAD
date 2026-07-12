@@ -29,8 +29,11 @@ impl<'a> Graphics<'a> {
         }
         // Power-of-two growth must not overshoot the device's per-buffer
         // limit; callers clamp their CPU-side data to the same limit first.
-        let max_items = (device.limits().max_buffer_size as usize / item_size).max(1);
-        let new_capacity = required_items.next_power_of_two().clamp(1, max_items);
+        let max_buffer_size =
+            usize::try_from(device.limits().max_buffer_size).unwrap_or(usize::MAX);
+        let max_items = (max_buffer_size / item_size).max(1);
+        let new_capacity = checked_growth_capacity(required_items, max_items)
+            .expect("scene stream was not clamped to the device buffer limit");
         *buffer = Self::create_stream_buffer(device, label, new_capacity * item_size, usage);
         *capacity_items = new_capacity;
     }
@@ -46,29 +49,23 @@ impl<'a> Graphics<'a> {
         label: &'static str,
     ) {
         let max_buffer_size = device.limits().max_buffer_size;
-        let max_vertices = (max_buffer_size as usize) / std::mem::size_of::<V>();
-        let max_indices = (max_buffer_size as usize) / std::mem::size_of::<u32>() / 3 * 3;
+        let max_buffer_size_usize = usize::try_from(max_buffer_size).unwrap_or(usize::MAX);
+        let max_vertices = max_buffer_size_usize / std::mem::size_of::<V>();
+        let max_indices = max_buffer_size_usize / std::mem::size_of::<u32>() / 3 * 3;
         if vertices.len() <= max_vertices && indices.len() <= max_indices {
             return;
         }
         crate::userspace_error!(
-            "{label}: tessellated geometry ({} vertices, {} indices) exceeds the GPU's {} MiB per-buffer limit; truncating — some geometry will not be displayed",
+            "{label}: tessellated geometry ({} vertices, {} indices) exceeds the GPU's {} MiB per-buffer limit; truncating - some geometry will not be displayed",
             vertices.len(),
             indices.len(),
             max_buffer_size / (1024 * 1024)
         );
         vertices.truncate(max_vertices);
-        // Primitives index vertices pushed by the same tessellation call, so
-        // referenced indices are nondecreasing across triangles: scanning back
-        // to the last fully in-range triangle yields a valid prefix.
-        let mut cut = indices.len().min(max_indices);
-        while cut >= 3
-            && indices[cut - 3..cut]
-                .iter()
-                .any(|&i| (i as usize) >= max_vertices)
-        {
-            cut -= 3;
-        }
+        // Retain only the prefix before the *first* invalid triangle. Index
+        // maxima are not guaranteed to be monotonic: a later in-range
+        // primitive must never hide an earlier out-of-range one.
+        let cut = valid_triangle_prefix_len(indices, max_indices, max_vertices);
         indices.truncate(cut);
     }
 
@@ -150,4 +147,32 @@ impl<'a> Graphics<'a> {
             );
         }
     }
+}
+
+/// Capacity growth that cannot overflow and never exceeds a hard item limit.
+fn checked_growth_capacity(required: usize, maximum: usize) -> Option<usize> {
+    if required > maximum || maximum == 0 {
+        return None;
+    }
+    Some(
+        required
+            .checked_next_power_of_two()
+            .unwrap_or(maximum)
+            .min(maximum)
+            .max(1),
+    )
+}
+
+/// Number of indices in the largest complete-triangle prefix that both fits
+/// the index buffer and references only retained vertices.
+fn valid_triangle_prefix_len(indices: &[u32], max_indices: usize, max_vertices: usize) -> usize {
+    let capped = indices.len().min(max_indices) / 3 * 3;
+    indices[..capped]
+        .chunks_exact(3)
+        .position(|triangle| {
+            triangle
+                .iter()
+                .any(|&index| (index as usize) >= max_vertices)
+        })
+        .map_or(capped, |triangle| triangle * 3)
 }

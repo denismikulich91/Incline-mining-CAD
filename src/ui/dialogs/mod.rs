@@ -16,3 +16,9 @@ pub(crate) struct SetSelectionZDialog {
     pub(crate) object_ids: Vec<ObjectId>,
     pub(crate) z_input: f64,
 }
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct InsertPointAtElevationDialog {
+    pub(crate) object_ids: Vec<ObjectId>,
+    pub(crate) elevation: f64,
+}

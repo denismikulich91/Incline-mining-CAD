@@ -1,10 +1,9 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fs,
     io::{Cursor, Write},
     path::{Path, PathBuf},
-    time::SystemTime,
 };
 
 use anyhow::{Context, Result, bail};
@@ -19,14 +18,14 @@ use dxf::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    model::{Document, FillStyle, Layer, LayerId, Object, ObjectColor, ObjectId, PolyVertex},
+    model::{Document, FillStyle, LayerId, Object, ObjectColor, PolyVertex},
     rendering::color::{COLOR_TABLE, linear_to_srgb_byte},
     userspace_log,
 };
 
 pub(crate) const PIDB_FORMAT_VERSION: u32 = 2;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PidbMetadata {
     pub(crate) name: String,
 }
@@ -40,298 +39,103 @@ pub(crate) struct PidbFile {
 
 #[derive(Clone, Debug)]
 pub(crate) struct OpenProject {
-    /// Stable identity for this open instance. Unlike its vector index, this
-    /// does not change when another project is closed or projects are sorted.
+    /// Stable identity for this open instance and the runtime namespace used
+    /// by all of its layer/object ids. Namespace zero is reserved for disk.
     pub(crate) runtime_id: u32,
     pub(crate) path: Option<PathBuf>,
     pub(crate) pidb: PidbFile,
     /// Layers currently present in the shared scene. The PIDB remains the
     /// source of truth even while a layer is unloaded.
     pub(crate) loaded_layers: HashSet<LayerId>,
-    dirty_layers_cache: RefCell<Option<DirtyLayersCache>>,
-    /// Parsed-and-serialized snapshot of the on-disk file, keyed by its
-    /// modification time. The disk contents only change when we save, so this
-    /// spares `dirty_layers()` from re-reading and re-serializing the file on
-    /// every in-memory edit (it runs per render frame).
-    disk_snapshot_cache: RefCell<Option<DiskSnapshot>>,
-    /// Serialized view of the in-memory document, updated incrementally via
-    /// per-object revisions so a revision bump (e.g. every frame of a vertex
-    /// drag) only re-serializes the objects that edit actually touched.
-    memory_snapshot_cache: RefCell<MemorySnapshot>,
+    /// Namespace-invariant content fingerprint of the complete PIDB at its
+    /// last successful load/save. `None` means the project has never been
+    /// saved. Replaces whole-document JSON snapshots: an interactive drag
+    /// used to re-clone and re-serialize the full project per pointer event.
+    saved_content_hash: Option<u64>,
+    /// Per-object hash cache backing [`Document::content_hash`].
+    content_hash_cache: RefCell<HashMap<crate::model::ObjectId, (u64, u64)>>,
+    dirty_cache: RefCell<Option<PidbDirtyCache>>,
 }
 
-/// Cached `dirty_layers()` result, valid for one (document revision, on-disk
-/// mtime) pair.
+/// Cached whole-PIDB dirty result. Document mutations bump `revision`; the
+/// other serialized PIDB fields are included directly in the cache key.
 #[derive(Clone, Debug)]
-struct DirtyLayersCache {
+struct PidbDirtyCache {
     revision: u64,
-    mtime: Option<SystemTime>,
-    layers: HashSet<LayerId>,
-}
-
-/// Normalized (namespace-0, parsed-then-serialized) view of an on-disk PIDB,
-/// grouped by local layer id, used to diff against in-memory state.
-#[derive(Clone, Debug)]
-struct DiskSnapshot {
-    mtime: Option<std::time::SystemTime>,
-    layers: HashMap<LayerId, String>,
-    objects: HashMap<LayerId, BTreeMap<u64, String>>,
-}
-
-/// Namespace-0 serialization of the in-memory document, mirroring
-/// `DiskSnapshot`'s shape. Kept in sync incrementally: only objects whose
-/// per-object revision moved since the last sync are re-serialized, so
-/// interactive edits on large documents don't pay a full-document clone and
-/// JSON pass per frame.
-#[derive(Clone, Debug, Default)]
-struct MemorySnapshot {
-    /// Per runtime object id: the revision its cached JSON reflects and the
-    /// local-layer bucket it was filed under (to relocate on layer moves).
-    object_state: HashMap<ObjectId, (u64, LayerId)>,
-    layers: HashMap<LayerId, String>,
-    objects: HashMap<LayerId, BTreeMap<u64, String>>,
-}
-
-impl MemorySnapshot {
-    fn sync(&mut self, document: &Document) {
-        const LOCAL_MASK: u64 = u32::MAX as u64;
-
-        // Layers are few — reserialize them all at their local ids.
-        self.layers = document
-            .layers()
-            .iter()
-            .map(|layer| {
-                let local_id = LayerId(layer.id.0 & LOCAL_MASK);
-                let mut portable = layer.clone();
-                portable.id = local_id;
-                (
-                    local_id,
-                    serde_json::to_string(&portable).unwrap_or_default(),
-                )
-            })
-            .collect();
-
-        let mut seen = HashSet::with_capacity(document.objects().len());
-        for object in document.objects() {
-            let id = object.id();
-            seen.insert(id);
-            let revision = document.object_revision(id);
-            let local_layer = LayerId(object.layer().0 & LOCAL_MASK);
-            if let Some(&(cached_revision, cached_layer)) = self.object_state.get(&id) {
-                if cached_revision == revision && cached_layer == local_layer {
-                    continue;
-                }
-                if cached_layer != local_layer
-                    && let Some(bucket) = self.objects.get_mut(&cached_layer)
-                {
-                    bucket.remove(&(id.0 & LOCAL_MASK));
-                }
-            }
-            let local_id = ObjectId(id.0 & LOCAL_MASK);
-            let portable = object.with_id_and_layer(local_id, local_layer);
-            self.objects.entry(local_layer).or_default().insert(
-                local_id.0,
-                serde_json::to_string(&portable).unwrap_or_default(),
-            );
-            self.object_state.insert(id, (revision, local_layer));
-        }
-
-        // Drop entries for objects deleted since the last sync.
-        if self.object_state.len() != seen.len() {
-            let stale: Vec<ObjectId> = self
-                .object_state
-                .keys()
-                .filter(|id| !seen.contains(*id))
-                .copied()
-                .collect();
-            for id in stale {
-                if let Some((_, layer)) = self.object_state.remove(&id)
-                    && let Some(bucket) = self.objects.get_mut(&layer)
-                {
-                    bucket.remove(&(id.0 & LOCAL_MASK));
-                    if bucket.is_empty() {
-                        self.objects.remove(&layer);
-                    }
-                }
-            }
-        }
-    }
+    format_version: u32,
+    metadata: PidbMetadata,
+    dirty: bool,
 }
 
 impl OpenProject {
-    pub(crate) fn dirty_layers(&self) -> HashSet<LayerId> {
-        let revision = self.pidb.document.revision();
-        // The disk mtime is part of the cache key: an external rewrite of the
-        // file must invalidate the result even though the in-memory revision
-        // is untouched.
-        let mtime = self
-            .path
-            .as_ref()
-            .and_then(|path| fs::metadata(path).and_then(|m| m.modified()).ok());
-        if let Some(cache) = self.dirty_layers_cache.borrow().as_ref()
-            && cache.revision == revision
-            && cache.mtime == mtime
-        {
-            return cache.layers.clone();
-        }
-        let layers = match self.path.as_ref() {
-            Some(path) => self.dirty_layers_against_disk(path, mtime),
-            None => self
-                .pidb
-                .document
-                .layers()
-                .iter()
-                .map(|layer| layer.id)
-                .collect(),
+    pub(crate) fn has_unsaved_changes(&self) -> bool {
+        let Some(saved_content_hash) = self.saved_content_hash else {
+            return true;
         };
-        *self.dirty_layers_cache.borrow_mut() = Some(DirtyLayersCache {
+        let revision = self.pidb.document.revision();
+        if let Some(cache) = self.dirty_cache.borrow().as_ref()
+            && cache.revision == revision
+            && cache.format_version == self.pidb.format_version
+            && cache.metadata == self.pidb.metadata
+        {
+            return cache.dirty;
+        }
+
+        let dirty = self.content_hash() != saved_content_hash;
+        *self.dirty_cache.borrow_mut() = Some(PidbDirtyCache {
             revision,
-            mtime,
-            layers: layers.clone(),
+            format_version: self.pidb.format_version,
+            metadata: self.pidb.metadata.clone(),
+            dirty,
         });
-        layers
+        dirty
     }
 
-    /// Diff the in-memory document against the on-disk file, reusing a cached
-    /// disk snapshot (refreshed only when the file's mtime changes) so an
-    /// in-memory edit doesn't re-read or re-parse the file.
-    fn dirty_layers_against_disk(
-        &self,
-        path: &Path,
-        mtime: Option<SystemTime>,
-    ) -> HashSet<LayerId> {
-        let snapshot_matches = self
-            .disk_snapshot_cache
-            .borrow()
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.mtime == mtime);
-        if !snapshot_matches {
-            match DiskSnapshot::load(path, mtime) {
-                Some(snapshot) => *self.disk_snapshot_cache.borrow_mut() = Some(snapshot),
-                // File missing/unreadable: every layer is unsaved.
-                None => {
-                    return self
-                        .pidb
-                        .document
-                        .layers()
-                        .iter()
-                        .map(|layer| layer.id)
-                        .collect();
-                }
-            }
-        }
-        let cache = self.disk_snapshot_cache.borrow();
-        let disk = cache.as_ref().expect("snapshot populated above");
-
-        // Bring the incrementally maintained namespace-0 memory snapshot up to
-        // date; only objects touched since the last sync are re-serialized.
-        let mut memory_cache = self.memory_snapshot_cache.borrow_mut();
-        memory_cache.sync(&self.pidb.document);
-        let memory = &*memory_cache;
-        let empty_objects = BTreeMap::new();
-
+    /// Fingerprint of everything the PIDB file serializes, computed from the
+    /// runtime document with cached per-object hashes — only objects touched
+    /// since the previous call re-hash.
+    fn content_hash(&self) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        self.pidb.format_version.hash(&mut hasher);
+        self.pidb.metadata.name.hash(&mut hasher);
         self.pidb
             .document
-            .layers()
-            .iter()
-            .filter_map(|runtime_layer| {
-                let local_id = LayerId(runtime_layer.id.0 & u64::from(u32::MAX));
-                let memory_layer = memory.layers.get(&local_id);
-                let disk_layer = disk.layers.get(&local_id);
-                let memory_objects = memory.objects.get(&local_id).unwrap_or(&empty_objects);
-                let disk_objects = disk.objects.get(&local_id).unwrap_or(&empty_objects);
-                layer_differs(
-                    memory_layer.map(String::as_str),
-                    disk_layer.map(String::as_str),
-                    memory_objects,
-                    disk_objects,
-                )
-                .then_some(runtime_layer.id)
-            })
-            .collect()
+            .content_hash(&mut self.content_hash_cache.borrow_mut())
+            .hash(&mut hasher);
+        hasher.finish()
     }
 
-    pub(crate) fn invalidate_dirty_layers(&self) {
-        *self.dirty_layers_cache.borrow_mut() = None;
+    pub(crate) fn current_content_hash(&self) -> u64 {
+        self.content_hash()
     }
 
-    pub(crate) fn invalidate_disk_snapshot(&self) {
-        self.invalidate_dirty_layers();
-        *self.disk_snapshot_cache.borrow_mut() = None;
+    /// Record the exact snapshot written by an asynchronous saver. If edits
+    /// happened while it was writing, `has_unsaved_changes` compares the live
+    /// content with this hash and correctly remains dirty.
+    pub(crate) fn mark_snapshot_saved(&mut self, snapshot_hash: u64) {
+        self.saved_content_hash = Some(snapshot_hash);
+        self.dirty_cache = RefCell::new(None);
     }
 
-    pub(crate) fn has_unsaved_changes(&self) -> bool {
-        !self.dirty_layers().is_empty()
+    pub(crate) fn mark_saved(&mut self) {
+        self.saved_content_hash = Some(self.content_hash());
+        self.dirty_cache = RefCell::new(None);
     }
 }
 
-impl DiskSnapshot {
-    fn load(path: &Path, mtime: Option<std::time::SystemTime>) -> Option<Self> {
-        let disk = load(path).ok()?;
-        let objects = objects_by_layer(disk.document.objects());
-        let layers = disk
-            .document
-            .layers()
-            .iter()
-            .map(|layer| {
-                let local_id = LayerId(layer.id.0 & u64::from(u32::MAX));
-                (local_id, serde_json::to_string(layer).unwrap_or_default())
-            })
-            .collect();
-        Some(DiskSnapshot {
-            mtime,
-            layers,
-            objects,
-        })
-    }
-}
-
-/// Re-serialize a JSON string after parsing it into `T`, so its float fields
-/// take the same bit patterns the disk side got when it was parsed from the
-/// file. serde_json's float parser can land a value 1 ULP off its serialized
-/// form, and object/layer floats are `f32`, so a value serialized straight from
-/// memory can differ textually from the round-tripped disk copy even when
-/// nothing was edited.
-fn normalized_json<T: Serialize + serde::de::DeserializeOwned>(json: &str) -> String {
-    serde_json::from_str::<T>(json)
-        .ok()
-        .and_then(|value| serde_json::to_string(&value).ok())
-        .unwrap_or_else(|| json.to_owned())
-}
-
-/// True if a layer's in-memory state diverges from disk. Both sides are
-/// serialized JSON. A direct string compare is tried first (unchanged layers —
-/// the common case every frame — cost one serialization pass); only on a
-/// mismatch are the memory strings normalised through the same typed parse the
-/// disk side went through, so a 1-ULP float-parser artefact isn't mistaken for
-/// an edit.
-fn layer_differs(
-    memory_layer: Option<&str>,
-    disk_layer: Option<&str>,
-    memory_objects: &BTreeMap<u64, String>,
-    disk_objects: &BTreeMap<u64, String>,
-) -> bool {
-    if memory_layer == disk_layer && memory_objects == disk_objects {
-        return false;
-    }
-    let layer_matches =
-        memory_layer.map(normalized_json::<Layer>) == disk_layer.map(normalized_json::<Layer>);
-    if !layer_matches {
-        return true;
-    }
-    if memory_objects.len() != disk_objects.len() {
-        return true;
-    }
-    memory_objects.iter().any(|(id, memory_json)| {
-        disk_objects.get(id).is_none_or(|disk_json| {
-            normalized_json::<Object>(memory_json) != normalized_json::<Object>(disk_json)
-        })
-    })
+fn portable_pidb(pidb: &PidbFile) -> PidbFile {
+    let mut portable = pidb.clone();
+    portable.document.apply_runtime_namespace(0);
+    portable
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct Workspace {
+    /// Every PIDB currently open and parsed in memory.
     pub(crate) projects: Vec<OpenProject>,
+    /// The project receiving editing commands. Other projects remain open and
+    /// may contribute loaded layers to the shared scene.
     pub(crate) active_index: Option<usize>,
     next_runtime_namespace: u32,
 }
@@ -348,11 +152,12 @@ impl Default for Workspace {
 
 impl Workspace {
     pub(crate) fn active_project(&self) -> Option<&OpenProject> {
-        self.active_index.and_then(|i| self.projects.get(i))
+        self.active_index.and_then(|index| self.projects.get(index))
     }
 
     pub(crate) fn active_project_mut(&mut self) -> Option<&mut OpenProject> {
-        self.active_index.and_then(|i| self.projects.get_mut(i))
+        self.active_index
+            .and_then(|index| self.projects.get_mut(index))
     }
 
     pub(crate) fn active_document(&self) -> Option<&Document> {
@@ -364,61 +169,20 @@ impl Workspace {
     }
 
     pub(crate) fn has_active_project(&self) -> bool {
-        self.active_index.is_some_and(|i| i < self.projects.len())
+        self.active_index
+            .is_some_and(|index| index < self.projects.len())
     }
 
-    /// Add a project and make it active. If a project with the same path is
-    /// already open, just switch to it instead of adding a duplicate.
-    pub(crate) fn add_and_activate(&mut self, mut project: OpenProject) -> usize {
-        if let Some(path) = &project.path
-            && let Some(i) = self
-                .projects
-                .iter()
-                .position(|p| p.path.as_deref() == Some(path.as_path()))
-        {
-            self.active_index = Some(i);
-            return i;
-        }
-        self.prepare_project(&mut project);
-        self.projects.push(project);
-        let idx = self.projects.len() - 1;
-        self.active_index = Some(idx);
-        idx
-    }
-
-    /// Add a project without changing the active project.
-    pub(crate) fn add_inactive(&mut self, mut project: OpenProject) -> usize {
-        if let Some(path) = &project.path
-            && let Some(index) = self
-                .projects
-                .iter()
-                .position(|candidate| candidate.path.as_deref() == Some(path.as_path()))
-        {
-            return index;
-        }
-        self.prepare_project(&mut project);
-        self.projects.push(project);
-        self.projects.len() - 1
-    }
-
-    fn prepare_project(&mut self, project: &mut OpenProject) {
-        let namespace = self.next_runtime_namespace;
-        self.next_runtime_namespace = self.next_runtime_namespace.saturating_add(1);
-        project.runtime_id = namespace;
-        project.pidb.document.apply_runtime_namespace(namespace);
-        project.loaded_layers.clear();
+    pub(crate) fn project_index_for_path(&self, path: &Path) -> Option<usize> {
+        self.projects
+            .iter()
+            .position(|project| project.path.as_deref() == Some(path))
     }
 
     pub(crate) fn project_index_for_runtime_id(&self, runtime_id: u32) -> Option<usize> {
         self.projects
             .iter()
             .position(|project| project.runtime_id == runtime_id)
-    }
-
-    pub(crate) fn project_index_for_loaded_layer(&self, layer_id: LayerId) -> Option<usize> {
-        self.projects
-            .iter()
-            .position(|project| project.loaded_layers.contains(&layer_id))
     }
 
     pub(crate) fn project_index_for_object(
@@ -430,10 +194,51 @@ impl Workspace {
             .position(|project| project.pidb.document.get_object(object_id).is_some())
     }
 
-    /// Fingerprint of everything `scene_document()` reads: per project, its
-    /// namespace, document revision (bumped by every document mutation) and
-    /// loaded-layer set. Equal keys guarantee an identical composite, letting
-    /// callers skip the rebuild.
+    pub(crate) fn project_index_for_layer(&self, layer_id: LayerId) -> Option<usize> {
+        self.projects
+            .iter()
+            .position(|project| project.pidb.document.layer(layer_id).is_some())
+    }
+
+    /// Add a project without changing the editing target. Existing paths are
+    /// deduplicated and return the already-open index.
+    pub(crate) fn add_inactive(&mut self, mut project: OpenProject) -> usize {
+        if let Some(path) = project.path.as_deref()
+            && let Some(index) = self.project_index_for_path(path)
+        {
+            return index;
+        }
+        self.prepare_project(&mut project);
+        self.projects.push(project);
+        self.projects.len() - 1
+    }
+
+    /// Add a project and make it the editing target. Existing paths are
+    /// activated rather than opened twice.
+    pub(crate) fn add_and_activate(&mut self, project: OpenProject) -> usize {
+        let index = self.add_inactive(project);
+        self.active_index = Some(index);
+        index
+    }
+
+    fn prepare_project(&mut self, project: &mut OpenProject) {
+        let namespace = self.next_runtime_namespace;
+        self.next_runtime_namespace = self.next_runtime_namespace.saturating_add(1);
+        project.runtime_id = namespace;
+        project.pidb.document.apply_runtime_namespace(namespace);
+        project.loaded_layers.clear();
+    }
+
+    pub(crate) fn set_active_index(&mut self, index: usize) {
+        if index < self.projects.len() {
+            self.active_index = Some(index);
+        }
+    }
+
+    /// Fingerprint of everything `scene_document()` reads: the active
+    /// document's revision (bumped by every document mutation) and loaded-layer
+    /// set. Equal keys guarantee an identical composite, letting callers skip
+    /// the rebuild.
     pub(crate) fn composite_key(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -452,31 +257,38 @@ impl Workspace {
     }
 
     /// Build the composite document rendered and queried by the viewport.
+    ///
+    /// One pass per project's objects (bucketed by loaded layer) instead of
+    /// rescanning every object once per loaded layer, and one index rebuild
+    /// at the end instead of per-insert map maintenance. Draw order matches
+    /// the incremental path: per project, loaded layers in layer order, each
+    /// layer's objects in document order.
     pub(crate) fn scene_document(&self) -> Document {
         let mut scene = Document::new();
         for project in &self.projects {
-            for layer in project.pidb.document.layers() {
+            let document = &project.pidb.document;
+            let mut per_layer: HashMap<LayerId, Vec<usize>> = HashMap::new();
+            for (index, object) in document.objects().iter().enumerate() {
+                if project.loaded_layers.contains(&object.layer()) {
+                    per_layer.entry(object.layer()).or_default().push(index);
+                }
+            }
+            for layer in document.layers() {
                 if !project.loaded_layers.contains(&layer.id) {
                     continue;
                 }
-                scene.append_layer_snapshot(
+                let indices = per_layer.remove(&layer.id).unwrap_or_default();
+                scene.append_layer_snapshot_unindexed(
                     layer,
-                    project
-                        .pidb
-                        .document
-                        .objects()
-                        .iter()
-                        .filter(|object| object.layer() == layer.id),
+                    indices.iter().map(|&index| {
+                        let object = &document.objects()[index];
+                        (object, document.object_revision(object.id()))
+                    }),
                 );
             }
         }
+        scene.rebuild_object_index();
         scene
-    }
-
-    pub(crate) fn set_active_index(&mut self, index: usize) {
-        if index < self.projects.len() {
-            self.active_index = Some(index);
-        }
     }
 }
 
@@ -504,86 +316,15 @@ pub(crate) fn load(path: impl AsRef<Path>) -> Result<PidbFile> {
     Ok(pidb)
 }
 
-fn objects_by_layer(
-    objects: &[crate::model::Object],
-) -> HashMap<LayerId, std::collections::BTreeMap<u64, String>> {
-    let mut map: HashMap<LayerId, std::collections::BTreeMap<u64, String>> = HashMap::new();
-    for object in objects {
-        map.entry(object.layer()).or_default().insert(
-            object.id().0,
-            serde_json::to_string(object).unwrap_or_default(),
-        );
-    }
-    map
-}
-
-/// Save one layer into an existing PIDB without overwriting unsaved changes on
-/// other in-memory layers.
-pub(crate) fn save_layer(path: impl AsRef<Path>, pidb: &PidbFile, layer_id: LayerId) -> Result<()> {
-    let path = path.as_ref();
-    // Older/newly-created projects may already have a selected save path even
-    // though no file has been written yet. Establish the database with the
-    // complete in-memory document before attempting an incremental layer save.
-    if !path.exists() {
-        return save(path, pidb);
-    }
-    let mut portable = pidb.clone();
-    portable.document.apply_runtime_namespace_for_io(0);
-    let local_layer_id = LayerId(layer_id.0 & u64::from(u32::MAX));
-    let layer = portable
-        .document
-        .layer(local_layer_id)
-        .cloned()
-        .context("The selected layer no longer exists")?;
-    let objects: Vec<Object> = portable
-        .document
-        .objects()
-        .iter()
-        .filter(|object| object.layer() == local_layer_id)
-        .cloned()
-        .collect();
-
-    // "Incremental" only in what it preserves: the whole file is re-parsed
-    // and re-serialized, so this save is O(file size).
-    let mut disk = load(path)?;
-    let old_object_ids: Vec<_> = disk
-        .document
-        .objects()
-        .iter()
-        .filter(|object| object.layer() == local_layer_id)
-        .map(Object::id)
-        .collect();
-    for object_id in old_object_ids {
-        disk.document.remove_object(object_id);
-    }
-    // Replace the layer in place so saving does not move it to the end of the
-    // on-disk layer list.
-    disk.document.upsert_layer(&layer);
-    for object in &objects {
-        disk.document.insert_object(object.clone());
-    }
-    save(path, &disk)
-}
-
 pub(crate) fn save(path: impl AsRef<Path>, pidb: &PidbFile) -> Result<()> {
     let path = path.as_ref();
-    // Runtime ids carry a per-open-project namespace so several PIDBs can
-    // share one scene. Keep the on-disk format project-local and stable.
-    let mut portable = pidb.clone();
-    portable.document.apply_runtime_namespace(0);
+    let portable = portable_pidb(pidb);
     let json = serde_json::to_string_pretty(&portable)?;
-    // Write-then-rename so a crash or full disk mid-write cannot destroy the
-    // previous copy of the project.
-    let tmp_path = path.with_extension("pidb.tmp");
-    {
-        let mut file = fs::File::create(&tmp_path)
-            .with_context(|| format!("create {}", tmp_path.display()))?;
+    crate::model::atomic_file::write_atomic(path, |file| {
         file.write_all(json.as_bytes())
-            .with_context(|| format!("write {}", tmp_path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("sync {}", tmp_path.display()))?;
-    }
-    fs::rename(&tmp_path, path).with_context(|| format!("write {}", path.display()))
+            .with_context(|| format!("write {}", path.display()))?;
+        Ok(())
+    })
 }
 
 pub(crate) fn validate(pidb: &mut PidbFile) -> Result<()> {
@@ -594,23 +335,33 @@ pub(crate) fn validate(pidb: &mut PidbFile) -> Result<()> {
             PIDB_FORMAT_VERSION
         );
     }
+    let repaired = pidb.document.repair_degenerate_closed_polylines();
+    if repaired > 0 {
+        userspace_log!("Reopened {repaired} degenerate two-vertex polygon(s) while loading");
+    }
+    // Enforce model invariants before runtime namespacing: duplicate or
+    // out-of-range ids would otherwise silently alias distinct records once
+    // ids are masked into the 32-bit local namespace.
+    pidb.document.validate().context("invalid PIDB document")?;
+    // Serialized counters are advisory only; derive them from the actual ids.
+    pidb.document.recompute_id_counters();
     pidb.document.rebuild_object_index();
     Ok(())
 }
 
-pub(crate) fn import_dxf_into(pidb: &mut PidbFile, path: impl AsRef<Path>) -> Result<usize> {
+/// Parse a DXF file into a standalone document without touching any project.
+/// Lets multi-file imports parse everything up front and commit atomically.
+pub(crate) fn parse_dxf_document(path: impl AsRef<Path>) -> Result<Document> {
     let path = path.as_ref();
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let count = import_dxf_bytes_into(pidb, &bytes)?;
-    userspace_log!("Imported {count} object(s) from {}", path.display());
-    Ok(count)
-}
-
-pub(crate) fn import_dxf_bytes_into(pidb: &mut PidbFile, bytes: &[u8]) -> Result<usize> {
-    let mut cursor = Cursor::new(bytes);
-    let drawing = Drawing::load(&mut cursor)?;
-    let imported = crate::model::formats::dxf::from_dxf(&drawing);
-    Ok(merge_document(&mut pidb.document, &imported))
+    let mut cursor = Cursor::new(bytes.as_slice());
+    let drawing =
+        Drawing::load(&mut cursor).with_context(|| format!("parse {}", path.display()))?;
+    let document = crate::model::formats::dxf::from_dxf(&drawing);
+    document
+        .validate()
+        .with_context(|| format!("validate imported DXF {}", path.display()))?;
+    Ok(document)
 }
 
 pub(crate) fn merge_document(target: &mut Document, imported: &Document) -> usize {
@@ -659,7 +410,7 @@ fn export_layers_to_dxf(
     path: impl AsRef<Path>,
 ) -> Result<()> {
     let mut drawing = Drawing::new();
-    drawing.header.version = AcadVersion::R2000;
+    drawing.header.version = AcadVersion::R2004;
     for layer in pidb.document.layers() {
         if only_layer.is_some_and(|id| id != layer.id) {
             continue;
@@ -681,9 +432,15 @@ fn export_layers_to_dxf(
         }
         add_object_to_drawing(&pidb.document, object, &mut road_network, &mut drawing);
     }
-    drawing
-        .save_file(path.as_ref())
-        .with_context(|| format!("write {}", path.as_ref().display()))
+    // Atomic replacement keeps the previous valid export intact when the
+    // write fails part-way (disk full, permissions, encoding errors).
+    crate::model::atomic_file::write_atomic(path.as_ref(), |file| {
+        let mut writer = std::io::BufWriter::new(file);
+        drawing.save(&mut writer)?;
+        std::io::Write::flush(&mut writer)?;
+        Ok(())
+    })
+    .with_context(|| format!("write {}", path.as_ref().display()))
 }
 
 fn add_object_to_drawing(
@@ -696,7 +453,7 @@ fn add_object_to_drawing(
         return;
     };
     let layer_name = layer.name.clone();
-    let dxf_color = color_to_dxf(object.color());
+    let object_color = object.color();
 
     match object {
         Object::Point { pos, .. } => {
@@ -705,7 +462,7 @@ fn add_object_to_drawing(
                 ..Default::default()
             }));
             entity.common.layer = layer_name;
-            entity.common.color = dxf_color;
+            apply_object_color(&mut entity.common, object_color);
             drawing.add_entity(entity);
         }
         Object::Polyline { verts, closed, .. } => {
@@ -723,18 +480,26 @@ fn add_object_to_drawing(
                 poly.set_is_closed(*closed);
                 let mut entity = Entity::new(EntityType::LwPolyline(poly));
                 entity.common.layer = layer_name;
-                entity.common.color = dxf_color;
+                apply_object_color(&mut entity.common, object_color);
                 entity.common.elevation = z0;
                 drawing.add_entity(entity);
             } else {
-                // 3D polyline — preserve per-vertex Z.
+                // DXF 3D polyline vertices do not portably support bulge.
+                // Tessellate bulged segments (including interpolated Z) into
+                // straight 3D vertices before export.
                 let mut poly = DxfPolyline::default();
                 poly.set_is_3d_polyline(true);
                 poly.set_is_closed(*closed);
-                for v in verts {
+                let positions: Vec<_> =
+                    if verts.iter().any(|vertex| vertex.bulge.abs() > f64::EPSILON) {
+                        crate::model::geometry::tessellate_polyline_bulges(verts, *closed)
+                    } else {
+                        verts.iter().map(|vertex| vertex.pos).collect()
+                    };
+                for pos in positions {
                     let mut vertex = DxfVertex {
-                        location: Point::new(v.pos.x, v.pos.y, v.pos.z),
-                        bulge: v.bulge,
+                        location: Point::new(pos.x, pos.y, pos.z),
+                        bulge: 0.0,
                         ..Default::default()
                     };
                     vertex.set_is_3d_polyline_vertex(true);
@@ -742,7 +507,7 @@ fn add_object_to_drawing(
                 }
                 let mut entity = Entity::new(EntityType::Polyline(poly));
                 entity.common.layer = layer_name;
-                entity.common.color = dxf_color;
+                apply_object_color(&mut entity.common, object_color);
                 drawing.add_entity(entity);
             }
         }
@@ -761,37 +526,47 @@ fn add_object_to_drawing(
                 ..Default::default()
             }));
             entity.common.layer = layer_name;
-            entity.common.color = dxf_color;
+            apply_object_color(&mut entity.common, object_color);
             drawing.add_entity(entity);
         }
         Object::Road { id, .. } => {
             use crate::model::road_network::{self, RoadKey};
             let network = road_network.get_or_insert_with(|| road_network::resolve(document, None));
             for edge in network.edges_for(RoadKey::Object(*id)) {
-                emit_road_points(&edge.center, &layer_name, dxf_color.clone(), drawing);
-                emit_road_points(&edge.left, &layer_name, dxf_color.clone(), drawing);
-                emit_road_points(&edge.right, &layer_name, dxf_color.clone(), drawing);
+                emit_road_points(&edge.center, &layer_name, object_color, drawing);
+                emit_road_points(&edge.left, &layer_name, object_color, drawing);
+                emit_road_points(&edge.right, &layer_name, object_color, drawing);
                 if edge.start_cap
                     && let (Some(&l), Some(&r)) = (edge.left.first(), edge.right.first())
                 {
-                    emit_road_points(&[l, r], &layer_name, dxf_color.clone(), drawing);
+                    emit_road_points(&[l, r], &layer_name, object_color, drawing);
                 }
                 if edge.end_cap
                     && let (Some(&l), Some(&r)) = (edge.left.last(), edge.right.last())
                 {
-                    emit_road_points(&[l, r], &layer_name, dxf_color.clone(), drawing);
+                    emit_road_points(&[l, r], &layer_name, object_color, drawing);
                 }
             }
         }
     }
 }
 
-fn emit_road_points(points: &[glam::DVec3], layer_name: &str, color: Color, drawing: &mut Drawing) {
+fn emit_road_points(
+    points: &[glam::DVec3],
+    layer_name: &str,
+    color: ObjectColor,
+    drawing: &mut Drawing,
+) {
     let verts: Vec<PolyVertex> = points.iter().copied().map(PolyVertex::straight).collect();
     emit_road_verts(verts, layer_name, color, drawing);
 }
 
-fn emit_road_verts(verts: Vec<PolyVertex>, layer_name: &str, color: Color, drawing: &mut Drawing) {
+fn emit_road_verts(
+    verts: Vec<PolyVertex>,
+    layer_name: &str,
+    color: ObjectColor,
+    drawing: &mut Drawing,
+) {
     if verts.len() < 2 {
         return;
     }
@@ -805,7 +580,7 @@ fn emit_road_verts(verts: Vec<PolyVertex>, layer_name: &str, color: Color, drawi
         poly.set_is_closed(false);
         let mut entity = Entity::new(EntityType::LwPolyline(poly));
         entity.common.layer = layer_name.to_owned();
-        entity.common.color = color;
+        apply_object_color(&mut entity.common, color);
         entity.common.elevation = z0;
         drawing.add_entity(entity);
     } else {
@@ -823,7 +598,7 @@ fn emit_road_verts(verts: Vec<PolyVertex>, layer_name: &str, color: Color, drawi
         }
         let mut entity = Entity::new(EntityType::Polyline(poly));
         entity.common.layer = layer_name.to_owned();
-        entity.common.color = color;
+        apply_object_color(&mut entity.common, color);
         drawing.add_entity(entity);
     }
 }
@@ -841,10 +616,22 @@ fn point_from_vec3(pos: glam::DVec3) -> Point {
     Point::new(pos.x, pos.y, pos.z)
 }
 
-fn color_to_dxf(color: ObjectColor) -> Color {
+fn apply_object_color(common: &mut dxf::entities::EntityCommon, color: ObjectColor) {
     match color {
-        ObjectColor::ByLayer => Color::by_layer(),
-        ObjectColor::Fixed(rgba) => Color::from_index(nearest_aci(rgba)),
+        ObjectColor::ByLayer => {
+            common.color = Color::by_layer();
+            common.color_24_bit = 0;
+            common.transparency = 0;
+        }
+        ObjectColor::Fixed(rgba) => {
+            common.color = Color::from_index(nearest_aci(rgba));
+            let red = u32::from(linear_to_srgb_byte(rgba[0]));
+            let green = u32::from(linear_to_srgb_byte(rgba[1]));
+            let blue = u32::from(linear_to_srgb_byte(rgba[2]));
+            common.color_24_bit = ((red << 16) | (green << 8) | blue) as i32;
+            let alpha = (rgba[3].clamp(0.0, 1.0) * 255.0).round() as i32;
+            common.transparency = 0x0200_0000 | alpha;
+        }
     }
 }
 
@@ -910,13 +697,14 @@ pub(crate) fn pidb_from_dgd_isis(path: impl AsRef<Path>) -> Result<PidbFile> {
             Vec::new()
         }
     };
-    let document = document_from_dgd_points(
+    let mut document = document_from_dgd_points(
         &design.points,
         &design.texts,
         &index_entries,
         &design.layer_names,
         design.palette.as_ref(),
     );
+    document.repair_degenerate_closed_polylines();
     Ok(PidbFile {
         format_version: PIDB_FORMAT_VERSION,
         document,
@@ -930,7 +718,8 @@ pub(crate) fn pidb_from_duf(path: impl AsRef<Path>) -> Result<PidbFile> {
     let path = path.as_ref();
     let duf = crate::model::formats::duf::read_duf(path)
         .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-    let document = document_from_duf_design(&duf);
+    let mut document = document_from_duf_design(&duf);
+    document.repair_degenerate_closed_polylines();
     if duf.skipped.unsupported_mesh_entities > 0 || !duf.polyfaces.is_empty() {
         userspace_log!(
             "Ignored {} DUF mesh entit{} while importing {} as PIDB",
@@ -1257,13 +1046,19 @@ fn is_dgd_point_collection_layer_name(name: &str) -> bool {
 
 pub(crate) fn open_project(path: Option<PathBuf>, mut pidb: PidbFile) -> Result<OpenProject> {
     validate(&mut pidb)?;
-    Ok(OpenProject {
+    let mut project = OpenProject {
         runtime_id: 0,
         path,
         pidb,
         loaded_layers: HashSet::new(),
-        dirty_layers_cache: RefCell::new(None),
-        disk_snapshot_cache: RefCell::new(None),
-        memory_snapshot_cache: RefCell::new(MemorySnapshot::default()),
-    })
+        saved_content_hash: None,
+        content_hash_cache: RefCell::new(HashMap::new()),
+        dirty_cache: RefCell::new(None),
+    };
+    // A pathless project has never been saved and stays dirty; the hash is
+    // namespace-invariant, so capturing it before runtime namespacing is fine.
+    if project.path.is_some() {
+        project.mark_saved();
+    }
+    Ok(project)
 }

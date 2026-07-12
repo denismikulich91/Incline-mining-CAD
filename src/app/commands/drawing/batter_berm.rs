@@ -11,9 +11,8 @@ impl<'a> App<'a> {
             SceneEntityId::Object(id)
                 if self
                     .workspace
-                    .project_index_for_object(*id)
-                    .and_then(|index| self.workspace.projects.get(index))
-                    .and_then(|project| project.pidb.document.get_object(*id))
+                    .active_document()
+                    .and_then(|document| document.get_object(*id))
                     .is_some_and(|object| matches!(object, Object::Polyline { .. })) =>
             {
                 Some(*id)
@@ -101,9 +100,10 @@ impl<'a> App<'a> {
         }
 
         let (src_verts, closed) = match self.active_document().get_object(object_id) {
-            Some(Object::Polyline { verts, closed, .. }) => {
-                (verts.iter().map(|v| v.pos).collect::<Vec<_>>(), *closed)
-            }
+            Some(Object::Polyline { verts, closed, .. }) => (
+                crate::model::geometry::tessellate_polyline_bulges(verts, *closed),
+                *closed,
+            ),
             _ => return,
         };
 

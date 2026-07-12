@@ -5,7 +5,7 @@ use super::*;
 
 impl<'a> App<'a> {
     /// Generate contour polylines from a triangulation and store them as a new
-    /// layer in the chosen pidb project. Major contours (multiples of
+    /// layer in the active pidb project. Major contours (multiples of
     /// `major_interval`) use `major_color`; all others use `minor_color`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn generate_contour_triangulation(
@@ -15,7 +15,6 @@ impl<'a> App<'a> {
         minor_interval: f64,
         major_color: [f32; 4],
         minor_color: [f32; 4],
-        project_index: usize,
         z_range: Option<(f64, f64)>,
     ) -> Result<()> {
         if !minor_interval.is_finite()
@@ -71,113 +70,179 @@ impl<'a> App<'a> {
             );
         }
 
-        if self.workspace.projects.get(project_index).is_none() {
-            anyhow::bail!("Target PIDB not found");
+        if !self.workspace.has_active_project() {
+            anyhow::bail!("No active PIDB to store the contours in");
         }
 
-        let verts_raw = mesh.vertices();
-        let contour_faces: Vec<ContourFace> = mesh
-            .face_vertex_indices_iter()
-            .map(|face| {
-                let vertices = [verts_raw[face[0]], verts_raw[face[1]], verts_raw[face[2]]];
-                let z_min = vertices
-                    .iter()
-                    .map(|vertex| vertex.z)
-                    .fold(f64::INFINITY, f64::min);
-                let z_max = vertices
-                    .iter()
-                    .map(|vertex| vertex.z)
-                    .fold(f64::NEG_INFINITY, f64::max);
-                ContourFace {
-                    vertices,
-                    z_min,
-                    z_max,
-                }
-            })
-            .collect();
-        let mut polylines: Vec<(Vec<glam::DVec3>, crate::model::ObjectColor)> = Vec::new();
+        // Snapshot the project identity so the apply step can verify the
+        // contours still have a home when the job completes.
+        let project_runtime_id = self
+            .workspace
+            .active_project()
+            .map(|project| project.runtime_id)
+            .expect("checked above");
 
-        // Bucket faces by the levels they cross so each level only visits the
-        // faces that actually intersect it, instead of rescanning every face.
-        let levels = contour_levels(z_lo, z_hi, minor_interval, major_interval);
-        let mut level_faces: Vec<Vec<u32>> = vec![Vec::new(); levels.len()];
-        for (face_index, face) in contour_faces.iter().enumerate() {
-            let first = levels.partition_point(|level| *level < face.z_min);
-            let last = levels.partition_point(|level| *level < face.z_max);
-            for bucket in &mut level_faces[first..last] {
-                bucket.push(face_index as u32);
-            }
-        }
-
-        for (z_level, face_indices) in levels.iter().copied().zip(&level_faces) {
-            let is_major = is_major_contour(z_level, major_interval);
-            let color = if is_major { major_color } else { minor_color };
-            let line_color = crate::model::ObjectColor::Fixed(color);
-            let mut level_segments = Vec::new();
-
-            for &face_index in face_indices {
-                let face = &contour_faces[face_index as usize];
-                if let Some(seg) = triangle_contour_segment(face.vertices, z_level) {
-                    level_segments.push([
-                        glam::DVec3::new(seg[0].x, seg[0].y, seg[0].z),
-                        glam::DVec3::new(seg[1].x, seg[1].y, seg[1].z),
-                    ]);
-                }
-            }
-
-            polylines.extend(
-                chain_contour_segments(level_segments)
-                    .into_iter()
-                    .map(|verts| (verts, line_color)),
-            );
-        }
-
-        if polylines.is_empty() {
-            anyhow::bail!("No contour segments were generated for the selected intervals");
-        }
-
-        if self.workspace.active_index != Some(project_index) {
-            self.history.clear();
-            self.workspace.set_active_index(project_index);
-        }
-
-        let layer_name = format!("{tri_name}_contour");
-        let project = &mut self.workspace.projects[project_index];
-        let layer_id = project.pidb.document.allocate_layer_id();
-        let layer = Layer {
-            id: layer_id,
-            name: layer_name.clone(),
-            color_index: None,
-            color: [1.0, 1.0, 1.0, 1.0],
-            visible: true,
-            elevation: 0.0,
+        let apply_tri_name = tri_name.clone();
+        let compute = move |cancel: &crate::app::jobs::CancelFlag|
+              -> Result<Vec<(Vec<glam::DVec3>, crate::model::ObjectColor)>> {
+            compute_contour_polylines(
+                &mesh,
+                z_lo,
+                z_hi,
+                minor_interval,
+                major_interval,
+                major_color,
+                minor_color,
+                cancel,
+            )
         };
-        let objects: Vec<Object> = polylines
-            .into_iter()
-            .map(|(verts, color)| Object::Polyline {
-                id: project.pidb.document.allocate_object_id(),
-                layer: layer_id,
-                verts: verts
+        let apply =
+            move |app: &mut App,
+                  result: Result<Vec<(Vec<glam::DVec3>, crate::model::ObjectColor)>>| {
+                let polylines = match result {
+                    Ok(polylines) => polylines,
+                    Err(error) => {
+                        crate::userspace_warn!("Contour generation failed: {error:#}");
+                        return;
+                    }
+                };
+                let Some(project) = app
+                    .workspace
+                    .projects
+                    .iter_mut()
+                    .find(|project| project.runtime_id == project_runtime_id)
+                else {
+                    crate::userspace_warn!(
+                        "Contours for '{apply_tri_name}' were discarded: the project was closed"
+                    );
+                    return;
+                };
+                let layer_name = format!("{apply_tri_name}_contour");
+                let layer_id = project.pidb.document.allocate_layer_id();
+                let layer = Layer {
+                    id: layer_id,
+                    name: layer_name,
+                    color_index: None,
+                    color: [1.0, 1.0, 1.0, 1.0],
+                    visible: true,
+                    elevation: 0.0,
+                };
+                let objects: Vec<Object> = polylines
                     .into_iter()
-                    .map(crate::model::PolyVertex::straight)
-                    .collect(),
-                closed: false,
-                color,
-                fill: crate::model::FillStyle::Clear,
-                line_weight: 1.0,
-            })
-            .collect();
-        let line_count = objects.len();
-        self.history.execute(
-            &mut project.pidb.document,
-            crate::model::Command::AddLayerSnapshot { layer, objects },
+                    .map(|(verts, color)| Object::Polyline {
+                        id: project.pidb.document.allocate_object_id(),
+                        layer: layer_id,
+                        verts: verts
+                            .into_iter()
+                            .map(crate::model::PolyVertex::straight)
+                            .collect(),
+                        closed: false,
+                        color,
+                        fill: crate::model::FillStyle::Clear,
+                        line_weight: 1.0,
+                    })
+                    .collect();
+                let line_count = objects.len();
+                app.history.execute(
+                    &mut project.pidb.document,
+                    crate::model::Command::AddLayerSnapshot { layer, objects },
+                );
+                project.loaded_layers.insert(layer_id);
+                app.editor.active_layer = Some(layer_id);
+                userspace_log!(
+                    "Generated {line_count} contour polyline(s) for triangulation '{apply_tri_name}'"
+                );
+                app.invalidate_geometry();
+            };
+        self.spawn_job(
+            "Generating contours…",
+            vec![crate::app::jobs::JobKey::Triangulation(tri_id)],
+            compute,
+            apply,
         );
-        project.loaded_layers.insert(layer_id);
-        self.editor.active_layer = Some(layer_id);
-        userspace_log!("Generated {line_count} contour polyline(s) for triangulation '{tri_name}'");
-        self.invalidate_geometry();
         Ok(())
     }
+}
+
+/// Contour a mesh with a Z sweep: faces are sorted by minimum Z once and an
+/// active-face set follows the ascending levels, so intermediate memory stays
+/// O(faces + active faces + output) instead of copying each face index into
+/// every level bucket it crosses (tall/vertical triangles made that
+/// O(face-level intersections)).
+#[allow(clippy::too_many_arguments)]
+fn compute_contour_polylines(
+    mesh: &tri00t::Triangulation,
+    z_lo: f64,
+    z_hi: f64,
+    minor_interval: f64,
+    major_interval: f64,
+    major_color: [f32; 4],
+    minor_color: [f32; 4],
+    cancel: &crate::app::jobs::CancelFlag,
+) -> Result<Vec<(Vec<glam::DVec3>, crate::model::ObjectColor)>> {
+    let verts_raw = mesh.vertices();
+    let mut contour_faces: Vec<ContourFace> = mesh
+        .face_vertex_indices_iter()
+        .map(|face| {
+            let vertices = [verts_raw[face[0]], verts_raw[face[1]], verts_raw[face[2]]];
+            let z_min = vertices
+                .iter()
+                .map(|vertex| vertex.z)
+                .fold(f64::INFINITY, f64::min);
+            let z_max = vertices
+                .iter()
+                .map(|vertex| vertex.z)
+                .fold(f64::NEG_INFINITY, f64::max);
+            ContourFace {
+                vertices,
+                z_min,
+                z_max,
+            }
+        })
+        .collect();
+    contour_faces.sort_by(|a, b| a.z_min.total_cmp(&b.z_min));
+
+    let levels = contour_levels(z_lo, z_hi, minor_interval, major_interval);
+    let mut polylines: Vec<(Vec<glam::DVec3>, crate::model::ObjectColor)> = Vec::new();
+    let mut active: Vec<usize> = Vec::new();
+    let mut next_face = 0usize;
+
+    for z_level in levels {
+        if cancel.is_cancelled() {
+            anyhow::bail!("Cancelled");
+        }
+        // Admit faces whose span has reached this level, then retire the ones
+        // it has passed. A face crosses the level when z_min <= level < z_max.
+        while next_face < contour_faces.len() && contour_faces[next_face].z_min <= z_level {
+            active.push(next_face);
+            next_face += 1;
+        }
+        active.retain(|&face_index| contour_faces[face_index].z_max > z_level);
+
+        let is_major = is_major_contour(z_level, major_interval);
+        let color = if is_major { major_color } else { minor_color };
+        let line_color = crate::model::ObjectColor::Fixed(color);
+        let mut level_segments = Vec::new();
+        for &face_index in &active {
+            let face = &contour_faces[face_index];
+            if let Some(seg) = triangle_contour_segment(face.vertices, z_level) {
+                level_segments.push([
+                    glam::DVec3::new(seg[0].x, seg[0].y, seg[0].z),
+                    glam::DVec3::new(seg[1].x, seg[1].y, seg[1].z),
+                ]);
+            }
+        }
+        polylines.extend(
+            chain_contour_segments(level_segments)
+                .into_iter()
+                .map(|verts| (verts, line_color)),
+        );
+    }
+
+    if polylines.is_empty() {
+        anyhow::bail!("No contour segments were generated for the selected intervals");
+    }
+    Ok(polylines)
 }
 
 struct ContourFace {

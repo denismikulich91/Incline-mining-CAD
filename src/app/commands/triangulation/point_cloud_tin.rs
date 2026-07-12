@@ -36,7 +36,7 @@ impl<'a> App<'a> {
             };
         self.spawn_job(
             "Point cloud TIN...",
-            crate::app::jobs::JobKey::Anonymous,
+            vec![crate::app::jobs::JobKey::PointCloud(cloud_id)],
             compute,
             apply,
         );

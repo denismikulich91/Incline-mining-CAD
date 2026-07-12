@@ -40,6 +40,7 @@ pub struct Vertex {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Face {
     indices: [u32; 3],
+    payload: [u8; 12],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -86,6 +87,10 @@ pub enum ReadError {
     InvalidVulzPage {
         offset: usize,
         message: String,
+    },
+    Allocation {
+        section: &'static str,
+        bytes: usize,
     },
     MissingVulzPages {
         missing: usize,
@@ -170,22 +175,62 @@ impl Triangulation {
     /// Construct a triangulation from a computed vertex list and face index triples.
     /// Face indices must be zero-based and within bounds. The raw header is populated
     /// with the counts so the result can be round-tripped through `write_mesh_with_progress`.
-    pub fn from_vertices_and_faces(vertices: Vec<Vertex>, faces: Vec<[u32; 3]>) -> Self {
+    pub fn from_vertices_and_faces(
+        vertices: Vec<Vertex>,
+        faces: Vec<[u32; 3]>,
+    ) -> Result<Self, ReadError> {
+        let vertex_count = vertices.len();
+        let face_count = faces.len();
+        if vertex_count == 0 || face_count == 0 {
+            return Err(ReadError::InvalidRawCounts {
+                vertices: vertex_count,
+                faces: face_count,
+            });
+        }
+        let vertex_count_u32 = u32::try_from(vertex_count)
+            .map_err(|_| ReadError::Overflow("generated vertex count"))?;
+        let face_count_u32 =
+            u32::try_from(face_count).map_err(|_| ReadError::Overflow("generated face count"))?;
+        if vertices
+            .iter()
+            .any(|vertex| !vertex.x.is_finite() || !vertex.y.is_finite() || !vertex.z.is_finite())
+        {
+            return Err(ReadError::InvalidCoordinates);
+        }
+        let (min_index, max_index) = faces
+            .iter()
+            .flatten()
+            .fold((u32::MAX, 0u32), |(min, max), &index| {
+                (min.min(index), max.max(index))
+            });
+        if max_index >= vertex_count_u32 {
+            return Err(ReadError::InvalidFaceIndices {
+                min: min_index,
+                max: max_index,
+                vertex_count,
+            });
+        }
         let bounds = Bounds::from_vertices(&vertices);
         let mut raw_header = vec![0u8; RAW_HEADER_LEN];
         raw_header[RAW_VERTEX_COUNT_OFFSET..RAW_VERTEX_COUNT_OFFSET + 4]
-            .copy_from_slice(&(vertices.len() as u32).to_be_bytes());
+            .copy_from_slice(&vertex_count_u32.to_be_bytes());
         raw_header[RAW_FACE_COUNT_OFFSET..RAW_FACE_COUNT_OFFSET + 4]
-            .copy_from_slice(&(faces.len() as u32).to_be_bytes());
-        let faces = faces.into_iter().map(|indices| Face { indices }).collect();
-        Self {
+            .copy_from_slice(&face_count_u32.to_be_bytes());
+        let faces = faces
+            .into_iter()
+            .map(|indices| Face {
+                indices,
+                payload: [0; 12],
+            })
+            .collect();
+        Ok(Self {
             vertices,
             faces,
             bounds,
             index_base: IndexBase::Zero,
             raw_header,
             trailing_attributes: Vec::new(),
-        }
+        })
     }
 
     /// Write the triangulation in Vulcan `.00t` layout, invoking `progress`
@@ -218,16 +263,28 @@ impl Triangulation {
                 progress(0.5 * i as f32 / vertex_count as f32);
             }
         }
-        for (i, (_face, indices)) in self
+        for (i, (face, indices)) in self
             .faces
             .iter()
             .zip(self.face_vertex_indices_iter())
             .enumerate()
         {
+            // Vulcan's native convention is one-based. Always emit that
+            // canonical form so a generated zero-based mesh which happens not
+            // to reference vertex zero cannot be misdetected when reloaded.
             for index in indices {
-                writer.write_all(&(index as u32).to_be_bytes())?;
+                let one_based = u32::try_from(index)
+                    .ok()
+                    .and_then(|index| index.checked_add(1))
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "00t face index exceeds the format limit",
+                        )
+                    })?;
+                writer.write_all(&one_based.to_be_bytes())?;
             }
-            writer.write_all(&[0u8; 12])?;
+            writer.write_all(&face.payload)?;
             if i % PROGRESS_STRIDE == 0 {
                 progress(0.5 + 0.5 * i as f32 / face_count as f32);
             }
@@ -324,6 +381,9 @@ impl fmt::Display for ReadError {
             }
             ReadError::InvalidVulzPage { offset, message } => {
                 write!(f, "invalid vulZ page at 0x{offset:x}: {message}")
+            }
+            ReadError::Allocation { section, bytes } => {
+                write!(f, "could not allocate {bytes} bytes for {section}")
             }
             ReadError::MissingVulzPages {
                 missing,
@@ -451,6 +511,9 @@ fn read_raw_triangulation(bytes: &[u8]) -> Result<Triangulation, ReadError> {
                 read_be_u32(bytes, offset + 4)?,
                 read_be_u32(bytes, offset + 8)?,
             ],
+            payload: bytes[offset + 12..offset + RAW_FACE_SIZE]
+                .try_into()
+                .expect("validated face record length"),
         });
     }
 
@@ -499,8 +562,12 @@ const MAX_VULZ_PAGE_LEN: usize = 4 << 20;
 /// Largest gap between a page's stored data and the next page header
 /// (page-number word, end marker, zero padding).
 const MAX_VULZ_PAGE_TRAILER: usize = 0x4000;
-/// Cap on the logical image size to guard against corrupt headers.
-const MAX_VULZ_TOTAL_LEN: usize = 1 << 30;
+/// Per-import ceilings for header-declared logical data. The combined limit
+/// ensures the main image and auxiliary gallery cannot each consume the full
+/// budget.
+const MAX_VULZ_TOTAL_LEN: usize = 512 << 20;
+const MAX_VULZ_AUX_LEN: usize = 128 << 20;
+const MAX_VULZ_EXPANDED_BYTES: usize = 512 << 20;
 
 /// Number of 8-byte entries in one vulZ pointer block.
 const VULZ_POINTER_BLOCK_ENTRIES: usize = 0x800 / 8;
@@ -542,18 +609,55 @@ pub(crate) fn decode_vulz_archive(bytes: &[u8]) -> Result<VulzArchive, ReadError
             message: format!("implausible page size {page_size}"),
         });
     }
-    let total_len = read_le_u32(bytes, VULZ_TOTAL_EXPANDED_OFFSET)? as usize
-        | ((read_le_u32(bytes, VULZ_TOTAL_EXPANDED_OFFSET + 4)? as usize) << 32);
-    if total_len == 0 || total_len > MAX_VULZ_TOTAL_LEN {
+    let total_len_u64 = u64::from(read_le_u32(bytes, VULZ_TOTAL_EXPANDED_OFFSET)?)
+        | (u64::from(read_le_u32(bytes, VULZ_TOTAL_EXPANDED_OFFSET + 4)?) << 32);
+    if total_len_u64 == 0 || total_len_u64 > MAX_VULZ_TOTAL_LEN as u64 {
         return Err(ReadError::InvalidVulzPage {
             offset: VULZ_TOTAL_EXPANDED_OFFSET,
-            message: format!("implausible total expanded length {total_len}"),
+            message: format!(
+                "total expanded length {total_len_u64} exceeds the import limit of {MAX_VULZ_TOTAL_LEN} bytes"
+            ),
         });
     }
+    let total_len = usize::try_from(total_len_u64).map_err(|_| ReadError::InvalidVulzPage {
+        offset: VULZ_TOTAL_EXPANDED_OFFSET,
+        message: format!("total expanded length {total_len_u64} is not addressable"),
+    })?;
     let aux_offset = read_le_u32(bytes, VULZ_AUX_OFFSET_OFFSET)? as usize;
     let aux_len = read_le_u32(bytes, VULZ_AUX_LEN_OFFSET)? as usize;
+    if aux_len > MAX_VULZ_AUX_LEN {
+        return Err(ReadError::InvalidVulzPage {
+            offset: VULZ_AUX_LEN_OFFSET,
+            message: format!(
+                "auxiliary expanded length {aux_len} exceeds the import limit of {MAX_VULZ_AUX_LEN} bytes"
+            ),
+        });
+    }
+    let expanded_len = total_len
+        .checked_add(aux_len)
+        .ok_or(ReadError::Overflow("vulZ expanded"))?;
+    if expanded_len > MAX_VULZ_EXPANDED_BYTES {
+        return Err(ReadError::InvalidVulzPage {
+            offset: VULZ_TOTAL_EXPANDED_OFFSET,
+            message: format!(
+                "combined expanded length {expanded_len} exceeds the import limit of {MAX_VULZ_EXPANDED_BYTES} bytes"
+            ),
+        });
+    }
+    if aux_len > 0
+        && !aux_offset
+            .checked_add(8)
+            .is_some_and(|end| end <= bytes.len())
+    {
+        return Err(ReadError::InvalidVulzPage {
+            offset: VULZ_AUX_OFFSET_OFFSET,
+            message: format!("auxiliary stream offset 0x{aux_offset:x} is outside the file"),
+        });
+    }
 
-    let archive = walk_vulz(bytes, page_size, total_len, aux_offset, aux_len, false);
+    let mut archive = walk_vulz(
+        bytes, page_size, total_len, aux_offset, aux_len, false, None,
+    )?;
 
     // Self-validating recovery for a header whose page-size field disagrees
     // with the actual page length (seen on some company 00t exports the tree
@@ -566,10 +670,31 @@ pub(crate) fn decode_vulz_archive(bytes: &[u8]) -> Result<VulzArchive, ReadError
         && actual != page_size
         && (1024..=MAX_VULZ_PAGE_LEN).contains(&actual)
     {
-        let retry = walk_vulz(bytes, actual, total_len, aux_offset, aux_len, false);
+        let buffers = (archive.data, archive.aux);
+        let retry = walk_vulz(
+            bytes,
+            actual,
+            total_len,
+            aux_offset,
+            aux_len,
+            false,
+            Some(buffers),
+        )?;
         if retry.missing_pages == 0 {
             return Ok(retry);
         }
+        // Preserve the old fallback result for callers which inspect partial
+        // archives, but rebuild it into the retry's buffers instead of
+        // retaining two potentially huge logical images at once.
+        archive = walk_vulz(
+            bytes,
+            page_size,
+            total_len,
+            aux_offset,
+            aux_len,
+            false,
+            Some((retry.data, retry.aux)),
+        )?;
     }
 
     // Self-validating recovery for trailer words that are not logical page
@@ -586,10 +711,27 @@ pub(crate) fn decode_vulz_archive(bytes: &[u8]) -> Result<VulzArchive, ReadError
         && archive.out_of_range_slot.is_some()
         && archive.decoded_pages == archive.total_pages
     {
-        let retry = walk_vulz(bytes, page_size, total_len, aux_offset, aux_len, true);
+        let retry = walk_vulz(
+            bytes,
+            page_size,
+            total_len,
+            aux_offset,
+            aux_len,
+            true,
+            Some((archive.data, archive.aux)),
+        )?;
         if retry.missing_pages == 0 {
             return Ok(retry);
         }
+        archive = walk_vulz(
+            bytes,
+            page_size,
+            total_len,
+            aux_offset,
+            aux_len,
+            false,
+            Some((retry.data, retry.aux)),
+        )?;
     }
 
     Ok(archive)
@@ -607,15 +749,31 @@ fn walk_vulz(
     aux_offset: usize,
     aux_len: usize,
     ignore_numbers: bool,
-) -> VulzArchive {
-    let total_pages = total_len.div_ceil(page_size);
+    reuse: Option<(Vec<u8>, Vec<u8>)>,
+) -> Result<VulzArchive, ReadError> {
+    let total_pages = total_len
+        .checked_add(page_size - 1)
+        .ok_or(ReadError::Overflow("vulZ page count"))?
+        / page_size;
+    let (mut data, mut aux) = reuse.unwrap_or_default();
+    data.clear();
+    if data.capacity() < total_len {
+        data.try_reserve_exact(total_len)
+            .map_err(|_| ReadError::Allocation {
+                section: "vulZ logical image",
+                bytes: total_len,
+            })?;
+    }
+    data.resize(total_len, 0);
+    let covered = try_false_vec(total_pages, "vulZ page coverage")?;
+    let tree_covered = try_false_vec(total_pages, "vulZ tree page coverage")?;
     let mut walk = VulzWalk {
         bytes,
         page_size,
         total_pages,
-        data: vec![0u8; total_pages * page_size],
-        covered: vec![false; total_pages],
-        tree_covered: vec![false; total_pages],
+        data,
+        covered,
+        tree_covered,
         placed_at: std::collections::HashMap::new(),
         next_sequential: 0,
         visited: std::collections::HashSet::new(),
@@ -625,24 +783,23 @@ fn walk_vulz(
         ignore_numbers,
     };
 
-    let mut aux = Vec::new();
+    aux.clear();
     if aux_offset != 0 {
-        walk.walk_aux(aux_offset, &mut aux, aux_len);
+        walk.walk_aux(aux_offset, &mut aux, aux_len)?;
     }
     walk.walk_data(VULZ_WALK_START);
 
     aux.truncate(aux_len);
     let VulzWalk {
-        mut data,
+        data,
         covered,
         decoded_pages,
         mismatched_len,
         out_of_range_slot,
         ..
     } = walk;
-    data.truncate(total_len);
     let missing_pages = covered.iter().filter(|&&hit| !hit).count();
-    VulzArchive {
+    Ok(VulzArchive {
         data,
         aux,
         missing_pages,
@@ -651,7 +808,18 @@ fn walk_vulz(
         decoded_pages,
         mismatched_len,
         out_of_range_slot,
-    }
+    })
+}
+
+fn try_false_vec(count: usize, section: &'static str) -> Result<Vec<bool>, ReadError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(count)
+        .map_err(|_| ReadError::Allocation {
+            section,
+            bytes: count.div_ceil(8),
+        })?;
+    out.resize(count, false);
+    Ok(out)
 }
 
 /// One page decoded off a vulZ record: its payload plus the trailer number.
@@ -692,40 +860,40 @@ struct VulzWalk<'a> {
 }
 
 impl VulzWalk<'_> {
+    fn page_header(&self, offset: usize) -> Option<(usize, usize, usize, usize)> {
+        let header_end = offset.checked_add(8)?;
+        let header = self.bytes.get(offset..header_end)?;
+        let stored_len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+        let advance = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+        let payload_end = header_end.checked_add(stored_len)?;
+        let max_advance = stored_len.checked_add(MAX_VULZ_PAGE_TRAILER)?;
+        (advance != 0
+            && stored_len <= MAX_VULZ_PAGE_LEN
+            && advance >= stored_len
+            && advance <= max_advance
+            && payload_end <= self.bytes.len())
+        .then_some((stored_len, advance, header_end, payload_end))
+    }
+
     /// Cheaply test whether `offset` looks like a page header (the same checks
     /// as [`Self::decode_page`] minus the FastLZ decompression). A pointer
     /// block reads as `(target, 0)`, so its zero `advance` word fails here —
     /// which lets a page run tell a following page from a following table.
     fn is_page_header(&self, offset: usize) -> bool {
-        let (Ok(stored_len), Ok(advance)) = (
-            read_le_u32(self.bytes, offset),
-            read_le_u32(self.bytes, offset + 4),
-        ) else {
-            return false;
-        };
-        let (stored_len, advance) = (stored_len as usize, advance as usize);
-        advance != 0
-            && stored_len <= MAX_VULZ_PAGE_LEN
-            && advance >= stored_len
-            && advance <= stored_len + MAX_VULZ_PAGE_TRAILER
-            && offset + 8 + stored_len <= self.bytes.len()
+        self.page_header(offset).is_some()
     }
 
     /// Read and decompress the page record at `offset`, or `None` if the
     /// bytes there do not form a plausible page.
     fn decode_page(&self, offset: usize) -> Option<VulzPage> {
-        if !self.is_page_header(offset) {
-            return None;
-        }
-        let stored_len = read_le_u32(self.bytes, offset).ok()? as usize;
-        let advance = read_le_u32(self.bytes, offset + 4).ok()? as usize;
-        let payload = fastlz_decompress(&self.bytes[offset + 8..offset + 8 + stored_len]).ok()?;
+        let (_stored_len, advance, payload_start, payload_end) = self.page_header(offset)?;
+        let payload = fastlz_decompress(&self.bytes[payload_start..payload_end]).ok()?;
         // Some containers put the end marker directly after the stored data,
         // with no page-number word; reading the marker as a number would send
         // every page past the logical image, so such pages place sequentially.
         let number = self
             .bytes
-            .get(offset + 8 + stored_len..offset + 12 + stored_len)
+            .get(payload_end..payload_end.checked_add(4)?)
             .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
             .filter(|&word| word != VULZ_END_MARKER)
             .unwrap_or(0) as usize;
@@ -742,7 +910,7 @@ impl VulzWalk<'_> {
     fn walk_data(&mut self, start: usize) {
         let mut stack = vec![start];
         while let Some(offset) = stack.pop() {
-            if offset + 8 > self.bytes.len() {
+            if !has_vulz_record(self.bytes, offset) {
                 continue;
             }
             if !self.visited.insert(offset) {
@@ -753,7 +921,10 @@ impl VulzWalk<'_> {
                 }
                 continue;
             }
-            let second = read_le_u32(self.bytes, offset + 4).unwrap_or(0) as usize;
+            let second = offset
+                .checked_add(4)
+                .and_then(|at| read_le_u32(self.bytes, at).ok())
+                .unwrap_or(0) as usize;
             if second == 0 {
                 self.push_pointer_block(offset, &mut stack);
             } else {
@@ -766,17 +937,25 @@ impl VulzWalk<'_> {
     fn push_pointer_block(&self, offset: usize, stack: &mut Vec<usize>) {
         let mut targets = Vec::new();
         for entry in 0..VULZ_POINTER_BLOCK_ENTRIES {
-            let entry_offset = offset + entry * 8;
-            if entry_offset + 8 > self.bytes.len() {
+            let Some(entry_offset) = entry
+                .checked_mul(8)
+                .and_then(|relative| offset.checked_add(relative))
+            else {
+                break;
+            };
+            if !has_vulz_record(self.bytes, entry_offset) {
                 break;
             }
             let target = read_le_u32(self.bytes, entry_offset).unwrap_or(0) as usize;
-            let second = read_le_u32(self.bytes, entry_offset + 4).unwrap_or(0);
+            let second = entry_offset
+                .checked_add(4)
+                .and_then(|at| read_le_u32(self.bytes, at).ok())
+                .unwrap_or(0);
             if second != 0 {
                 // Ran off the pointer entries into other data.
                 break;
             }
-            if target != 0 && target + 8 <= self.bytes.len() {
+            if target != 0 && has_vulz_record(self.bytes, target) {
                 targets.push(target);
             }
         }
@@ -809,25 +988,38 @@ impl VulzWalk<'_> {
                 // every following zero-numbered page out of range too).
                 if slot < self.total_pages {
                     if from_tree || !self.tree_covered[slot] {
-                        self.data[slot * self.page_size..(slot + 1) * self.page_size]
-                            .copy_from_slice(&page.payload);
+                        let Some(start) = slot.checked_mul(self.page_size) else {
+                            return;
+                        };
+                        let end = start.saturating_add(self.page_size).min(self.data.len());
+                        let Some(destination) = self.data.get_mut(start..end) else {
+                            return;
+                        };
+                        destination.copy_from_slice(&page.payload[..destination.len()]);
                         self.covered[slot] = true;
                         self.tree_covered[slot] |= from_tree;
                         self.placed_at.insert(offset, slot);
                     }
-                    self.next_sequential = slot + 1;
+                    self.next_sequential = slot.saturating_add(1);
                 } else if self.out_of_range_slot.is_none() {
                     self.out_of_range_slot = Some(slot);
                 }
             }
-            offset += 8 + page.advance;
+            let Some(next_offset) = page
+                .advance
+                .checked_add(8)
+                .and_then(|advance| offset.checked_add(advance))
+            else {
+                return;
+            };
+            offset = next_offset;
             // End the run without claiming its terminating offset unless that
             // offset is itself another page. A run's end frequently lands on a
             // pointer/table block that the tree directory also points at (its
             // leaf lists the pages of the *next* group); marking it visited here
             // would make walk_data skip that whole subtree and drop every page
             // it references. Leaving it unvisited lets the tree traverse it.
-            if offset + 8 > self.bytes.len() || !self.is_page_header(offset) {
+            if !has_vulz_record(self.bytes, offset) || !self.is_page_header(offset) {
                 return;
             }
             if !self.visited.insert(offset) {
@@ -840,33 +1032,60 @@ impl VulzWalk<'_> {
     /// Walk the aux pointer tree from `start`, concatenating page payloads in
     /// walk order until `aux_len` bytes are collected. Aux pages are not part
     /// of the numbered page space and may be shorter than a data page.
-    fn walk_aux(&mut self, start: usize, aux: &mut Vec<u8>, aux_len: usize) {
+    fn walk_aux(
+        &mut self,
+        start: usize,
+        aux: &mut Vec<u8>,
+        aux_len: usize,
+    ) -> Result<(), ReadError> {
         let mut stack = vec![start];
         while let Some(offset) = stack.pop() {
-            if aux.len() >= aux_len || offset + 8 > self.bytes.len() {
+            if aux.len() >= aux_len || !has_vulz_record(self.bytes, offset) {
                 continue;
             }
             if !self.visited.insert(offset) {
                 continue;
             }
-            let second = read_le_u32(self.bytes, offset + 4).unwrap_or(0) as usize;
+            let second = offset
+                .checked_add(4)
+                .and_then(|at| read_le_u32(self.bytes, at).ok())
+                .unwrap_or(0) as usize;
             if second == 0 {
                 self.push_pointer_block(offset, &mut stack);
                 continue;
             }
             let mut run_offset = offset;
             while let Some(page) = self.decode_page(run_offset) {
-                aux.extend_from_slice(&page.payload);
-                run_offset += 8 + page.advance;
+                let remaining = aux_len.saturating_sub(aux.len());
+                let copy_len = remaining.min(page.payload.len());
+                aux.try_reserve_exact(copy_len)
+                    .map_err(|_| ReadError::Allocation {
+                        section: "vulZ auxiliary stream",
+                        bytes: aux_len,
+                    })?;
+                aux.extend_from_slice(&page.payload[..copy_len]);
+                let Some(next_offset) = page
+                    .advance
+                    .checked_add(8)
+                    .and_then(|advance| run_offset.checked_add(advance))
+                else {
+                    break;
+                };
+                run_offset = next_offset;
                 if aux.len() >= aux_len
-                    || run_offset + 8 > self.bytes.len()
+                    || !has_vulz_record(self.bytes, run_offset)
                     || !self.visited.insert(run_offset)
                 {
                     break;
                 }
             }
         }
+        Ok(())
     }
+}
+
+fn has_vulz_record(bytes: &[u8], offset: usize) -> bool {
+    offset.checked_add(8).is_some_and(|end| end <= bytes.len())
 }
 
 /// Decompress one FastLZ stream (as Vulcan stores per page). The level is
@@ -906,11 +1125,22 @@ fn fastlz_decompress(input: &[u8]) -> Result<Vec<u8>, ReadError> {
 
         if control < 32 {
             let len = control as usize + 1;
-            let end = input_offset + len;
+            let end = input_offset
+                .checked_add(len)
+                .ok_or_else(|| ReadError::InvalidVulzPage {
+                    offset: op_offset,
+                    message: "literal run length overflows".to_string(),
+                })?;
             if end > input.len() {
                 return Err(ReadError::InvalidVulzPage {
                     offset: op_offset,
                     message: "literal run exceeds page input".to_string(),
+                });
+            }
+            if output.len().saturating_add(len) > MAX_VULZ_PAGE_LEN {
+                return Err(ReadError::InvalidVulzPage {
+                    offset: op_offset,
+                    message: "expanded page is larger than expected".to_string(),
                 });
             }
             output.extend_from_slice(&input[input_offset..end]);
@@ -929,7 +1159,20 @@ fn fastlz_decompress(input: &[u8]) -> Result<Vec<u8>, ReadError> {
                     }
                     let code = input[input_offset];
                     input_offset += 1;
-                    len += code as usize;
+                    len = len.checked_add(code as usize).ok_or_else(|| {
+                        ReadError::InvalidVulzPage {
+                            offset: op_offset,
+                            message: "extended match length overflows".to_string(),
+                        }
+                    })?;
+                    // Reject attacker-controlled expansion while reading the
+                    // length bytes, before reserving or copying any match.
+                    if output.len().saturating_add(len).saturating_add(2) > MAX_VULZ_PAGE_LEN {
+                        return Err(ReadError::InvalidVulzPage {
+                            offset: op_offset,
+                            message: "expanded page is larger than expected".to_string(),
+                        });
+                    }
                     if !level2 || code != 255 {
                         break;
                     }
@@ -962,7 +1205,27 @@ fn fastlz_decompress(input: &[u8]) -> Result<Vec<u8>, ReadError> {
                 reference_offset = (hi << 8) + lo + 8191;
             }
 
-            len += 2;
+            len = len
+                .checked_add(2)
+                .ok_or_else(|| ReadError::InvalidVulzPage {
+                    offset: op_offset,
+                    message: "match length overflows".to_string(),
+                })?;
+
+            let expanded_len =
+                output
+                    .len()
+                    .checked_add(len)
+                    .ok_or_else(|| ReadError::InvalidVulzPage {
+                        offset: op_offset,
+                        message: "expanded page length overflows".to_string(),
+                    })?;
+            if expanded_len > MAX_VULZ_PAGE_LEN {
+                return Err(ReadError::InvalidVulzPage {
+                    offset: op_offset,
+                    message: "expanded page is larger than expected".to_string(),
+                });
+            }
 
             if reference_offset >= output.len() {
                 return Err(ReadError::InvalidVulzPage {
@@ -972,7 +1235,14 @@ fn fastlz_decompress(input: &[u8]) -> Result<Vec<u8>, ReadError> {
             }
 
             let start = output.len() - reference_offset - 1;
-            for reference_index in start..start + len {
+            let reference_end =
+                start
+                    .checked_add(len)
+                    .ok_or_else(|| ReadError::InvalidVulzPage {
+                        offset: op_offset,
+                        message: "match reference length overflows".to_string(),
+                    })?;
+            for reference_index in start..reference_end {
                 if reference_index >= output.len() {
                     return Err(ReadError::InvalidVulzPage {
                         offset: op_offset,
@@ -1032,22 +1302,31 @@ fn detect_index_base(faces: &[Face], vertex_count: usize) -> Result<IndexBase, R
 }
 
 fn read_be_u32(bytes: &[u8], offset: usize) -> Result<u32, ReadError> {
+    let end = offset
+        .checked_add(4)
+        .ok_or(ReadError::Overflow("u32 byte range"))?;
     let slice = bytes
-        .get(offset..offset + 4)
+        .get(offset..end)
         .ok_or(ReadError::UnexpectedEof { offset, needed: 4 })?;
     Ok(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
 fn read_le_u32(bytes: &[u8], offset: usize) -> Result<u32, ReadError> {
+    let end = offset
+        .checked_add(4)
+        .ok_or(ReadError::Overflow("u32 byte range"))?;
     let slice = bytes
-        .get(offset..offset + 4)
+        .get(offset..end)
         .ok_or(ReadError::UnexpectedEof { offset, needed: 4 })?;
     Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
 fn read_be_f64(bytes: &[u8], offset: usize) -> Result<f64, ReadError> {
+    let end = offset
+        .checked_add(8)
+        .ok_or(ReadError::Overflow("f64 byte range"))?;
     let slice = bytes
-        .get(offset..offset + 8)
+        .get(offset..end)
         .ok_or(ReadError::UnexpectedEof { offset, needed: 8 })?;
     Ok(f64::from_be_bytes([
         slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],

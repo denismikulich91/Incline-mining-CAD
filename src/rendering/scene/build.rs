@@ -9,19 +9,16 @@ use crate::{
     model::{Document, Object, ObjectId, SceneEntityId},
     rendering::{
         StrokeVertex, Vertex,
-        geometry::{
-            DrawContext, draw_line, draw_screen_cross, polyline_segments,
-            tessellate_polyline_stroke,
-        },
+        geometry::{DrawContext, draw_line, draw_screen_cross, tessellate_polyline_stroke},
         graphics::{
             DOC_LINE_WIDTH, DOC_TEXT_FONT_SIZE, INVALID_PREVIEW_COLOR, PREVIEW_COLOR,
             TEXT_EDIT_INDICATOR_COLOR, YELLOW_HIGHLIGHT_COLOR, make_translucent,
             text_bounds_corners,
         },
-        pick::{PickRecord, TextPickRecord},
+        pick::{PickRecord, TextPickRecord, world_bounds_from_local_positions},
         scene::{
             document::{
-                draw_origin_marker, fill_polygon_hatch, fill_polygon_solid, polygon_plane_frame,
+                draw_origin_marker, fill_polygon_hatch, fill_polygon_solid, polygon_hatch_spacing,
             },
             road::*,
         },
@@ -43,8 +40,48 @@ pub(crate) struct DocumentSceneBuildInput<'a> {
     pub(crate) textarea_depths: &'a mut Vec<f32>,
     pub(crate) pick_records: &'a mut Vec<PickRecord>,
     pub(crate) text_pick_records: &'a mut Vec<TextPickRecord>,
+    pub(crate) document_draw_batches: &'a mut Vec<DocumentDrawBatch>,
     pub(crate) scene_origin: DVec3,
     pub(crate) scale_factor: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DocumentPrimitive {
+    Fill,
+    Stroke,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DocumentRenderStage {
+    Opaque,
+    Translucent,
+    Overlay,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DocumentDrawBatch {
+    pub(crate) primitive: DocumentPrimitive,
+    pub(crate) index_range: (u32, u32),
+    pub(crate) center: DVec3,
+    stage: DocumentRenderStage,
+}
+
+impl DocumentDrawBatch {
+    pub(crate) fn stage(self, xray_enabled: bool) -> DocumentRenderStage {
+        if xray_enabled {
+            DocumentRenderStage::Overlay
+        } else {
+            self.stage
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DocumentObjectRanges {
+    entity: Option<SceneEntityId>,
+    stroke_index_range: (u32, u32),
+    fill_index_range: (u32, u32),
+    center: DVec3,
 }
 
 pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
@@ -60,6 +97,7 @@ pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
         textarea_depths,
         pick_records,
         text_pick_records,
+        document_draw_batches,
         scene_origin,
         scale_factor,
     } = input;
@@ -72,6 +110,9 @@ pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
     textarea_depths.clear();
     pick_records.clear();
     text_pick_records.clear();
+    document_draw_batches.clear();
+
+    let mut object_ranges = Vec::new();
 
     {
         let mut draw_ctx = DrawContext {
@@ -83,7 +124,14 @@ pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
             scale_factor,
         };
 
+        let origin_stroke_start = draw_ctx.stroke_index_buf.len() as u32;
         draw_origin_marker(&mut draw_ctx);
+        object_ranges.push(DocumentObjectRanges {
+            entity: None,
+            stroke_index_range: (origin_stroke_start, draw_ctx.stroke_index_buf.len() as u32),
+            fill_index_range: (0, 0),
+            center: DVec3::ZERO,
+        });
 
         // Static pass: roads resolve without the ghost. Roads the ghost
         // reshapes are suppressed here and drawn by `rebuild_dynamic_scene`
@@ -117,6 +165,7 @@ pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
             let stroke_index_start = draw_ctx.stroke_index_buf.len() as u32;
             let fill_start = draw_ctx.fill_vertex_buf.len() as u32;
             let fill_index_start = draw_ctx.fill_index_buf.len() as u32;
+            let mut fill_opaque = false;
             match object {
                 Object::Point { pos, .. } => {
                     draw_screen_cross(&mut draw_ctx, *pos, 6.0, DOC_LINE_WIDTH, rgba);
@@ -130,6 +179,8 @@ pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
                 } => {
                     let line_rgba = rgba;
                     let fill_rgba = document.object_fill_rgba(object);
+                    fill_opaque = *fill == crate::model::FillStyle::Solid
+                        && fill_rgba[3] >= 1.0 - f32::EPSILON;
                     tessellate_polyline_stroke(
                         &mut draw_ctx,
                         verts,
@@ -137,7 +188,7 @@ pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
                         *line_weight,
                         line_rgba,
                     );
-                    if *closed && verts.len() >= 3 {
+                    if *closed && verts.len() >= 2 {
                         match fill {
                             crate::model::FillStyle::Solid => {
                                 fill_polygon_solid(
@@ -149,29 +200,7 @@ pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
                                 );
                             }
                             crate::model::FillStyle::Slashes | crate::model::FillStyle::Crosses => {
-                                let hatch_spacing = {
-                                    let (centroid, axis_u, axis_v) = polygon_plane_frame(verts);
-                                    let pts_2d: Vec<[f64; 2]> = verts
-                                        .iter()
-                                        .map(|v| {
-                                            let d = v.pos - centroid;
-                                            [d.dot(axis_u), d.dot(axis_v)]
-                                        })
-                                        .collect();
-                                    let min_x =
-                                        pts_2d.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min);
-                                    let max_x = pts_2d
-                                        .iter()
-                                        .map(|p| p[0])
-                                        .fold(f64::NEG_INFINITY, f64::max);
-                                    let min_y =
-                                        pts_2d.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min);
-                                    let max_y = pts_2d
-                                        .iter()
-                                        .map(|p| p[1])
-                                        .fold(f64::NEG_INFINITY, f64::max);
-                                    ((max_x - min_x).max(max_y - min_y) / 15.0).max(f64::EPSILON)
-                                };
+                                let hatch_spacing = polygon_hatch_spacing(verts, 15.0);
                                 fill_polygon_hatch(
                                     &mut draw_ctx,
                                     verts,
@@ -292,24 +321,36 @@ pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
             let stroke_index_end = draw_ctx.stroke_index_buf.len() as u32;
             let fill_end = draw_ctx.fill_vertex_buf.len() as u32;
             let fill_index_end = draw_ctx.fill_index_buf.len() as u32;
+            if stroke_index_end > stroke_index_start || fill_index_end > fill_index_start {
+                object_ranges.push(DocumentObjectRanges {
+                    entity: Some(handle),
+                    stroke_index_range: (stroke_index_start, stroke_index_end),
+                    fill_index_range: (fill_index_start, fill_index_end),
+                    center: object_center(object),
+                });
+            }
             if (stroke_end > stroke_start || fill_end > fill_start)
                 && !editor.frozen_handles.contains(&handle)
+                && let Some(world_bounds) = world_bounds_from_local_positions(
+                    draw_ctx.stroke_vertex_buf[stroke_start as usize..stroke_end as usize]
+                        .iter()
+                        .map(|vertex| vertex.pos)
+                        .chain(
+                            draw_ctx.fill_vertex_buf[fill_start as usize..fill_end as usize]
+                                .iter()
+                                .map(|vertex| vertex.pos),
+                        ),
+                    scene_origin,
+                )
             {
-                let segments = match object {
-                    Object::Polyline { verts, closed, .. } => polyline_segments(verts, *closed),
-                    Object::Road { centerline, .. } => centerline
-                        .windows(2)
-                        .map(|w| [w[0].pos, w[1].pos])
-                        .collect(),
-                    _ => Vec::new(),
-                };
                 pick_records.push(PickRecord {
                     entity: handle,
+                    world_bounds,
                     stroke_range: (stroke_start, stroke_end),
                     stroke_index_range: (stroke_index_start, stroke_index_end),
                     fill_range: (fill_start, fill_end),
                     fill_index_range: (fill_index_start, fill_index_end),
-                    segments,
+                    fill_opaque,
                 });
             }
         }
@@ -376,6 +417,169 @@ pub(crate) fn rebuild_document_scene(input: DocumentSceneBuildInput<'_>) {
             }
         }
     }
+
+    rebuild_document_draw_batches(
+        document_draw_batches,
+        &object_ranges,
+        editor,
+        stroke_vertex_buf,
+        stroke_index_buf,
+        &lyon_buffer.vertices,
+        &lyon_buffer.indices,
+    );
+}
+
+fn object_center(object: &Object) -> DVec3 {
+    match object {
+        Object::Point { pos, .. } | Object::Text { pos, .. } => *pos,
+        Object::Polyline { verts, .. } => average_positions(verts.iter().map(|vertex| vertex.pos)),
+        Object::Road { centerline, .. } => {
+            average_positions(centerline.iter().map(|vertex| vertex.pos))
+        }
+    }
+}
+
+fn average_positions(points: impl Iterator<Item = DVec3>) -> DVec3 {
+    let (sum, count) = points.fold((DVec3::ZERO, 0usize), |(sum, count), point| {
+        (sum + point, count + 1)
+    });
+    if count == 0 {
+        DVec3::ZERO
+    } else {
+        sum / count as f64
+    }
+}
+
+fn rebuild_document_draw_batches(
+    batches: &mut Vec<DocumentDrawBatch>,
+    objects: &[DocumentObjectRanges],
+    editor: &EditorState,
+    stroke_vertices: &[StrokeVertex],
+    stroke_indices: &[u32],
+    fill_vertices: &[Vertex],
+    fill_indices: &[u32],
+) {
+    batches.clear();
+    for object in objects {
+        let overlay = object.entity.is_some_and(|entity| {
+            editor.selected_handles.contains(&entity)
+                || editor.tri_hover_handles.contains(&entity)
+                || editor
+                    .tool_highlight_id
+                    .is_some_and(|id| entity == SceneEntityId::Object(id))
+                || editor
+                    .editing_labels_id
+                    .is_some_and(|id| entity == SceneEntityId::Object(id))
+        });
+        append_alpha_runs(
+            batches,
+            DocumentPrimitive::Stroke,
+            object.stroke_index_range,
+            object.center,
+            overlay,
+            stroke_indices,
+            |index| {
+                stroke_vertices
+                    .get(index as usize)
+                    .map(|vertex| vertex.color[3])
+            },
+        );
+        append_alpha_runs(
+            batches,
+            DocumentPrimitive::Fill,
+            object.fill_index_range,
+            object.center,
+            overlay,
+            fill_indices,
+            |index| {
+                fill_vertices
+                    .get(index as usize)
+                    .map(|vertex| vertex.color[3])
+            },
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_alpha_runs(
+    batches: &mut Vec<DocumentDrawBatch>,
+    primitive: DocumentPrimitive,
+    index_range: (u32, u32),
+    center: DVec3,
+    overlay: bool,
+    indices: &[u32],
+    alpha_for_vertex: impl Fn(u32) -> Option<f32>,
+) {
+    let start = (index_range.0 as usize).min(indices.len());
+    let end = (index_range.1 as usize).min(indices.len());
+    let end = start + (end.saturating_sub(start) / 3) * 3;
+    if start >= end {
+        return;
+    }
+
+    let stage_for_triangle = |triangle_start: usize| {
+        if overlay {
+            DocumentRenderStage::Overlay
+        } else if indices
+            .get(triangle_start)
+            .and_then(|&index| alpha_for_vertex(index))
+            .unwrap_or(1.0)
+            < 0.999
+        {
+            DocumentRenderStage::Translucent
+        } else {
+            DocumentRenderStage::Opaque
+        }
+    };
+
+    let mut run_start = start;
+    let mut run_stage = stage_for_triangle(start);
+    for triangle_start in (start + 3..end).step_by(3) {
+        let stage = stage_for_triangle(triangle_start);
+        if stage == run_stage {
+            continue;
+        }
+        push_document_batch(
+            batches,
+            DocumentDrawBatch {
+                primitive,
+                index_range: (run_start as u32, triangle_start as u32),
+                center,
+                stage: run_stage,
+            },
+        );
+        run_start = triangle_start;
+        run_stage = stage;
+    }
+    push_document_batch(
+        batches,
+        DocumentDrawBatch {
+            primitive,
+            index_range: (run_start as u32, end as u32),
+            center,
+            stage: run_stage,
+        },
+    );
+}
+
+fn push_document_batch(batches: &mut Vec<DocumentDrawBatch>, batch: DocumentDrawBatch) {
+    // Fill and stroke indices live in separate streams, so batches of one
+    // primitive can remain contiguous even when the other primitive was
+    // appended between them. Coalescing opaque/overlay runs keeps large point
+    // and road documents at a handful of draw calls; translucent runs retain
+    // per-object centers for back-to-front sorting.
+    if let Some(previous) = batches
+        .iter_mut()
+        .rev()
+        .find(|previous| previous.primitive == batch.primitive)
+        && previous.stage == batch.stage
+        && previous.index_range.1 == batch.index_range.0
+        && (batch.stage != DocumentRenderStage::Translucent || previous.center == batch.center)
+    {
+        previous.index_range.1 = batch.index_range.1;
+        return;
+    }
+    batches.push(batch);
 }
 
 pub(crate) struct DynamicSceneBuildInput<'a> {

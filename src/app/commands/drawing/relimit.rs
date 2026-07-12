@@ -2,7 +2,7 @@ use glam::DVec3;
 
 use crate::{
     app::{App, PICK_THRESHOLD_PX},
-    model::{Command, Object, ObjectId, SceneEntityId},
+    model::{Command, Object, ObjectId, PolyVertex, SceneEntityId},
     rendering::pick,
     ui::state::{ActiveTool, RelimitCandidate, RelimitMode, TrimEnd},
     userspace_log, userspace_warn,
@@ -156,42 +156,16 @@ impl<'a> App<'a> {
         let vp = graphics.view_proj();
         let screen = graphics.screen_size_pub();
 
-        // Collect every intersection of the *infinite* source line with the
-        // target's segments, recorded as the parameter t along A→B (t=0 at A,
-        // t=1 at B; t<0 is beyond A, t>1 is beyond B).
-        //
-        // This is computed in world-space XY (ground plane), not screen space:
-        // a screen-space test depends on the current camera angle and clips out
-        // any endpoint that projects off-screen or behind the camera, which made
-        // picking unreliable in anything but a straight-down plan view.
-        let src_last = src_verts.len() - 1;
-        let a_world = src_verts[0].pos;
-        let b_world = src_verts[src_last].pos;
-        let a_xy = a_world.truncate();
-        let b_xy = b_world.truncate();
-        let mut crossings: Vec<(f64, DVec3)> = Vec::new();
-        let n = tgt_verts.len();
-        // Edge count: n-1 for an open polyline, plus the closing edge when closed.
-        let edge_count = if tgt_closed { n } else { n - 1 };
-        for i in 0..edge_count {
-            let c = tgt_verts[i].pos;
-            let d = tgt_verts[(i + 1) % n].pos;
-            if let Some(t) = line_line_intersect_t(a_xy, b_xy, c.truncate(), d.truncate()) {
-                crossings.push((t, a_world + t * (b_world - a_world)));
-            }
-        }
-        if crossings.is_empty() {
+        // Each end continues its own terminal segment. Using the first-to-last
+        // chord here makes every bent polyline relimit in the wrong direction.
+        let world_candidates = relimit_world_candidates(&src_verts, &tgt_verts, tgt_closed);
+        if world_candidates.is_empty() {
             userspace_warn!(
-                "Relimit: source line does not cross the selected target line in plan view"
+                "Relimit: neither terminal segment crosses the selected target line in plan view"
             );
             return;
         }
 
-        // Build the candidate operations. Endpoint A may move to any crossing on
-        // its side of B (t < 1); endpoint B to any on its side of A (t > 0). A
-        // crossing beyond the current span (t<0 for A, t>1 for B) extends the
-        // line (yellow); one inside the span (0<t<1) trims it (red).
-        //
         // The screen-space handle position is only used to pick which candidate
         // is nearest the cursor and to draw the hover marker — it's fine for it
         // to be approximate (or fall back to the anchor) when a point happens to
@@ -210,78 +184,23 @@ impl<'a> App<'a> {
             }
         };
 
-        let mut candidates: Vec<RelimitCandidate> = Vec::new();
-
-        // The trim/extend split is offset by a small slack in t (XY_TOL metres
-        // expressed as a fraction of the source span) so a crossing that lands
-        // right at (or a hair past) an endpoint — e.g. the other line was
-        // already relimited to touch here — is treated as a (near zero-length)
-        // trim rather than falling into neither bucket.
-        let touch_t = {
-            use crate::model::kernel;
-            kernel::XY_TOL / (b_xy - a_xy).length().max(kernel::XY_TOL)
-        };
-
-        // A-extend: nearest crossing with t < 0 (closest to A from outside).
-        if let Some(&(_, world)) = crossings
-            .iter()
-            .filter(|(t, _)| *t < -touch_t)
-            .max_by(|(t1, _), (t2, _)| t1.total_cmp(t2))
-        {
-            candidates.push(RelimitCandidate {
-                end: TrimEnd::Start,
-                target: world,
-                is_extension: true,
-                handle_px: mid_screen(a_world, world),
-            });
-        }
-        // A-trim: nearest interior crossing (smallest t in (0,1), closest to A).
-        if let Some(&(_, world)) = crossings
-            .iter()
-            .filter(|(t, _)| *t > -touch_t && *t < 1.0)
-            .min_by(|(t1, _), (t2, _)| t1.total_cmp(t2))
-        {
-            candidates.push(RelimitCandidate {
-                end: TrimEnd::Start,
-                target: world,
-                is_extension: false,
-                handle_px: mid_screen(a_world, world),
-            });
-        }
-        // B-trim: nearest interior crossing (largest t in (0,1), closest to B).
-        if let Some(&(_, world)) = crossings
-            .iter()
-            .filter(|(t, _)| *t > 0.0 && *t < 1.0 + touch_t)
-            .max_by(|(t1, _), (t2, _)| t1.total_cmp(t2))
-        {
-            candidates.push(RelimitCandidate {
-                end: TrimEnd::End,
-                target: world,
-                is_extension: false,
-                handle_px: mid_screen(b_world, world),
-            });
-        }
-        // B-extend: nearest crossing with t > 1 (closest to B from outside).
-        if let Some(&(_, world)) = crossings
-            .iter()
-            .filter(|(t, _)| *t > 1.0 + touch_t)
-            .min_by(|(t1, _), (t2, _)| t1.total_cmp(t2))
-        {
-            candidates.push(RelimitCandidate {
-                end: TrimEnd::End,
-                target: world,
-                is_extension: true,
-                handle_px: mid_screen(b_world, world),
-            });
-        }
-
-        if candidates.is_empty() {
-            userspace_warn!(
-                "Relimit: found {} crossing(s) but none usable (source endpoint sits exactly on the target)",
-                crossings.len()
-            );
-            return;
-        }
+        let start_world = src_verts[0].pos;
+        let end_world = src_verts[src_verts.len() - 1].pos;
+        let candidates: Vec<RelimitCandidate> = world_candidates
+            .into_iter()
+            .map(|candidate| {
+                let anchor = match candidate.end {
+                    TrimEnd::Start => start_world,
+                    TrimEnd::End => end_world,
+                };
+                RelimitCandidate {
+                    end: candidate.end,
+                    target: candidate.target,
+                    is_extension: candidate.is_extension,
+                    handle_px: mid_screen(anchor, candidate.target),
+                }
+            })
+            .collect();
 
         userspace_log!(
             "Relimit: picked target {second_id:?}, {} candidate end(s) available",
@@ -455,29 +374,15 @@ impl<'a> App<'a> {
         let mut after = before.clone();
         let resize_end = self.editor.relimit_resize_end;
         if let Object::Polyline { verts, .. } = &mut after {
-            if verts.len() < 2 {
+            let Some(position) = resized_terminal_position(verts, resize_end, mode, value) else {
                 return;
-            }
-            let start = verts[0].pos;
-            let end = verts[verts.len() - 1].pos;
-            let dir = end - start;
-            let current_len = dir.length();
-            if current_len < 1e-9 {
-                return;
-            }
-            let unit = dir / current_len;
-            let new_len = match mode {
-                RelimitMode::AbsoluteLength => value,
-                RelimitMode::RelativeLength => current_len + value,
-                RelimitMode::Intersect => return, // handled separately
             };
-            if !new_len.is_finite() || new_len <= 0.0 {
-                return;
-            }
-            let last = verts.len() - 1;
             match resize_end {
-                crate::ui::state::TrimEnd::End => verts[last].pos = start + unit * new_len,
-                crate::ui::state::TrimEnd::Start => verts[0].pos = end - unit * new_len,
+                TrimEnd::End => {
+                    let last = verts.len() - 1;
+                    verts[last].pos = position;
+                }
+                TrimEnd::Start => verts[0].pos = position,
             }
         }
 
@@ -530,4 +435,159 @@ fn line_line_intersect_t(
     let (point, _) = kernel::line_segment(a, b - a, c, d, kernel::XY_TOL)?;
     let r = b - a;
     Some((point - a).dot(r) / r.length_squared())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RelimitWorldCandidate {
+    end: TrimEnd,
+    target: DVec3,
+    is_extension: bool,
+}
+
+/// Find trim/extend candidates along the source's first and last segments.
+/// The target is tessellated first so a bulged target is not reduced to its
+/// stored endpoint chords.
+fn relimit_world_candidates(
+    source: &[PolyVertex],
+    target: &[PolyVertex],
+    target_closed: bool,
+) -> Vec<RelimitWorldCandidate> {
+    if source.len() < 2 || target.len() < 2 {
+        return Vec::new();
+    }
+    let target_points = crate::model::geometry::tessellate_polyline_bulges(target, target_closed);
+    if target_points.len() < 2 {
+        return Vec::new();
+    }
+
+    let target_edge_count = if target_closed {
+        target_points.len()
+    } else {
+        target_points.len() - 1
+    };
+    let crossings = |a: DVec3, b: DVec3| -> Vec<(f64, DVec3)> {
+        if (b - a).truncate().length_squared() <= f64::EPSILON {
+            return Vec::new();
+        }
+        (0..target_edge_count)
+            .filter_map(|i| {
+                let c = target_points[i];
+                let d = target_points[(i + 1) % target_points.len()];
+                line_line_intersect_t(a.truncate(), b.truncate(), c.truncate(), d.truncate())
+                    .map(|t| (t, a + t * (b - a)))
+            })
+            .collect()
+    };
+
+    let mut candidates = Vec::with_capacity(4);
+    let start_a = source[0].pos;
+    let start_b = source[1].pos;
+    let start_touch = crate::model::kernel::XY_TOL
+        / (start_b - start_a)
+            .truncate()
+            .length()
+            .max(crate::model::kernel::XY_TOL);
+    let start_crossings = crossings(start_a, start_b);
+    if let Some(&(_, target)) = start_crossings
+        .iter()
+        .filter(|(t, _)| *t < -start_touch)
+        .max_by(|(a, _), (b, _)| a.total_cmp(b))
+    {
+        candidates.push(RelimitWorldCandidate {
+            end: TrimEnd::Start,
+            target,
+            is_extension: true,
+        });
+    }
+    if let Some(&(_, target)) = start_crossings
+        .iter()
+        .filter(|(t, _)| *t >= -start_touch && *t < 1.0)
+        .min_by(|(a, _), (b, _)| a.total_cmp(b))
+    {
+        candidates.push(RelimitWorldCandidate {
+            end: TrimEnd::Start,
+            target,
+            is_extension: false,
+        });
+    }
+
+    let last = source.len() - 1;
+    let end_a = source[last - 1].pos;
+    let end_b = source[last].pos;
+    let end_touch = crate::model::kernel::XY_TOL
+        / (end_b - end_a)
+            .truncate()
+            .length()
+            .max(crate::model::kernel::XY_TOL);
+    let end_crossings = crossings(end_a, end_b);
+    if let Some(&(_, target)) = end_crossings
+        .iter()
+        .filter(|(t, _)| *t > 0.0 && *t <= 1.0 + end_touch)
+        .max_by(|(a, _), (b, _)| a.total_cmp(b))
+    {
+        candidates.push(RelimitWorldCandidate {
+            end: TrimEnd::End,
+            target,
+            is_extension: false,
+        });
+    }
+    if let Some(&(_, target)) = end_crossings
+        .iter()
+        .filter(|(t, _)| *t > 1.0 + end_touch)
+        .min_by(|(a, _), (b, _)| a.total_cmp(b))
+    {
+        candidates.push(RelimitWorldCandidate {
+            end: TrimEnd::End,
+            target,
+            is_extension: true,
+        });
+    }
+
+    candidates
+}
+
+fn resized_terminal_position(
+    verts: &[PolyVertex],
+    end: TrimEnd,
+    mode: RelimitMode,
+    value: f64,
+) -> Option<DVec3> {
+    if verts.len() < 2 || !value.is_finite() {
+        return None;
+    }
+    let lengths: Vec<f64> = verts
+        .windows(2)
+        .map(|pair| pair[0].pos.distance(pair[1].pos))
+        .collect();
+    if lengths.iter().any(|length| !length.is_finite()) {
+        return None;
+    }
+    let current_length: f64 = lengths.iter().sum();
+    let requested_length = match mode {
+        RelimitMode::AbsoluteLength => value,
+        RelimitMode::RelativeLength => current_length + value,
+        RelimitMode::Intersect => return None,
+    };
+    let terminal_index = match end {
+        TrimEnd::Start => 0,
+        TrimEnd::End => lengths.len() - 1,
+    };
+    let fixed_length = current_length - lengths[terminal_index];
+    let new_terminal_length = requested_length - fixed_length;
+    if !new_terminal_length.is_finite() || new_terminal_length <= 1e-9 {
+        return None;
+    }
+
+    match end {
+        TrimEnd::Start => {
+            let next = verts[1].pos;
+            let outward = verts[0].pos - next;
+            (outward.length() > 1e-9).then(|| next + outward.normalize() * new_terminal_length)
+        }
+        TrimEnd::End => {
+            let previous = verts[verts.len() - 2].pos;
+            let outward = verts[verts.len() - 1].pos - previous;
+            (outward.length() > 1e-9).then(|| previous + outward.normalize() * new_terminal_length)
+        }
+    }
 }

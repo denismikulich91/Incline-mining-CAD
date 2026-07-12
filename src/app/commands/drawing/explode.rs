@@ -45,9 +45,8 @@ impl<'a> App<'a> {
             SceneEntityId::Object(id)
                 if self
                     .workspace
-                    .project_index_for_object(id)
-                    .and_then(|index| self.workspace.projects.get(index))
-                    .and_then(|project| project.pidb.document.get_object(id))
+                    .active_document()
+                    .and_then(|document| document.get_object(id))
                     .is_some_and(|object| matches!(object, Object::Polyline { .. })) =>
             {
                 Some(id)

@@ -1,8 +1,8 @@
 //! Translation between Vulcan triangulations and common triangle-mesh formats.
 //!
-//! OBJ and ASCII PLY polygons are triangulated using a triangle fan. STL
-//! normals, OBJ materials/texture coordinates, and PLY properties other than
-//! positions and vertex indices are intentionally ignored.
+//! OBJ and PLY polygons are triangulated in their dominant plane. STL normals,
+//! OBJ materials/texture coordinates, and PLY properties other than positions
+//! and vertex indices are intentionally ignored.
 
 pub(crate) mod bmf;
 pub(crate) mod duf;
@@ -14,8 +14,7 @@ pub(crate) mod tri00t;
 use std::{
     collections::HashMap,
     error::Error,
-    fmt,
-    fs::{self, File},
+    fmt, fs,
     io::{self, Write},
     path::Path,
 };
@@ -131,16 +130,21 @@ pub fn write_mesh_with_progress(
 ) -> Result<(), TranslationError> {
     let path = path.as_ref();
     let format = MeshFormat::from_path(path).ok_or_else(|| unsupported_path(path))?;
-    let file = File::create(path)?;
-    let mut writer = io::BufWriter::new(file);
-    match format {
-        MeshFormat::Obj => write_obj_with_progress(mesh, &mut writer, progress)?,
-        MeshFormat::Stl => write_stl_with_progress(mesh, &mut writer, progress)?,
-        MeshFormat::Ply => write_ply_with_progress(mesh, &mut writer, progress)?,
-        MeshFormat::T00 => mesh.write_00t_with_progress(&mut writer, progress)?,
-    }
-    writer.flush()?;
-    Ok(())
+    crate::model::atomic_file::write_atomic(path, |file| {
+        let mut writer = io::BufWriter::new(file);
+        match format {
+            MeshFormat::Obj => write_obj_with_progress(mesh, &mut writer, progress)?,
+            MeshFormat::Stl => write_stl_with_progress(mesh, &mut writer, progress)?,
+            MeshFormat::Ply => write_ply_with_progress(mesh, &mut writer, progress)?,
+            MeshFormat::T00 => mesh.write_00t_with_progress(&mut writer, progress)?,
+        }
+        writer.flush()?;
+        Ok(())
+    })
+    .map_err(|error| match error.downcast::<TranslationError>() {
+        Ok(translation) => translation,
+        Err(error) => TranslationError::Io(io::Error::other(error)),
+    })
 }
 
 /// How many vertices/faces to write between progress callbacks.
@@ -208,7 +212,7 @@ pub fn read_obj_bytes(bytes: &[u8]) -> Result<Triangulation, TranslationError> {
                 .map(|field| parse_obj_index(field, *vcount_at_point, *line_number))
                 .collect::<Result<Vec<_>, _>>()?;
             let mut tris = Vec::new();
-            triangulate(&polygon, &mut tris, *line_number)?;
+            triangulate(&polygon, &vertices, &mut tris, *line_number)?;
             Ok(tris)
         })
         .collect::<Result<Vec<Vec<[u32; 3]>>, TranslationError>>()?;
@@ -281,25 +285,90 @@ fn read_ascii_stl(bytes: &[u8]) -> Result<Triangulation, TranslationError> {
     let mut vertices = Vec::new();
     let mut triangles = Vec::new();
     let mut indices = HashMap::<[u32; 3], u32>::new();
-    let mut current = Vec::new();
+    let mut in_solid = false;
+    let mut in_facet = false;
+    let mut in_loop = false;
+    let mut loop_closed = false;
+    let mut current = [0u32; 3];
+    let mut current_len = 0usize;
     for (line_index, line) in text.lines().enumerate() {
+        let line_number = line_index + 1;
         let mut fields = line.split_whitespace();
-        if fields.next() != Some("vertex") {
+        let Some(keyword) = fields.next() else {
             continue;
-        }
-        let xyz = [
-            parse_f32(fields.next(), line_index + 1, "vertex x")?,
-            parse_f32(fields.next(), line_index + 1, "vertex y")?,
-            parse_f32(fields.next(), line_index + 1, "vertex z")?,
-        ];
-        current.push(intern_stl_vertex(xyz, &mut vertices, &mut indices)?);
-        if current.len() == 3 {
-            triangles.push([current[0], current[1], current[2]]);
-            current.clear();
+        };
+        match keyword {
+            "solid" if !in_solid && !in_facet => in_solid = true,
+            "facet" if in_solid && !in_facet => {
+                if fields.next() != Some("normal") {
+                    return Err(invalid(Some(line_number), "expected 'facet normal x y z'"));
+                }
+                for axis in ["normal x", "normal y", "normal z"] {
+                    parse_f32(fields.next(), line_number, axis)?;
+                }
+                if fields.next().is_some() {
+                    return Err(invalid(Some(line_number), "extra data after facet normal"));
+                }
+                in_facet = true;
+                loop_closed = false;
+                current_len = 0;
+            }
+            "outer" if in_facet && !in_loop && !loop_closed => {
+                if fields.next() != Some("loop") || fields.next().is_some() {
+                    return Err(invalid(Some(line_number), "expected 'outer loop'"));
+                }
+                in_loop = true;
+            }
+            "vertex" if in_facet && in_loop => {
+                if current_len >= 3 {
+                    return Err(invalid(
+                        Some(line_number),
+                        "ASCII STL facet has more than 3 vertices",
+                    ));
+                }
+                let xyz = [
+                    parse_f32(fields.next(), line_number, "vertex x")?,
+                    parse_f32(fields.next(), line_number, "vertex y")?,
+                    parse_f32(fields.next(), line_number, "vertex z")?,
+                ];
+                if fields.next().is_some() {
+                    return Err(invalid(Some(line_number), "extra data after STL vertex"));
+                }
+                current[current_len] = intern_stl_vertex(xyz, &mut vertices, &mut indices)?;
+                current_len += 1;
+            }
+            "endloop" if in_facet && in_loop => {
+                if fields.next().is_some() || current_len != 3 {
+                    return Err(invalid(
+                        Some(line_number),
+                        "ASCII STL loop must contain exactly 3 vertices",
+                    ));
+                }
+                in_loop = false;
+                loop_closed = true;
+            }
+            "endfacet" if in_facet && !in_loop && loop_closed => {
+                if fields.next().is_some() {
+                    return Err(invalid(Some(line_number), "extra data after endfacet"));
+                }
+                triangles.push(current);
+                in_facet = false;
+                loop_closed = false;
+                current_len = 0;
+            }
+            "endsolid" if in_solid && !in_facet => {
+                in_solid = false;
+            }
+            _ => {
+                return Err(invalid(
+                    Some(line_number),
+                    format!("unexpected ASCII STL record '{keyword}'"),
+                ));
+            }
         }
     }
-    if !current.is_empty() {
-        return Err(invalid(None, "incomplete ASCII STL facet"));
+    if in_solid || in_facet || in_loop {
+        return Err(invalid(None, "incomplete ASCII STL structure"));
     }
     build_mesh(vertices, triangles)
 }
@@ -372,6 +441,21 @@ enum PlyScalar {
     F64,
 }
 
+impl PlyScalar {
+    const fn byte_len(self) -> usize {
+        match self {
+            Self::I8 | Self::U8 => 1,
+            Self::I16 | Self::U16 => 2,
+            Self::I32 | Self::U32 | Self::F32 => 4,
+            Self::F64 => 8,
+        }
+    }
+
+    const fn is_integer(self) -> bool {
+        !matches!(self, Self::F32 | Self::F64)
+    }
+}
+
 #[derive(Clone, Debug)]
 enum PlyProperty {
     Scalar {
@@ -385,12 +469,29 @@ enum PlyProperty {
     },
 }
 
+#[derive(Clone, Debug)]
+struct PlyElement {
+    name: String,
+    count: usize,
+    properties: Vec<PlyProperty>,
+}
+
 struct PlyHeader {
     format: PlyFormat,
-    vertex_count: usize,
-    face_count: usize,
-    vertex_properties: Vec<PlyProperty>,
-    face_properties: Vec<PlyProperty>,
+    elements: Vec<PlyElement>,
+}
+
+impl PlyHeader {
+    fn element(&self, name: &str) -> Result<&PlyElement, TranslationError> {
+        let mut matching = self.elements.iter().filter(|element| element.name == name);
+        let element = matching
+            .next()
+            .ok_or_else(|| invalid(None, format!("missing PLY {name} element")))?;
+        if matching.next().is_some() {
+            return Err(invalid(None, format!("duplicate PLY {name} element")));
+        }
+        Ok(element)
+    }
 }
 
 fn parse_ply_header(text: &str) -> Result<PlyHeader, TranslationError> {
@@ -399,11 +500,8 @@ fn parse_ply_header(text: &str) -> Result<PlyHeader, TranslationError> {
         return Err(invalid(Some(1), "missing PLY signature"));
     }
     let mut format = None;
-    let mut vertex_count = None;
-    let mut face_count = None;
-    let mut element = "";
-    let mut vertex_properties = Vec::new();
-    let mut face_properties = Vec::new();
+    let mut elements = Vec::<PlyElement>::new();
+    let mut current_element = None;
     for (line_index, line) in lines.iter().enumerate() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         match fields.as_slice() {
@@ -416,54 +514,60 @@ fn parse_ply_header(text: &str) -> Result<PlyHeader, TranslationError> {
                     "big-endian binary PLY is not supported".into(),
                 ));
             }
-            ["element", "vertex", count] => {
-                vertex_count = count.parse().ok();
-                element = "vertex";
-            }
-            ["element", "face", count] => {
-                face_count = count.parse().ok();
-                element = "face";
-            }
-            ["element", name, _] => element = name,
-            ["property", data_type, name] if element == "vertex" || element == "face" => {
-                let property = PlyProperty::Scalar {
-                    data_type: parse_ply_scalar(data_type, line_index + 1)?,
+            ["element", name, count] => {
+                let count = count
+                    .parse::<usize>()
+                    .map_err(|_| invalid(Some(line_index + 1), "invalid PLY element count"))?;
+                elements.push(PlyElement {
                     name: (*name).to_string(),
-                };
-                if element == "vertex" {
-                    vertex_properties.push(property);
-                } else {
-                    face_properties.push(property);
-                }
+                    count,
+                    properties: Vec::new(),
+                });
+                current_element = Some(elements.len() - 1);
             }
-            ["property", "list", count_type, item_type, name]
-                if element == "vertex" || element == "face" =>
-            {
-                if element == "vertex" {
+            ["property", "list", count_type, item_type, name] => {
+                let element_index = current_element.ok_or_else(|| {
+                    invalid(
+                        Some(line_index + 1),
+                        "PLY property appears before an element",
+                    )
+                })?;
+                let count_type = parse_ply_scalar(count_type, line_index + 1)?;
+                if !count_type.is_integer() {
                     return Err(invalid(
                         Some(line_index + 1),
-                        "list property is invalid for PLY vertices",
+                        "PLY list count type must be an integer",
                     ));
                 }
-                face_properties.push(PlyProperty::List {
-                    count_type: parse_ply_scalar(count_type, line_index + 1)?,
+                elements[element_index].properties.push(PlyProperty::List {
+                    count_type,
                     item_type: parse_ply_scalar(item_type, line_index + 1)?,
                     name: (*name).to_string(),
                 });
             }
+            ["property", data_type, name] => {
+                let element_index = current_element.ok_or_else(|| {
+                    invalid(
+                        Some(line_index + 1),
+                        "PLY property appears before an element",
+                    )
+                })?;
+                elements[element_index]
+                    .properties
+                    .push(PlyProperty::Scalar {
+                        data_type: parse_ply_scalar(data_type, line_index + 1)?,
+                        name: (*name).to_string(),
+                    });
+            }
+            ["end_header"] => break,
             _ => {}
         }
     }
     let format = format.ok_or_else(|| invalid(None, "missing or unsupported PLY format"))?;
-    let vertex_count = vertex_count.ok_or_else(|| invalid(None, "missing PLY vertex element"))?;
-    let face_count = face_count.ok_or_else(|| invalid(None, "missing PLY face element"))?;
-    Ok(PlyHeader {
-        format,
-        vertex_count,
-        face_count,
-        vertex_properties,
-        face_properties,
-    })
+    let header = PlyHeader { format, elements };
+    header.element("vertex")?;
+    header.element("face")?;
+    Ok(header)
 }
 
 fn parse_ply_scalar(name: &str, line: usize) -> Result<PlyScalar, TranslationError> {
@@ -483,10 +587,10 @@ fn parse_ply_scalar(name: &str, line: usize) -> Result<PlyScalar, TranslationErr
     }
 }
 
-fn ply_position_properties(header: &PlyHeader) -> Result<[usize; 3], TranslationError> {
+fn ply_position_properties(element: &PlyElement) -> Result<[usize; 3], TranslationError> {
     let positions = ["x", "y", "z"].map(|name| {
-        header
-            .vertex_properties
+        element
+            .properties
             .iter()
             .position(|property| matches!(property, PlyProperty::Scalar { name: property_name, .. } if property_name == name))
     });
@@ -498,136 +602,261 @@ fn ply_position_properties(header: &PlyHeader) -> Result<[usize; 3], Translation
 
 fn read_ascii_ply(bytes: &[u8], header: &PlyHeader) -> Result<Triangulation, TranslationError> {
     let text = std::str::from_utf8(bytes).map_err(|_| invalid(None, "invalid ASCII PLY data"))?;
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.len() < header.vertex_count + header.face_count {
-        return Err(invalid(None, "PLY data is truncated"));
-    }
-    let positions = ply_position_properties(header)?;
-    let mut vertices = Vec::with_capacity(header.vertex_count);
-    for (row, line) in lines.iter().take(header.vertex_count).enumerate() {
-        let line_number = row + 1;
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        let value = |axis: usize| -> Result<f64, TranslationError> {
-            fields
-                .get(positions[axis])
-                .and_then(|v| v.parse().ok())
-                .filter(|v: &f64| v.is_finite())
-                .ok_or_else(|| invalid(Some(line_number), "invalid PLY vertex coordinate"))
-        };
-        vertices.push(Vertex::new(value(0)?, value(1)?, value(2)?));
-    }
-    let mut triangles = Vec::new();
-    for row in 0..header.face_count {
-        let line_number = header.vertex_count + row + 1;
-        let fields: Vec<&str> = lines[header.vertex_count + row]
-            .split_whitespace()
-            .collect();
-        let mut field_index = 0;
-        let mut polygon = None;
-        for property in &header.face_properties {
-            match property {
-                PlyProperty::Scalar { .. } => {
-                    fields
-                        .get(field_index)
-                        .ok_or_else(|| invalid(Some(line_number), "truncated PLY face"))?;
-                    field_index += 1;
-                }
-                PlyProperty::List { name, .. } => {
-                    let count = fields
-                        .get(field_index)
-                        .and_then(|value| value.parse::<usize>().ok())
-                        .ok_or_else(|| invalid(Some(line_number), "invalid PLY face"))?;
-                    field_index += 1;
-                    if fields.len() < field_index + count {
-                        return Err(invalid(Some(line_number), "truncated PLY face"));
-                    }
-                    let values = fields[field_index..field_index + count]
+    let vertex_element = header.element("vertex")?;
+    let positions = ply_position_properties(vertex_element)?;
+    let mut rows = text.lines().enumerate();
+    let mut vertices = Vec::new();
+    let mut polygons = Vec::<(Vec<u32>, usize)>::new();
+
+    for element in &header.elements {
+        for _ in 0..element.count {
+            let (line_index, line) = rows
+                .next()
+                .ok_or_else(|| invalid(None, "PLY data is truncated"))?;
+            let line_number = line_index + 1;
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let mut field_index = 0usize;
+
+            if element.name == "vertex" {
+                let mut xyz = [0.0; 3];
+                for (property_index, property) in element.properties.iter().enumerate() {
+                    let values = ascii_ply_property_values(
+                        &fields,
+                        &mut field_index,
+                        property,
+                        line_number,
+                    )?;
+                    if let Some(axis) = positions
                         .iter()
-                        .map(|value| {
-                            value
-                                .parse::<u32>()
-                                .map_err(|_| invalid(Some(line_number), "invalid PLY face index"))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    field_index += count;
-                    if name == "vertex_indices" || name == "vertex_index" {
-                        polygon = Some(values);
+                        .position(|position| *position == property_index)
+                    {
+                        xyz[axis] = values[0]
+                            .parse::<f64>()
+                            .ok()
+                            .filter(|value| value.is_finite())
+                            .ok_or_else(|| {
+                                invalid(Some(line_number), "invalid PLY vertex coordinate")
+                            })?;
                     }
+                }
+                vertices.push(Vertex::new(xyz[0], xyz[1], xyz[2]));
+            } else if element.name == "face" {
+                let mut polygon = None;
+                for property in &element.properties {
+                    let values = ascii_ply_property_values(
+                        &fields,
+                        &mut field_index,
+                        property,
+                        line_number,
+                    )?;
+                    if matches!(property, PlyProperty::List { name, .. } if name == "vertex_indices" || name == "vertex_index")
+                    {
+                        polygon = Some(
+                            values
+                                .iter()
+                                .map(|value| {
+                                    value.parse::<u32>().map_err(|_| {
+                                        invalid(Some(line_number), "invalid PLY face index")
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, _>>()?,
+                        );
+                    }
+                }
+                polygons.push((
+                    polygon.ok_or_else(|| {
+                        invalid(Some(line_number), "PLY face has no vertex_indices property")
+                    })?,
+                    line_number,
+                ));
+            } else {
+                for property in &element.properties {
+                    ascii_ply_property_values(&fields, &mut field_index, property, line_number)?;
                 }
             }
         }
-        let polygon = polygon
-            .ok_or_else(|| invalid(Some(line_number), "PLY face has no vertex_indices property"))?;
-        if polygon.iter().any(|i| *i as usize >= vertices.len()) {
-            return Err(invalid(Some(line_number), "PLY face index is out of range"));
-        }
-        triangulate(&polygon, &mut triangles, line_number)?;
+    }
+
+    let mut triangles = Vec::new();
+    for (polygon, line_number) in polygons {
+        triangulate(&polygon, &vertices, &mut triangles, line_number)?;
     }
     build_mesh(vertices, triangles)
 }
 
+fn ascii_ply_property_values<'a>(
+    fields: &'a [&str],
+    field_index: &mut usize,
+    property: &PlyProperty,
+    line: usize,
+) -> Result<&'a [&'a str], TranslationError> {
+    let count = match property {
+        PlyProperty::Scalar { .. } => 1,
+        PlyProperty::List { .. } => {
+            let count = fields
+                .get(*field_index)
+                .and_then(|value| value.parse::<usize>().ok())
+                .ok_or_else(|| invalid(Some(line), "invalid PLY list count"))?;
+            *field_index = field_index
+                .checked_add(1)
+                .ok_or_else(|| invalid(Some(line), "PLY list count is too large"))?;
+            count
+        }
+    };
+    let end = field_index
+        .checked_add(count)
+        .ok_or_else(|| invalid(Some(line), "PLY list count is too large"))?;
+    let values = fields
+        .get(*field_index..end)
+        .ok_or_else(|| invalid(Some(line), "PLY row is truncated"))?;
+    *field_index = end;
+    Ok(values)
+}
+
 fn read_binary_ply(bytes: &[u8], header: &PlyHeader) -> Result<Triangulation, TranslationError> {
-    let positions = ply_position_properties(header)?;
+    let vertex_element = header.element("vertex")?;
+    let positions = ply_position_properties(vertex_element)?;
     let mut offset = 0;
-    let mut vertices = Vec::with_capacity(header.vertex_count);
-    for _ in 0..header.vertex_count {
-        let mut xyz = [0.0; 3];
-        for (property_index, property) in header.vertex_properties.iter().enumerate() {
-            let PlyProperty::Scalar { data_type, .. } = property else {
-                unreachable!()
-            };
-            let value = read_ply_number(bytes, &mut offset, *data_type)?;
-            if let Some(axis) = positions
-                .iter()
-                .position(|position| *position == property_index)
-            {
-                xyz[axis] = value;
+    let mut vertices = Vec::new();
+    let mut polygons = Vec::<(Vec<u32>, usize)>::new();
+
+    for element in &header.elements {
+        for element_index in 0..element.count {
+            if element.name == "vertex" {
+                let mut xyz = [0.0; 3];
+                for (property_index, property) in element.properties.iter().enumerate() {
+                    match property {
+                        PlyProperty::Scalar { data_type, .. } => {
+                            let value = read_ply_number(bytes, &mut offset, *data_type)?;
+                            if let Some(axis) = positions
+                                .iter()
+                                .position(|position| *position == property_index)
+                            {
+                                xyz[axis] = value;
+                            }
+                        }
+                        PlyProperty::List {
+                            count_type,
+                            item_type,
+                            ..
+                        } => skip_binary_ply_list(bytes, &mut offset, *count_type, *item_type)?,
+                    }
+                }
+                if !xyz.iter().all(|value| value.is_finite()) {
+                    return Err(invalid(None, "PLY contains non-finite coordinates"));
+                }
+                vertices.push(Vertex::new(xyz[0], xyz[1], xyz[2]));
+            } else if element.name == "face" {
+                let mut polygon = None;
+                for property in &element.properties {
+                    match property {
+                        PlyProperty::Scalar { data_type, .. } => {
+                            read_ply_number(bytes, &mut offset, *data_type)?;
+                        }
+                        PlyProperty::List {
+                            count_type,
+                            item_type,
+                            name,
+                        } => {
+                            let count = read_ply_integer(bytes, &mut offset, *count_type)?;
+                            ensure_binary_ply_items(bytes, offset, count, *item_type)?;
+                            if name == "vertex_indices" || name == "vertex_index" {
+                                if !item_type.is_integer() {
+                                    return Err(invalid(
+                                        None,
+                                        "PLY face indices must use an integer type",
+                                    ));
+                                }
+                                let mut values = Vec::new();
+                                values.try_reserve_exact(count).map_err(|_| {
+                                    invalid(None, "PLY face list is too large to allocate")
+                                })?;
+                                for _ in 0..count {
+                                    let value = read_ply_integer(bytes, &mut offset, *item_type)?;
+                                    values.push(
+                                        u32::try_from(value).map_err(|_| {
+                                            TranslationError::TooLarge("face index")
+                                        })?,
+                                    );
+                                }
+                                polygon = Some(values);
+                            } else {
+                                offset = offset
+                                    .checked_add(
+                                        count.checked_mul(item_type.byte_len()).ok_or_else(
+                                            || invalid(None, "PLY list byte length overflows"),
+                                        )?,
+                                    )
+                                    .ok_or_else(|| {
+                                        invalid(None, "PLY list byte length overflows")
+                                    })?;
+                            }
+                        }
+                    }
+                }
+                polygons.push((
+                    polygon
+                        .ok_or_else(|| invalid(None, "PLY face has no vertex_indices property"))?,
+                    element_index + 1,
+                ));
+            } else {
+                for property in &element.properties {
+                    match property {
+                        PlyProperty::Scalar { data_type, .. } => {
+                            read_ply_number(bytes, &mut offset, *data_type)?;
+                        }
+                        PlyProperty::List {
+                            count_type,
+                            item_type,
+                            ..
+                        } => skip_binary_ply_list(bytes, &mut offset, *count_type, *item_type)?,
+                    }
+                }
             }
         }
-        if !xyz.iter().all(|value| value.is_finite()) {
-            return Err(invalid(None, "PLY contains non-finite coordinates"));
-        }
-        vertices.push(Vertex::new(xyz[0], xyz[1], xyz[2]));
     }
+
     let mut triangles = Vec::new();
-    for face_index in 0..header.face_count {
-        let mut polygon = None;
-        for property in &header.face_properties {
-            match property {
-                PlyProperty::Scalar { data_type, .. } => {
-                    read_ply_number(bytes, &mut offset, *data_type)?;
-                }
-                PlyProperty::List {
-                    count_type,
-                    item_type,
-                    name,
-                } => {
-                    let count = read_ply_integer(bytes, &mut offset, *count_type)?;
-                    let mut values = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        let value = read_ply_integer(bytes, &mut offset, *item_type)?;
-                        values.push(
-                            u32::try_from(value)
-                                .map_err(|_| TranslationError::TooLarge("face index"))?,
-                        );
-                    }
-                    if name == "vertex_indices" || name == "vertex_index" {
-                        polygon = Some(values);
-                    }
-                }
-            }
-        }
-        let polygon =
-            polygon.ok_or_else(|| invalid(None, "PLY face has no vertex_indices property"))?;
-        if polygon
-            .iter()
-            .any(|index| *index as usize >= vertices.len())
-        {
-            return Err(invalid(None, "PLY face index is out of range"));
-        }
-        triangulate(&polygon, &mut triangles, face_index + 1)?;
+    for (polygon, face_index) in polygons {
+        triangulate(&polygon, &vertices, &mut triangles, face_index)?;
     }
     build_mesh(vertices, triangles)
+}
+
+fn ensure_binary_ply_items(
+    bytes: &[u8],
+    offset: usize,
+    count: usize,
+    item_type: PlyScalar,
+) -> Result<(), TranslationError> {
+    let byte_len = count
+        .checked_mul(item_type.byte_len())
+        .ok_or_else(|| invalid(None, "PLY list byte length overflows"))?;
+    let end = offset
+        .checked_add(byte_len)
+        .ok_or_else(|| invalid(None, "PLY list byte length overflows"))?;
+    if end > bytes.len() {
+        return Err(invalid(None, "binary PLY data is truncated"));
+    }
+    Ok(())
+}
+
+fn skip_binary_ply_list(
+    bytes: &[u8],
+    offset: &mut usize,
+    count_type: PlyScalar,
+    item_type: PlyScalar,
+) -> Result<(), TranslationError> {
+    let count = read_ply_integer(bytes, offset, count_type)?;
+    ensure_binary_ply_items(bytes, *offset, count, item_type)?;
+    *offset = offset
+        .checked_add(
+            count
+                .checked_mul(item_type.byte_len())
+                .ok_or_else(|| invalid(None, "PLY list byte length overflows"))?,
+        )
+        .ok_or_else(|| invalid(None, "PLY list byte length overflows"))?;
+    Ok(())
 }
 
 fn read_ply_number(
@@ -636,10 +865,13 @@ fn read_ply_number(
     data_type: PlyScalar,
 ) -> Result<f64, TranslationError> {
     let take = |offset: &mut usize, size: usize| -> Result<&[u8], TranslationError> {
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| invalid(None, "binary PLY offset overflows"))?;
         let value = bytes
-            .get(*offset..*offset + size)
+            .get(*offset..end)
             .ok_or_else(|| invalid(None, "binary PLY data is truncated"))?;
-        *offset += size;
+        *offset = end;
         Ok(value)
     };
     Ok(match data_type {
@@ -683,8 +915,7 @@ pub fn write_obj_with_progress(
     let face_count = mesh.face_count().max(1);
     writeln!(writer, "# exported by vulcan-formats")?;
     for (i, v) in mesh.vertices().iter().enumerate() {
-        // Convert Z-up coordinates back to OBJ's Y-up convention.
-        writeln!(writer, "v {:.12} {:.12} {:.12}", v.x, v.z, -v.y)?;
+        writeln!(writer, "v {:.12} {:.12} {:.12}", v.x, v.y, v.z)?;
         if i % WRITE_PROGRESS_STRIDE == 0 {
             progress(0.5 * i as f32 / vertex_count as f32);
         }
@@ -704,40 +935,78 @@ pub fn write_stl_with_progress(
     writer: &mut impl Write,
     progress: &mut dyn FnMut(f32),
 ) -> io::Result<()> {
+    // Validate the full mesh before emitting a header. Binary STL stores
+    // coordinates as f32 even though the in-memory mesh uses f64.
+    let stl_face_count = u32::try_from(mesh.face_count()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "STL face count exceeds the format limit",
+        )
+    })?;
+    for vertex in mesh.vertices() {
+        for value in vertex.as_array() {
+            finite_stl_f32(value)?;
+        }
+    }
+    for triangle in mesh.triangles() {
+        stl_normal(triangle.vertices)?;
+    }
+
     let mut header = [0u8; 80];
     let label = b"binary STL from vulcan-formats";
     header[..label.len()].copy_from_slice(label);
     writer.write_all(&header)?;
-    writer.write_all(&(mesh.face_count() as u32).to_le_bytes())?;
+    writer.write_all(&stl_face_count.to_le_bytes())?;
     let face_count = mesh.face_count().max(1);
     for (face_index, triangle) in mesh.triangles().enumerate() {
         if face_index % WRITE_PROGRESS_STRIDE == 0 {
             progress(face_index as f32 / face_count as f32);
         }
-        let a = triangle.vertices[0];
-        let b = triangle.vertices[1];
-        let c = triangle.vertices[2];
-        let ux = b.x - a.x;
-        let uy = b.y - a.y;
-        let uz = b.z - a.z;
-        let vx = c.x - a.x;
-        let vy = c.y - a.y;
-        let vz = c.z - a.z;
-        let mut normal = [uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx];
-        let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
-        if length > 0.0 {
-            normal.iter_mut().for_each(|v| *v /= length);
-        }
+        let normal = stl_normal(triangle.vertices)?;
         for value in normal
             .into_iter()
             .chain(triangle.vertices.into_iter().flat_map(Vertex::as_array))
         {
-            writer.write_all(&(value as f32).to_le_bytes())?;
+            writer.write_all(&finite_stl_f32(value)?.to_le_bytes())?;
         }
         writer.write_all(&0u16.to_le_bytes())?;
     }
     progress(1.0);
     Ok(())
+}
+
+fn finite_stl_f32(value: f64) -> io::Result<f32> {
+    let narrowed = value as f32;
+    if narrowed.is_finite() {
+        Ok(narrowed)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "STL coordinate is outside the finite f32 range",
+        ))
+    }
+}
+
+fn stl_normal(vertices: [Vertex; 3]) -> io::Result<[f64; 3]> {
+    let [a, b, c] = vertices;
+    let u = [b.x - a.x, b.y - a.y, b.z - a.z];
+    let v = [c.x - a.x, c.y - a.y, c.z - a.z];
+    let mut normal = [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ];
+    let length = normal.iter().map(|value| value * value).sum::<f64>().sqrt();
+    if !length.is_finite() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "STL triangle normal is not finite",
+        ));
+    }
+    if length > 0.0 {
+        normal.iter_mut().for_each(|value| *value /= length);
+    }
+    Ok(normal)
 }
 
 pub fn write_ply_with_progress(
@@ -779,15 +1048,77 @@ pub fn write_ply_with_progress(
 
 fn triangulate(
     polygon: &[u32],
+    vertices: &[Vertex],
     output: &mut Vec<[u32; 3]>,
     line: usize,
 ) -> Result<(), TranslationError> {
     if polygon.len() < 3 {
         return Err(invalid(Some(line), "face has fewer than three vertices"));
     }
-    for i in 1..polygon.len() - 1 {
-        output.push([polygon[0], polygon[i], polygon[i + 1]]);
+    if polygon
+        .iter()
+        .any(|index| *index as usize >= vertices.len())
+    {
+        return Err(invalid(Some(line), "face index is out of range"));
     }
+    if polygon.len() == 3 {
+        output.push([polygon[0], polygon[1], polygon[2]]);
+        return Ok(());
+    }
+
+    // Project onto the polygon's dominant plane so vertical and tilted faces
+    // triangulate just as correctly as horizontal ones. Scale first so valid
+    // but very large finite coordinates cannot overflow Newell/earcut math.
+    let coordinate_scale = polygon
+        .iter()
+        .flat_map(|index| vertices[*index as usize].as_array())
+        .map(f64::abs)
+        .fold(0.0_f64, f64::max);
+    if coordinate_scale == 0.0 || !coordinate_scale.is_finite() {
+        return Err(invalid(Some(line), "face is degenerate"));
+    }
+    let scaled = polygon
+        .iter()
+        .map(|index| {
+            vertices[*index as usize]
+                .as_array()
+                .map(|value| value / coordinate_scale)
+        })
+        .collect::<Vec<_>>();
+    let mut normal = [0.0_f64; 3];
+    for index in 0..polygon.len() {
+        let current = scaled[index];
+        let next = scaled[(index + 1) % polygon.len()];
+        normal[0] += (current[1] - next[1]) * (current[2] + next[2]);
+        normal[1] += (current[2] - next[2]) * (current[0] + next[0]);
+        normal[2] += (current[0] - next[0]) * (current[1] + next[1]);
+    }
+    if !normal.iter().all(|value| value.is_finite()) || normal.iter().all(|value| *value == 0.0) {
+        return Err(invalid(Some(line), "face is degenerate"));
+    }
+    let drop_axis = normal
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+        .map(|(axis, _)| axis)
+        .unwrap_or(2);
+    let projected = scaled.into_iter().map(|vertex| match drop_axis {
+        0 => [vertex[1], vertex[2]],
+        1 => [vertex[0], vertex[2]],
+        _ => [vertex[0], vertex[1]],
+    });
+    let mut local_triangles = Vec::<usize>::new();
+    earcut::Earcut::new().earcut(projected, &[], &mut local_triangles);
+    if local_triangles.len() < 3 || !local_triangles.len().is_multiple_of(3) {
+        return Err(invalid(Some(line), "face could not be triangulated"));
+    }
+    output.extend(local_triangles.chunks_exact(3).map(|triangle| {
+        [
+            polygon[triangle[0]],
+            polygon[triangle[1]],
+            polygon[triangle[2]],
+        ]
+    }));
     Ok(())
 }
 
@@ -809,7 +1140,7 @@ fn build_mesh(
             "mesh contains non-finite coordinates".into(),
         ));
     }
-    Ok(Triangulation::from_vertices_and_faces(vertices, triangles))
+    Ok(Triangulation::from_vertices_and_faces(vertices, triangles)?)
 }
 
 fn parse_f64(value: Option<&str>, line: usize, name: &str) -> Result<f64, TranslationError> {

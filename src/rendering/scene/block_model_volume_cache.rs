@@ -7,10 +7,13 @@ use super::gpu_cache::{block_model_color_values, grade_for_block};
 use crate::model::block_model::{ColorTransferFunction, OpenBlockModel};
 use glam::{DVec3, Vec3};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use wgpu::util::DeviceExt;
 
-pub(crate) const MAX_VOLUME_CELL_BYTES: usize = 8 * 1024 * 1024 * 1024;
+/// Hard CPU/backing-store ceiling for the optional volume path. Models above
+/// it fall back to the already bounded cube renderer instead of doing several
+/// GiB of synchronous cell construction during a frame.
+pub(crate) const MAX_VOLUME_CELL_BYTES: usize = 1024 * 1024 * 1024;
+const MAX_VOLUME_METADATA_BYTES: usize = 512 * 1024 * 1024;
 pub(crate) const BRICK_SIZE: usize = 8;
 pub(crate) const CELLS_PER_BRICK: usize = BRICK_SIZE * BRICK_SIZE * BRICK_SIZE;
 pub(crate) const EMPTY_BRICK: u32 = u32::MAX;
@@ -66,6 +69,110 @@ pub(crate) struct CachedBlockVolumeGpu {
     pub(crate) bounds_max: glam::Vec3,
 }
 
+impl CachedBlockVolumeGpu {
+    /// Nearest visible volume cell along a model-local ray. This mirrors the
+    /// volume asset's sparse occupancy rather than treating its outer AABB as
+    /// solid, so document picks remain possible through genuine holes.
+    pub(crate) fn nearest_opaque_cell_hit(
+        &self,
+        ray_origin: Vec3,
+        ray_direction: Vec3,
+        color_transfer: &ColorTransferFunction,
+        fallback_alpha: f32,
+    ) -> Option<f32> {
+        let asset = &self.asset;
+        let brick_dims = asset.brick_dims.map(|value| value as usize);
+        let dims = asset.dims.map(|value| value as usize);
+        let mut nearest = f32::INFINITY;
+        for (ordinal, &brick_index) in asset.occupied_brick_indices.iter().enumerate() {
+            if asset.brick_aggregates[ordinal][3] <= 0.0 {
+                continue;
+            }
+            let brick_index = brick_index as usize;
+            let bi = brick_index % brick_dims[0];
+            let bj = (brick_index / brick_dims[0]) % brick_dims[1];
+            let bk = brick_index / (brick_dims[0] * brick_dims[1]);
+            let starts = [bi * BRICK_SIZE, bj * BRICK_SIZE, bk * BRICK_SIZE];
+            let ends = [
+                (starts[0] + BRICK_SIZE).min(dims[0]),
+                (starts[1] + BRICK_SIZE).min(dims[1]),
+                (starts[2] + BRICK_SIZE).min(dims[2]),
+            ];
+            let brick_min = Vec3::new(
+                asset.x_planes[starts[0]],
+                asset.y_planes[starts[1]],
+                asset.z_planes[starts[2]],
+            );
+            let brick_max = Vec3::new(
+                asset.x_planes[ends[0]],
+                asset.y_planes[ends[1]],
+                asset.z_planes[ends[2]],
+            );
+            if ray_box_distance_f32(ray_origin, ray_direction, brick_min, brick_max)
+                .is_none_or(|distance| distance >= nearest)
+            {
+                continue;
+            }
+            let cells = asset.cells.brick_cells(ordinal as u32);
+            for k in starts[2]..ends[2] {
+                for j in starts[1]..ends[1] {
+                    for i in starts[0]..ends[0] {
+                        let local_index =
+                            brick_local_index(i - starts[0], j - starts[1], k - starts[2]);
+                        let payload = cells[local_index];
+                        let alpha = if payload == EMPTY_CELL_PAYLOAD {
+                            0.0
+                        } else if payload & FALLBACK_CELL_FLAG != 0 {
+                            fallback_alpha
+                        } else {
+                            ramp_rgba(color_transfer, (payload & 0xffff) as f32 / 65535.0)[3]
+                        };
+                        if alpha < 0.98 {
+                            continue;
+                        }
+                        let cell_min =
+                            Vec3::new(asset.x_planes[i], asset.y_planes[j], asset.z_planes[k]);
+                        let cell_max = Vec3::new(
+                            asset.x_planes[i + 1],
+                            asset.y_planes[j + 1],
+                            asset.z_planes[k + 1],
+                        );
+                        if let Some(distance) =
+                            ray_box_distance_f32(ray_origin, ray_direction, cell_min, cell_max)
+                            && distance < nearest
+                        {
+                            nearest = distance;
+                        }
+                    }
+                }
+            }
+        }
+        nearest.is_finite().then_some(nearest)
+    }
+}
+
+fn ray_box_distance_f32(origin: Vec3, direction: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
+    let mut near = 0.0_f32;
+    let mut far = f32::INFINITY;
+    for axis in 0..3 {
+        if direction[axis].abs() <= f32::EPSILON {
+            if origin[axis] < min[axis] || origin[axis] > max[axis] {
+                return None;
+            }
+            continue;
+        }
+        let inverse = direction[axis].recip();
+        let first = (min[axis] - origin[axis]) * inverse;
+        let second = (max[axis] - origin[axis]) * inverse;
+        near = near.max(first.min(second));
+        far = far.min(first.max(second));
+        if near > far {
+            return None;
+        }
+    }
+    Some(near)
+}
+
 pub(crate) enum CellBacking {
     Ram(Vec<u32>),
     Mapped(MappedCells),
@@ -73,13 +180,11 @@ pub(crate) enum CellBacking {
 
 pub(crate) struct MappedCells {
     mmap: memmap2::Mmap,
-    path: std::path::PathBuf,
-}
-
-impl Drop for MappedCells {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
+    // Keep the anonymous temporary file alive for exactly as long as its
+    // mapping. `tempfile()` unlinks immediately on Unix and uses
+    // delete-on-close on Windows, so the OS also cleans it after a crash.
+    // Declaring the mapping first makes it drop before the file handle.
+    _file: std::fs::File,
 }
 
 impl CellBacking {
@@ -95,11 +200,14 @@ impl CellBacking {
 
 enum CellBackingBuilder {
     Ram(Vec<u32>),
-    Mapped {
-        file: std::fs::File,
-        mmap: memmap2::MmapMut,
-        path: std::path::PathBuf,
-    },
+    Mapped(MappedCellBackingBuilder),
+}
+
+struct MappedCellBackingBuilder {
+    // Drop the mapping before its delete-on-close file handle on every early
+    // return from sizing, initialization, flush, or read-only conversion.
+    mmap: memmap2::MmapMut,
+    file: std::fs::File,
 }
 
 const MAX_VOLUME_RAM_CELL_BYTES: usize = 256 * 1024 * 1024;
@@ -119,51 +227,73 @@ impl CellBackingBuilder {
     }
 
     fn new_mapped(cell_count: usize) -> Result<Self, String> {
-        let bytes = cell_count * std::mem::size_of::<u32>();
-        let path = std::env::temp_dir().join(format!(
-            "proinspector-volume-{}-{}.cells",
-            std::process::id(),
-            NEXT_BACKING_ID.fetch_add(1, Ordering::Relaxed),
-        ));
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|e| format!("temp cell file {}: {e}", path.display()))?;
+        Self::new_mapped_in(cell_count, &std::env::temp_dir())
+    }
+
+    fn new_mapped_in(cell_count: usize, directory: &std::path::Path) -> Result<Self, String> {
+        let bytes = cell_count
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| "cell byte size overflows usize".to_owned())?;
+        // Unlike a named PID/counter path, `tempfile_in` creates a private,
+        // unpredictable file and asks the OS to make it anonymous. Its File
+        // handle owns cleanup immediately, including every failure below.
+        let file = create_anonymous_cell_file(directory)?;
         file.set_len(bytes as u64)
             .map_err(|e| format!("sizing temp cell file to {bytes} bytes: {e}"))?;
         let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file) }
             .map_err(|e| format!("mapping temp cell file: {e}"))?;
         let words: &mut [u32] = bytemuck::cast_slice_mut(&mut mmap[..]);
         words.fill(EMPTY_CELL_PAYLOAD);
-        Ok(CellBackingBuilder::Mapped { file, mmap, path })
+        Ok(CellBackingBuilder::Mapped(MappedCellBackingBuilder {
+            mmap,
+            file,
+        }))
     }
 
     fn as_mut_slice(&mut self) -> &mut [u32] {
         match self {
             CellBackingBuilder::Ram(v) => v.as_mut_slice(),
-            CellBackingBuilder::Mapped { mmap, .. } => bytemuck::cast_slice_mut(&mut mmap[..]),
+            CellBackingBuilder::Mapped(mapped) => bytemuck::cast_slice_mut(&mut mapped.mmap[..]),
         }
     }
 
     fn finish(self) -> Result<CellBacking, String> {
         match self {
             CellBackingBuilder::Ram(v) => Ok(CellBacking::Ram(v)),
-            CellBackingBuilder::Mapped { file, mmap, path } => {
-                mmap.flush()
+            CellBackingBuilder::Mapped(mapped) => {
+                mapped
+                    .mmap
+                    .flush()
                     .map_err(|e| format!("flushing temp cell file: {e}"))?;
-                let mmap = mmap
+                let mmap = mapped
+                    .mmap
                     .make_read_only()
                     .map_err(|e| format!("sealing temp cell file: {e}"))?;
-                drop(file);
-                Ok(CellBacking::Mapped(MappedCells { mmap, path }))
+                Ok(CellBacking::Mapped(MappedCells {
+                    mmap,
+                    _file: mapped.file,
+                }))
             }
         }
     }
 }
 
-static NEXT_BACKING_ID: AtomicU64 = AtomicU64::new(0);
+fn create_anonymous_cell_file(directory: &std::path::Path) -> Result<std::fs::File, String> {
+    let file = tempfile::tempfile_in(directory)
+        .map_err(|e| format!("creating anonymous temp cell file: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Linux's O_TMPFILE path can inherit OpenOptions' default mode. The
+        // file is already anonymous here, so tightening it has no exposure
+        // window, and the owned handle still cleans up if chmod fails.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("restricting anonymous temp cell file permissions: {e}"))?;
+    }
+    Ok(file)
+}
+
 const NO_OCCUPANT: u32 = u32::MAX;
 
 pub(crate) struct BrickStreamer {
@@ -342,6 +472,10 @@ pub(crate) struct BlockVolumeAsset {
     z_planes: Vec<f32>,
     pub(crate) cells: CellBacking,
     pub(crate) brick_table: Vec<u32>,
+    /// Brick-table index for each occupied ordinal. Cached because style
+    /// changes are frequent and rediscovering/sorting this mapping walked the
+    /// entire sparse address space on every colour-picker tick.
+    occupied_brick_indices: Vec<u32>,
     pub(crate) brick_aggregates: Vec<[f32; 4]>,
     pub(crate) brick_uniform: Vec<bool>,
     brick_centers: Vec<[f32; 3]>,
@@ -353,30 +487,14 @@ pub(crate) struct BlockVolumeAsset {
     reference_len: f32,
 }
 
-pub(crate) fn build_block_volume_gpu(
+pub(crate) fn upload_block_volume_gpu(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     scene_origin: DVec3,
     block_model: &OpenBlockModel,
-    translucent: bool,
     layout: &wgpu::BindGroupLayout,
+    asset: BlockVolumeAsset,
 ) -> Option<CachedBlockVolumeGpu> {
-    if !translucent {
-        return None;
-    }
-
-    let asset = match build_block_volume_asset(block_model) {
-        Ok(Some(asset)) => asset,
-        Ok(None) => return None,
-        Err(message) => {
-            log::warn!(
-                "Block model '{}' volume raycast cache rejected: {message}; falling back to cube transparency",
-                block_model.name
-            );
-            return None;
-        }
-    };
-
     let storage_limit = device.limits().max_storage_buffer_binding_size;
     let max_buffer = device.limits().max_buffer_size;
 
@@ -471,13 +589,13 @@ pub(crate) fn build_block_volume_gpu(
         contents: bytemuck::cast_slice(&streamer.all_info()),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
-    for &(slot, ordinal) in &seed.uploads {
-        queue.write_buffer(
-            &cell_pool_buffer,
-            slot as u64 * slot_bytes,
-            bytemuck::cast_slice(asset.cells.brick_cells(ordinal)),
-        );
-    }
+    write_cell_uploads(
+        queue,
+        &cell_pool_buffer,
+        &asset.cells,
+        &seed.uploads,
+        slot_bytes,
+    );
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         layout,
         entries: &[
@@ -560,32 +678,84 @@ pub(crate) fn stream_volume_bricks(
 ) {
     if volume.streamer.needs_replan(camera_local) {
         let evictions = volume.streamer.replan(camera_local);
-        for (ordinal, info) in evictions {
-            queue.write_buffer(
-                &volume.brick_info_buffer,
-                ordinal as u64 * std::mem::size_of::<u32>() as u64,
-                bytemuck::bytes_of(&info),
-            );
-        }
+        write_info_updates(queue, &volume.brick_info_buffer, evictions);
     }
     if !volume.streamer.has_pending() {
         return;
     }
     let plan = volume.streamer.drain(VOLUME_MAX_UPLOADS_PER_UPDATE);
     let slot_bytes = (CELLS_PER_BRICK * std::mem::size_of::<u32>()) as u64;
-    for (slot, ordinal) in plan.uploads {
-        queue.write_buffer(
-            &volume.cell_pool_buffer,
-            slot as u64 * slot_bytes,
-            bytemuck::cast_slice(volume.asset.cells.brick_cells(ordinal)),
-        );
+    write_cell_uploads(
+        queue,
+        &volume.cell_pool_buffer,
+        &volume.asset.cells,
+        &plan.uploads,
+        slot_bytes,
+    );
+    write_info_updates(queue, &volume.brick_info_buffer, plan.info_updates);
+}
+
+/// Upload consecutive pool slots together. The streamer commonly assigns a
+/// long run of neighbouring free slots; issuing one write per 2 KiB brick made
+/// camera movement spend much more CPU time in queue submission than copying.
+/// Cap each temporary batch so seeding a very large pool stays memory-bounded.
+fn write_cell_uploads(
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    cells: &CellBacking,
+    uploads: &[(u32, u32)],
+    slot_bytes: u64,
+) {
+    const MAX_BATCH_BRICKS: usize = 1024;
+    if uploads.is_empty() {
+        return;
     }
-    for (ordinal, info) in plan.info_updates {
+    let mut ordered = uploads.to_vec();
+    ordered.sort_unstable_by_key(|&(slot, _)| slot);
+    let mut start = 0;
+    while start < ordered.len() {
+        let first_slot = ordered[start].0;
+        let mut end = start + 1;
+        while end < ordered.len()
+            && end - start < MAX_BATCH_BRICKS
+            && ordered[end].0 == ordered[end - 1].0 + 1
+        {
+            end += 1;
+        }
+        let mut packed = Vec::with_capacity((end - start) * CELLS_PER_BRICK);
+        for &(_, ordinal) in &ordered[start..end] {
+            packed.extend_from_slice(cells.brick_cells(ordinal));
+        }
         queue.write_buffer(
-            &volume.brick_info_buffer,
-            ordinal as u64 * std::mem::size_of::<u32>() as u64,
-            bytemuck::bytes_of(&info),
+            buffer,
+            u64::from(first_slot) * slot_bytes,
+            bytemuck::cast_slice(&packed),
         );
+        start = end;
+    }
+}
+
+/// Coalesce neighbouring ordinal updates into a small number of queue writes.
+fn write_info_updates(queue: &wgpu::Queue, buffer: &wgpu::Buffer, mut updates: Vec<(u32, u32)>) {
+    const MAX_BATCH_INFOS: usize = 16 * 1024;
+    updates.sort_unstable_by_key(|&(ordinal, _)| ordinal);
+    let mut start = 0;
+    while start < updates.len() {
+        let first_ordinal = updates[start].0;
+        let mut end = start + 1;
+        while end < updates.len()
+            && end - start < MAX_BATCH_INFOS
+            && updates[end].0 == updates[end - 1].0 + 1
+        {
+            end += 1;
+        }
+        let infos: Vec<u32> = updates[start..end].iter().map(|&(_, info)| info).collect();
+        queue.write_buffer(
+            buffer,
+            u64::from(first_ordinal) * std::mem::size_of::<u32>() as u64,
+            bytemuck::cast_slice(&infos),
+        );
+        start = end;
     }
 }
 
@@ -705,7 +875,24 @@ pub(crate) fn apply_scene_to_local(rows: &[[f32; 4]; 3], scene: Vec3) -> Vec3 {
     Vec3::new(axis(&rows[0]), axis(&rows[1]), axis(&rows[2]))
 }
 
-fn build_block_volume_asset(
+fn validate_volume_metadata_budget(brick_count: usize) -> Result<(), String> {
+    // Dense address/occupancy tables plus the worst-case per-occupied-brick
+    // aggregate, centre, uniform/residency and streaming metadata. Keep this
+    // estimate deliberately conservative; cell payloads have their own cap.
+    const BYTES_PER_BRICK_UPPER_BOUND: usize = 64;
+    let bytes = brick_count
+        .checked_mul(BYTES_PER_BRICK_UPPER_BOUND)
+        .ok_or_else(|| "brick metadata byte size overflows usize".to_owned())?;
+    if bytes > MAX_VOLUME_METADATA_BYTES || brick_count > u32::MAX as usize {
+        return Err(format!(
+            "brick grid metadata would require at least {} MiB",
+            bytes / (1024 * 1024)
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn build_block_volume_asset(
     block_model: &OpenBlockModel,
 ) -> Result<Option<BlockVolumeAsset>, String> {
     let Some((x_planes, y_planes, z_planes)) = block_volume_planes(block_model) else {
@@ -721,6 +908,7 @@ fn build_block_volume_asset(
         .into_iter()
         .try_fold(1usize, |acc, dim| acc.checked_mul(dim))
         .ok_or_else(|| "brick grid dimensions overflow usize".to_owned())?;
+    validate_volume_metadata_budget(brick_count)?;
     let color_values = block_model_color_values(block_model);
 
     struct PlacedBlock {
@@ -728,8 +916,12 @@ fn build_block_volume_asset(
         range: [[usize; 2]; 3],
     }
     let mut placed: Vec<PlacedBlock> = Vec::new();
-    let mut brick_occupied = vec![false; brick_count];
-    for &block_index in &block_model.renderable_block_indices {
+    let mut brick_occupied = Vec::new();
+    brick_occupied
+        .try_reserve_exact(brick_count)
+        .map_err(|error| format!("could not allocate brick occupancy table: {error}"))?;
+    brick_occupied.resize(brick_count, false);
+    for &block_index in block_model.renderable_block_indices.iter() {
         let Some(block) = block_model.blocks.get(block_index).copied() else {
             continue;
         };
@@ -794,14 +986,20 @@ fn build_block_volume_asset(
         ));
     }
 
-    let mut brick_table = vec![EMPTY_BRICK; brick_count];
+    let mut brick_table = Vec::new();
+    brick_table
+        .try_reserve_exact(brick_count)
+        .map_err(|error| format!("could not allocate brick address table: {error}"))?;
+    brick_table.resize(brick_count, EMPTY_BRICK);
     let mut brick_centers = vec![[0.0f32; 3]; occupied_count];
+    let mut occupied_brick_indices = Vec::with_capacity(occupied_count);
     let mut next_ordinal = 0u32;
     for (bindex, &occ) in brick_occupied.iter().enumerate() {
         if !occ {
             continue;
         }
         brick_table[bindex] = next_ordinal;
+        occupied_brick_indices.push(bindex as u32);
         let bi = bindex % brick_dims_usize[0];
         let bj = (bindex / brick_dims_usize[0]) % brick_dims_usize[1];
         let bk = bindex / (brick_dims_usize[0] * brick_dims_usize[1]);
@@ -873,6 +1071,7 @@ fn build_block_volume_asset(
         z_planes,
         cells,
         brick_table,
+        occupied_brick_indices,
         brick_aggregates: Vec::new(),
         brick_uniform: Vec::new(),
         brick_centers,
@@ -954,18 +1153,13 @@ fn compute_brick_style_data(
     let y_lengths = cell_lengths(&asset.y_planes);
     let z_lengths = cell_lengths(&asset.z_planes);
 
-    let mut occupied: Vec<(usize, u32)> = asset
-        .brick_table
-        .iter()
-        .enumerate()
-        .filter(|&(_, &ordinal)| ordinal != EMPTY_BRICK)
-        .map(|(bindex, &ordinal)| (bindex, ordinal))
-        .collect();
-    occupied.sort_unstable_by_key(|&(_, ordinal)| ordinal);
-
-    let per_brick: Vec<([f32; 4], bool)> = occupied
+    let per_brick: Vec<([f32; 4], bool)> = asset
+        .occupied_brick_indices
         .par_iter()
-        .map(|&(bindex, ordinal)| {
+        .enumerate()
+        .map(|(ordinal, &bindex)| {
+            let bindex = bindex as usize;
+            let ordinal = ordinal as u32;
             let bi = bindex % brick_dims[0];
             let bj = (bindex / brick_dims[0]) % brick_dims[1];
             let bk = bindex / (brick_dims[0] * brick_dims[1]);
@@ -1045,7 +1239,7 @@ fn block_volume_planes(block_model: &OpenBlockModel) -> Option<(Vec<f32>, Vec<f3
     let mut x_planes = Vec::new();
     let mut y_planes = Vec::new();
     let mut z_planes = Vec::new();
-    for &index in &block_model.renderable_block_indices {
+    for &index in block_model.renderable_block_indices.iter() {
         let Some(block) = block_model.blocks.get(index) else {
             continue;
         };

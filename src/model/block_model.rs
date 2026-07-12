@@ -30,10 +30,11 @@ pub(crate) struct LoadedBlockModel {
     pub(crate) source: BlockModelSource,
     pub(crate) model: BmfModel,
     pub(crate) bdf: Option<BdfDefinition>,
-    pub(crate) blocks: Vec<BlockBounds>,
-    pub(crate) renderable_block_indices: Vec<usize>,
+    pub(crate) blocks: Arc<Vec<BlockBounds>>,
+    pub(crate) renderable_block_indices: Arc<Vec<usize>>,
     pub(crate) world_bounds: Option<(DVec3, DVec3)>,
-    pub(crate) scene_was_empty: bool,
+    pub(crate) active_numeric_variable: Option<String>,
+    pub(crate) active_values_cache: ActiveValuesCache,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -95,8 +96,8 @@ pub(crate) struct OpenBlockModel {
     pub(crate) source: BlockModelSource,
     pub(crate) model: BmfModel,
     pub(crate) bdf: Option<BdfDefinition>,
-    pub(crate) blocks: Vec<BlockBounds>,
-    pub(crate) renderable_block_indices: Vec<usize>,
+    pub(crate) blocks: Arc<Vec<BlockBounds>>,
+    pub(crate) renderable_block_indices: Arc<Vec<usize>>,
     pub(crate) visible: bool,
     pub(crate) color: [f32; 4],
     pub(crate) active_numeric_variable: Option<String>,
@@ -129,6 +130,51 @@ pub(crate) struct ActiveValuesCacheEntry {
 }
 
 impl OpenBlockModel {
+    /// Decode the initially selected variable while the model is still on the
+    /// loader worker. This prevents the first render from materialising and
+    /// scanning a whole BMF column on the UI/render thread.
+    pub(crate) fn prepare_active_values_cache(
+        model: &BmfModel,
+        renderable_block_indices: &[usize],
+        variable: Option<&str>,
+    ) -> ActiveValuesCache {
+        let Some(name) = variable else {
+            return RefCell::new(None);
+        };
+        let values = model.numeric_values(name).ok().map(Arc::new);
+        let range = values.as_ref().and_then(|values| {
+            let default = model.variable(name).and_then(numeric_variable_default);
+            render_value_range(values, renderable_block_indices, default)
+        });
+        RefCell::new(Some(ActiveValuesCacheEntry {
+            variable: name.to_owned(),
+            values,
+            range,
+        }))
+    }
+
+    pub(crate) fn begin_active_values_decode(&self, variable: &str) {
+        *self.active_values_cache.borrow_mut() = Some(ActiveValuesCacheEntry {
+            variable: variable.to_owned(),
+            values: None,
+            range: None,
+        });
+    }
+
+    pub(crate) fn install_active_values_cache(&self, prepared: ActiveValuesCache) {
+        *self.active_values_cache.borrow_mut() = prepared.into_inner();
+    }
+
+    pub(crate) fn active_values_available_for_render(&self) -> bool {
+        let Some(variable) = self.active_numeric_variable.as_deref() else {
+            return true;
+        };
+        self.active_values_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|entry| entry.variable == variable && entry.values.is_some())
+    }
+
     pub(crate) fn entity_id(&self) -> crate::model::SceneEntityId {
         crate::model::SceneEntityId::BlockModel(self.id)
     }
@@ -243,8 +289,11 @@ pub(crate) fn is_no_data_sentinel(value: f64) -> bool {
 /// The (min, max) of `values` at `indices`, skipping non-finite values, the
 /// variable's default/"unset" value, and Vulcan's common -99/-999 sentinel
 /// "no grade" values, so real ore values don't collapse into one colour.
-/// `None` when no value in range is usable. Shared by the renderer's grade
-/// colouring and the UI's colour-scale legend so both agree on the range.
+/// `None` when no value in range is usable. A constant column deliberately
+/// returns a degenerate `(value, value)` range; callers map that case to the
+/// first ramp stop instead of treating valid data as if no variable existed.
+/// Shared by the renderer's grade colouring and the UI's colour-scale legend
+/// so both agree on the range.
 pub(crate) fn render_value_range(
     values: &[f64],
     indices: &[usize],
@@ -265,7 +314,7 @@ pub(crate) fn render_value_range(
         min = min.min(value);
         max = max.max(value);
     }
-    (min.is_finite() && max.is_finite() && max > min).then_some((min, max))
+    (min.is_finite() && max.is_finite()).then_some((min, max))
 }
 
 fn block_corners(block: BlockBounds) -> [DVec3; 8] {

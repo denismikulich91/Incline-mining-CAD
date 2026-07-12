@@ -95,10 +95,9 @@ impl<'a> App<'a> {
     }
 
     fn begin_text_edit(&mut self, object_id: ObjectId, created: bool) {
-        let Some(project_index) = self.workspace.project_index_for_object(object_id) else {
+        let Some(document) = self.workspace.active_document() else {
             return;
         };
-        let document = &self.workspace.projects[project_index].pidb.document;
         let Some(
             object @ Object::Text {
                 layer,
@@ -115,10 +114,6 @@ impl<'a> App<'a> {
             (*layer, content.clone(), *height, rotation.to_degrees());
         let pending_color = document.object_rgba(object);
 
-        if self.workspace.active_index != Some(project_index) {
-            self.history.clear();
-        }
-        self.workspace.set_active_index(project_index);
         self.editor.active_layer = Some(layer);
         self.editor.selected_handles.clear();
         self.editor
@@ -146,13 +141,10 @@ impl<'a> App<'a> {
         rotation_degrees: f64,
         color: [f32; 4],
     ) {
-        let Some(project_index) = self.workspace.project_index_for_object(object_id) else {
+        let Some(document) = self.workspace.active_document_mut() else {
             self.finish_text_edit_state();
             return;
         };
-        self.workspace.set_active_index(project_index);
-        let project = &mut self.workspace.projects[project_index];
-        let document = &mut project.pidb.document;
         let Some(before) = document.get_object(object_id).cloned() else {
             self.finish_text_edit_state();
             return;
@@ -207,11 +199,10 @@ impl<'a> App<'a> {
         if created
             && let Some(object_id) = object_id
             && let Some(project_index) = self.workspace.project_index_for_object(object_id)
+            && let Some(project) = self.workspace.projects.get_mut(project_index)
+            && project.pidb.document.get_object(object_id).is_some()
         {
-            self.workspace.set_active_index(project_index);
-            let project = &mut self.workspace.projects[project_index];
             project.pidb.document.remove_object(object_id);
-            project.invalidate_dirty_layers();
             self.editor
                 .selected_handles
                 .remove(&SceneEntityId::Object(object_id));

@@ -15,7 +15,6 @@ pub(crate) struct LoadedTriangulation {
     pub(crate) spatial: Arc<crate::model::spatial::TriangleBvh>,
     pub(crate) edges: Vec<[u32; 2]>,
     pub(crate) surface_face_order: Arc<Vec<u32>>,
-    pub(crate) scene_was_empty: bool,
 }
 
 /// A freshly generated triangulation with its mesh, BVH and edge list already
@@ -56,6 +55,9 @@ pub(crate) struct OpenTriangulation {
     pub(crate) color: [f32; 4],
     pub(crate) line_color: [f32; 4],
     pub(crate) line_weight: Option<f32>,
+    /// Optional georeferenced raster draped over this surface in world XY.
+    pub(crate) raster_texture: Option<crate::model::raster::RasterTextureId>,
+    pub(crate) raster_opacity: f32,
 }
 
 impl OpenTriangulation {

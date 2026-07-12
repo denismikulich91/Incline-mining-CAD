@@ -82,7 +82,7 @@ pub(crate) fn draw_delete_layer_confirm_dialog(
     commands: &mut Vec<UiCommand>,
     editor: &mut EditorState,
 ) {
-    let Some((project_index, layer_id, name)) = editor.pending_delete_layer.clone() else {
+    let Some((layer_id, name)) = editor.pending_delete_layer.clone() else {
         return;
     };
     let mut open = true;
@@ -96,7 +96,7 @@ pub(crate) fn draw_delete_layer_confirm_dialog(
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("Delete Layer").clicked() {
-                    commands.push(UiCommand::DeleteLayer(project_index, layer_id));
+                    commands.push(UiCommand::DeleteLayer(layer_id));
                 }
                 if ui.button("Cancel").clicked() {
                     editor.pending_delete_layer = None;
@@ -108,20 +108,20 @@ pub(crate) fn draw_delete_layer_confirm_dialog(
     }
 }
 
-/// Draw the confirmation dialog shown before removing a dirty PIDB.
-pub(crate) fn draw_close_project_dialog(
+/// Draw the confirmation dialog shown before closing a dirty PIDB.
+pub(crate) fn draw_close_pidb_dialog(
     ui: &mut egui::Ui,
     commands: &mut Vec<UiCommand>,
     editor: &mut EditorState,
     project: &UiProjectView,
 ) {
-    let Some(project_index) = editor.pending_close_project else {
+    let Some(runtime_id) = editor.pending_close_pidb else {
         return;
     };
     let name = project
         .projects
         .iter()
-        .find(|entry| entry.index == project_index)
+        .find(|entry| entry.runtime_id == runtime_id)
         .map(|entry| entry.name.as_str())
         .unwrap_or("this PIDB");
     let mut open = true;
@@ -130,22 +130,22 @@ pub(crate) fn draw_close_project_dialog(
         .min_width(320.0)
         .show(ui.ctx(), |ui| {
             ui.set_max_width(320.);
-            ui.label(format!("Save changes to '{name}' before removing it?"));
+            ui.label(format!("Save changes to '{name}' before closing it?"));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("Save and Remove").clicked() {
-                    commands.push(UiCommand::SaveAndClosePidb(project_index));
+                if ui.button("Save and Close").clicked() {
+                    commands.push(UiCommand::SaveAndClosePidb(runtime_id));
                 }
-                if ui.button("Remove Without Saving").clicked() {
-                    commands.push(UiCommand::ClosePidbForce(project_index));
+                if ui.button("Close Without Saving").clicked() {
+                    commands.push(UiCommand::ClosePidbForce(runtime_id));
                 }
                 if ui.button("Cancel").clicked() {
-                    editor.pending_close_project = None;
+                    editor.pending_close_pidb = None;
                 }
             });
         });
     if !open {
-        editor.pending_close_project = None;
+        editor.pending_close_pidb = None;
     }
 }
 
@@ -184,43 +184,6 @@ pub(crate) fn draw_confirm_load_all_folder_dialog(
         });
     if !open {
         editor.confirm_load_all_folder = None;
-    }
-}
-
-pub(crate) fn draw_pending_unload_layer_dialog(
-    ui: &mut egui::Ui,
-    commands: &mut Vec<UiCommand>,
-    editor: &mut EditorState,
-) {
-    let (proj_idx, layer_id, name) = match editor.pending_unload_queue.first() {
-        Some(p) => p.clone(),
-        None => return,
-    };
-    let mut open = true;
-    DragableMenu::new("Unload Layer: Unsaved Changes")
-        .open(&mut open)
-        .min_width(280.0)
-        .show(ui.ctx(), |ui| {
-            ui.label(format!(
-                "Layer '{name}' has unsaved changes.\nSave before unloading?"
-            ));
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("Save and Unload").clicked() {
-                    commands.push(UiCommand::SaveAndUnloadLayer(proj_idx, layer_id));
-                }
-                if ui.button("Unload Without Saving").clicked() {
-                    commands.push(UiCommand::UnloadLayerConfirmed(proj_idx, layer_id));
-                    editor.pending_unload_queue.remove(0);
-                }
-                if ui.button("Cancel").clicked() {
-                    editor.pending_unload_queue.remove(0);
-                }
-            });
-        });
-    // Closing the window (X) cancels the whole queued batch.
-    if !open {
-        editor.pending_unload_queue.clear();
     }
 }
 

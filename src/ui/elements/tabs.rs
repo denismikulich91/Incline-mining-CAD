@@ -101,7 +101,17 @@ impl TabManager {
         let was_active = self.active_tab_id == tab_id;
         self.tabs.remove(index);
         if was_active {
-            self.active_tab_id = 2;
+            self.activate_workspace();
+        }
+    }
+
+    fn activate_workspace(&mut self) {
+        if let Some(workspace) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.class == TabClass::Workspace)
+        {
+            self.active_tab_id = workspace.id;
         }
     }
 
@@ -131,7 +141,7 @@ impl TabManager {
         }
 
         if active_removed {
-            self.active_tab_id = 2;
+            self.activate_workspace();
         }
     }
 

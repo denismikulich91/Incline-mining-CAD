@@ -14,13 +14,27 @@ struct DeleteVertexHit {
 
 impl<'a> App<'a> {
     pub(crate) fn select_all_active_objects(&mut self) {
+        if self.has_pending_move_delta() {
+            self.cancel_move_delta();
+        }
         self.editor.selected_handles.clear();
         let handles = self
-            .active_document()
-            .objects()
-            .iter()
-            .map(|object| SceneEntityId::Object(object.id()))
-            .collect::<Vec<_>>();
+            .workspace
+            .active_project()
+            .map_or_else(Vec::new, |project| {
+                project
+                    .pidb
+                    .document
+                    .objects()
+                    .iter()
+                    .filter(|object| project.loaded_layers.contains(&object.layer()))
+                    .map(|object| SceneEntityId::Object(object.id()))
+                    .filter(|handle| {
+                        !self.editor.hidden_handles.contains(handle)
+                            && !self.editor.frozen_handles.contains(handle)
+                    })
+                    .collect::<Vec<_>>()
+            });
         let count = handles.len();
         self.editor.selected_handles.extend(handles);
         userspace_log!("Selected {count} object(s)");
@@ -47,12 +61,6 @@ impl<'a> App<'a> {
         let Some((SceneEntityId::Object(object_id), world)) = picked else {
             return;
         };
-        if let Some(index) = self.workspace.project_index_for_object(object_id) {
-            if self.workspace.active_index != Some(index) {
-                self.history.clear();
-            }
-            self.workspace.set_active_index(index);
-        }
         self.editor.on_canvas_pick(
             SceneEntityId::Object(object_id),
             world,
@@ -74,13 +82,6 @@ impl<'a> App<'a> {
         let Some(hit) = self.delete_polygon_vertex_hit() else {
             return false;
         };
-        if let Some(index) = self.workspace.project_index_for_object(hit.object_id) {
-            if self.workspace.active_index != Some(index) {
-                self.history.clear();
-            }
-            self.workspace.set_active_index(index);
-        }
-
         let Some(before) = self.active_document().get_object(hit.object_id).cloned() else {
             return false;
         };
@@ -280,13 +281,6 @@ impl<'a> App<'a> {
             self.editor.move_vertex_target = None;
             return false;
         };
-
-        if let Some(index) = self.workspace.project_index_for_object(object_id)
-            && self.workspace.active_index != Some(index)
-        {
-            self.history.clear();
-            self.workspace.set_active_index(index);
-        }
 
         self.cancel_move_delta();
         self.editor.move_vertex_target = Some((object_id, vertex_index));

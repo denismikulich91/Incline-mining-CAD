@@ -1,109 +1,11 @@
-<?xml version="1.0" encoding="UTF-8" standalone="no"?>
-<!-- Uploaded to: SVG Repo, www.svgrepo.com, Generator: SVG Repo Mixer Tools -->
-
-<svg
-   width="800px"
-   height="800px"
-   viewBox="0 0 24 24"
-   fill="none"
-   version="1.1"
-   id="svg1"
-   sodipodi:docname="offset.svg"
-   inkscape:version="1.4.4 (dcaf3e7d9e, 2026-05-05)"
-   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
-   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
-   xmlns="http://www.w3.org/2000/svg"
-   xmlns:svg="http://www.w3.org/2000/svg">
-  <defs
-     id="defs1">
-    <rect
-       x="46.936733"
-       y="122.23108"
-       width="650.26932"
-       height="567.15219"
-       id="rect7" />
-  </defs>
-  <sodipodi:namedview
-     id="namedview1"
-     pagecolor="#ffffff"
-     bordercolor="#000000"
-     borderopacity="0.25"
-     inkscape:showpageshadow="2"
-     inkscape:pageopacity="0.0"
-     inkscape:pagecheckerboard="0"
-     inkscape:deskcolor="#d1d1d1"
-     inkscape:zoom="0.72312501"
-     inkscape:cx="319.44684"
-     inkscape:cy="391.35695"
-     inkscape:window-width="1512"
-     inkscape:window-height="1217"
-     inkscape:window-x="0"
-     inkscape:window-y="0"
-     inkscape:window-maximized="0"
-     inkscape:current-layer="svg1" />
-  <rect
-     style="fill:#000000;fill-opacity:1;stroke-width:2.26788"
-     id="rect1"
-     width="2.9380732"
-     height="22.177607"
-     x="18.975515"
-     y="0.85072827"
-     ry="0.71694845" />
-  <rect
-     style="fill:#3d3d3d;fill-opacity:1;stroke-width:2.16969"
-     id="rect2"
-     width="2.6891534"
-     height="22.177607"
-     x="1.4961094"
-     y="0.85072827"
-     ry="0.71694845" />
-  <g
-     inkscape:groupmode="layer"
-     id="layer1"
-     inkscape:label="Arrow">
-    <rect
-       style="fill:#0065ff;fill-opacity:1;stroke-width:2.0909"
-       id="rect4"
-       width="4.2299895"
-       height="1.9552146"
-       x="13.571453"
-       y="4.5352306"
-       ry="0.83096653" />
-    <rect
-       style="fill:#0065ff;fill-opacity:1;stroke-width:2.0909"
-       id="rect5"
-       width="4.2299895"
-       height="1.9552146"
-       x="8.8418579"
-       y="4.5352306"
-       ry="0.83096653" />
-    <path
-       style="fill:#0065ff;fill-opacity:1;stroke-width:2.00622"
-       d="M 9.5579572,4.9262746 10.324018,2.9221842 4.9282829,5.4883976 9.9909484,8.4212132 9.5413034,6.0260807 Z"
-       id="path5" />
-    <rect
-       style="fill:#0065ff;fill-opacity:1;stroke-width:2.0909"
-       id="rect9"
-       width="4.2299895"
-       height="1.9552146"
-       x="13.571453"
-       y="17.147158"
-       ry="0.83096653" />
-    <rect
-       style="fill:#0065ff;fill-opacity:1;stroke-width:2.0909"
-       id="rect10"
-       width="4.2299895"
-       height="1.9552146"
-       x="8.8418579"
-       y="17.147158"
-       ry="0.83096653" />
-    <path
-       style="fill:#0065ff;fill-opacity:1;stroke-width:2.00622"
-       d="M 9.5579572,17.538202 10.324018,15.534111 4.9282829,18.100325 9.9909484,21.03314 9.5413034,18.638008 Z"
-       id="path10" />
-  </g>
-  <g
-     inkscape:groupmode="layer"
-     id="g9"
-     inkscape:label="Arrow" />
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="800px" height="800px" fill="none" version="1.1" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+ <rect x="18.976" y=".85073" width="2.9381" height="22.178" ry=".71695" style="fill:#000;stroke-width:2.2679"/>
+ <rect x="1.4961" y=".85073" width="2.6892" height="22.178" ry=".71695" style="fill:#3d3d3d;stroke-width:2.1697"/>
+ <rect x="13.571" y="4.5352" width="4.23" height="1.9552" ry=".83097" style="fill:#0065ff;stroke-width:2.0909"/>
+ <rect x="8.8419" y="4.5352" width="4.23" height="1.9552" ry=".83097" style="fill:#0065ff;stroke-width:2.0909"/>
+ <path d="m9.558 4.9263 0.76606-2.0041-5.3957 2.5662 5.0627 2.9328-0.44964-2.3951z" style="fill:#0065ff;stroke-width:2.0062"/>
+ <rect x="13.571" y="17.147" width="4.23" height="1.9552" ry=".83097" style="fill:#0065ff;stroke-width:2.0909"/>
+ <rect x="8.8419" y="17.147" width="4.23" height="1.9552" ry=".83097" style="fill:#0065ff;stroke-width:2.0909"/>
+ <path d="m9.558 17.538 0.76606-2.0041-5.3957 2.5662 5.0627 2.9328-0.44964-2.3951z" style="fill:#0065ff;stroke-width:2.0062"/>
 </svg>

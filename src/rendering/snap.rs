@@ -6,11 +6,12 @@ use crate::{
     Size,
     model::{
         Document, Object, SceneEntityId,
+        geometry::tessellate_bulge_segment,
         road_network::{ResolvedNetwork, RoadKey, resolve},
         spatial::ObjectSnapIndex,
         triangulation::OpenTriangulation,
     },
-    rendering::pick::{closest_t_on_segment, world_to_screen},
+    rendering::pick::{closest_t_on_segment, perspective_correct_segment_point, world_to_screen},
     ui::state::CursorMode,
 };
 
@@ -117,7 +118,9 @@ pub(crate) fn snap_cursor(
                             if d < best_dist_sq {
                                 best_dist_sq = d;
                                 best = Some(SnapHit {
-                                    world: pair[0] + (pair[1] - pair[0]) * t,
+                                    world: perspective_correct_segment_point(
+                                        view_proj, pair[0], pair[1], t,
+                                    ),
                                 });
                             }
                         }
@@ -149,11 +152,11 @@ pub(crate) fn snap_cursor(
                         if d < best_dist_sq {
                             best_dist_sq = d;
                             best = Some(SnapHit {
-                                world: a + (b - a) * t,
+                                world: perspective_correct_segment_point(view_proj, a, b, t),
                             });
                         }
                     } else {
-                        let points = segment_points(a, b, bulge);
+                        let points = tessellate_bulge_segment(a, b, bulge);
                         for pair in points.windows(2) {
                             let (Some(sa), Some(sb)) = (
                                 world_to_screen(view_proj, pair[0], screen),
@@ -166,7 +169,9 @@ pub(crate) fn snap_cursor(
                             if d < best_dist_sq {
                                 best_dist_sq = d;
                                 best = Some(SnapHit {
-                                    world: pair[0] + (pair[1] - pair[0]) * t,
+                                    world: perspective_correct_segment_point(
+                                        view_proj, pair[0], pair[1], t,
+                                    ),
                                 });
                             }
                         }
@@ -249,7 +254,7 @@ pub(crate) fn snap_cursor(
                             if d < best_dist_sq {
                                 best_dist_sq = d;
                                 best = Some(SnapHit {
-                                    world: a + (b - a) * t,
+                                    world: perspective_correct_segment_point(view_proj, a, b, t),
                                 });
                             }
                         }
@@ -268,8 +273,8 @@ fn screen_ray(view_proj: &DMat4, screen: Size, cursor: DVec2) -> Option<(DVec3, 
     let ndc_x = cursor.x / screen.0 as f64 * 2.0 - 1.0;
     let ndc_y = 1.0 - cursor.y / screen.1 as f64 * 2.0;
     let inverse = view_proj.inverse();
-    let near_h = inverse * glam::DVec4::new(ndc_x, ndc_y, 0.0, 1.0);
-    let far_h = inverse * glam::DVec4::new(ndc_x, ndc_y, 1.0, 1.0);
+    let near_h = inverse * glam::DVec4::new(ndc_x, ndc_y, 1.0, 1.0);
+    let far_h = inverse * glam::DVec4::new(ndc_x, ndc_y, 0.0, 1.0);
     if near_h.w.abs() <= f64::EPSILON || far_h.w.abs() <= f64::EPSILON {
         return None;
     }
@@ -277,29 +282,4 @@ fn screen_ray(view_proj: &DMat4, screen: Size, cursor: DVec2) -> Option<(DVec3, 
     let far = far_h.truncate() / far_h.w;
     let direction = (far - near).try_normalize()?;
     Some((near, direction))
-}
-
-fn segment_points(start: DVec3, end: DVec3, bulge: f64) -> Vec<DVec3> {
-    let chord = end - start;
-    let length = chord.length();
-    if length <= f64::EPSILON {
-        return vec![start];
-    }
-    let theta = 4.0 * bulge.atan();
-    let midpoint = (start + end) * 0.5;
-    let perpendicular = DVec3::Z.cross(chord / length).normalize_or_zero();
-    let center = midpoint + perpendicular * length * (1.0 - bulge * bulge) / (4.0 * bulge);
-    let radius = start - center;
-    let count = ((theta.abs() * 16.0).ceil() as usize).clamp(8, 128);
-    (0..=count)
-        .map(|index| {
-            if index == count {
-                end
-            } else {
-                center
-                    + glam::DQuat::from_rotation_z(theta * index as f64 / count as f64)
-                        .mul_vec3(radius)
-            }
-        })
-        .collect()
 }

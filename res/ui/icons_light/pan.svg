@@ -1,76 +1,9 @@
-<?xml version="1.0" encoding="UTF-8" standalone="no"?>
-<!-- Uploaded to: SVG Repo, www.svgrepo.com, Generator: SVG Repo Mixer Tools -->
-
-<svg
-   width="800px"
-   height="800px"
-   viewBox="0 0 24 24"
-   fill="none"
-   version="1.1"
-   id="svg1"
-   sodipodi:docname="pan.svg"
-   inkscape:version="1.4.4 (dcaf3e7d9e, 2026-05-05)"
-   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
-   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
-   xmlns="http://www.w3.org/2000/svg"
-   xmlns:svg="http://www.w3.org/2000/svg">
-  <defs
-     id="defs1">
-    <rect
-       x="307.04447"
-       y="228.81658"
-       width="246.41785"
-       height="289.44319"
-       id="rect661" />
-  </defs>
-  <sodipodi:namedview
-     id="namedview1"
-     pagecolor="#ffffff"
-     bordercolor="#000000"
-     borderopacity="0.25"
-     inkscape:showpageshadow="2"
-     inkscape:pageopacity="0.0"
-     inkscape:pagecheckerboard="0"
-     inkscape:deskcolor="#d1d1d1"
-     inkscape:zoom="1.0226532"
-     inkscape:cx="267.93052"
-     inkscape:cy="333.9353"
-     inkscape:window-width="2560"
-     inkscape:window-height="1366"
-     inkscape:window-x="0"
-     inkscape:window-y="0"
-     inkscape:window-maximized="1"
-     inkscape:current-layer="svg1" />
-  <rect
-     style="fill:#000000;fill-opacity:1;stroke-width:2.11771"
-     id="rect1"
-     width="2.8688469"
-     height="16.72121"
-     x="-13.616003"
-     y="-20.360603"
-     transform="scale(-1)" />
-  <path
-     style="fill:#000000;fill-opacity:1;stroke-width:0.765611;stroke-linecap:round"
-     d="M 16.840156,5.3701866 H 7.414919 L 12.276521,0 Z"
-     id="path1" />
-  <path
-     style="fill:#000000;fill-opacity:1;stroke-width:0.765611;stroke-linecap:round"
-     d="M 7.4815163,18.629813 H 16.906754 L 12.045152,24 Z"
-     id="path4" />
-  <rect
-     style="fill:#000000;fill-opacity:1;stroke-width:2.12142"
-     id="rect4"
-     width="2.8688469"
-     height="16.779881"
-     x="10.544833"
-     y="-20.550777"
-     transform="rotate(90)" />
-  <path
-     style="fill:#000000;fill-opacity:1;stroke-width:0.703975;stroke-linecap:round"
-     d="M 5.5310231,8.0437755 V 16.012531 L 0.16083645,11.902191 Z"
-     id="path5" />
-  <path
-     style="fill:#000000;fill-opacity:1;stroke-width:0.703975;stroke-linecap:round"
-     d="M 18.790649,15.956225 V 7.9874689 l 5.370187,4.1103381 z"
-     id="path6" />
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="800px" height="800px" fill="none" version="1.1" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+ <rect transform="scale(-1)" x="-13.616" y="-20.361" width="2.8688" height="16.721" style="fill:#000;stroke-width:2.1177"/>
+ <path d="m16.84 5.3702h-9.4252l4.8616-5.3702z" style="fill:#000;stroke-linecap:round;stroke-width:.76561"/>
+ <path d="m7.4815 18.63h9.4252l-4.8616 5.3702z" style="fill:#000;stroke-linecap:round;stroke-width:.76561"/>
+ <rect transform="rotate(90)" x="10.545" y="-20.551" width="2.8688" height="16.78" style="fill:#000;stroke-width:2.1214"/>
+ <path d="m5.531 8.0438v7.9688l-5.3702-4.1103z" style="fill:#000;stroke-linecap:round;stroke-width:.70398"/>
+ <path d="m18.791 15.956v-7.9688l5.3702 4.1103z" style="fill:#000;stroke-linecap:round;stroke-width:.70398"/>
 </svg>

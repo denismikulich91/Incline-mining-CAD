@@ -24,9 +24,12 @@ impl<'a> App<'a> {
                 verts,
                 closed: true,
                 ..
-            }) => verts.iter().map(|v| v.pos).collect(),
+            }) => crate::model::geometry::tessellate_polyline_bulges(verts, true),
             _ => anyhow::bail!("Selected object is not a closed polygon"),
         };
+        if poly_verts.len() < 3 {
+            anyhow::bail!("Selected polygon has fewer than 3 boundary points");
+        }
 
         // Run the clip + mesh/BVH build off the UI thread; the polygon and mesh
         // are snapshotted above so the worker never touches `self`.
@@ -59,7 +62,7 @@ impl<'a> App<'a> {
         };
         self.spawn_job(
             "Cutting triangulation by polygon…",
-            crate::app::jobs::JobKey::Triangulation(tri_id),
+            vec![crate::app::jobs::JobKey::Triangulation(tri_id)],
             compute,
             apply,
         );
@@ -98,15 +101,48 @@ impl<'a> App<'a> {
             tri.mesh.clone()
         };
 
-        let pit_shell = prepare_pit_shell_surface(&pit_shell_mesh)?;
-        let envelope = build_pit_shell_lower_envelope(&pit_shell)?;
-        let (new_verts, new_faces) = clip_topology_to_pit_shell(&topology_mesh, &envelope);
-
-        if new_faces.is_empty() {
-            anyhow::bail!("No topology geometry falls outside the pit shell");
-        }
-        userspace_log!("Cut topology '{}' to pit shell", topology_name);
-        self.finish_generated_triangulation(name, new_verts, new_faces, TriSurfaceType::Surface)
+        let compute = move |cancel: &crate::app::jobs::CancelFlag|
+              -> Result<crate::model::triangulation::GeneratedTriangulationLog> {
+            let pit_shell = prepare_pit_shell_surface(&pit_shell_mesh)?;
+            if cancel.is_cancelled() {
+                anyhow::bail!("Cancelled");
+            }
+            let envelope = build_pit_shell_lower_envelope(&pit_shell)?;
+            if cancel.is_cancelled() {
+                anyhow::bail!("Cancelled");
+            }
+            let (new_verts, new_faces) = clip_topology_to_pit_shell(&topology_mesh, &envelope);
+            if new_faces.is_empty() {
+                anyhow::bail!("No topology geometry falls outside the pit shell");
+            }
+            let generated = super::session::build_generated_triangulation(
+                name,
+                new_verts,
+                new_faces,
+                TriSurfaceType::Surface,
+                crate::model::triangulation::unique_edges,
+            )?;
+            Ok(crate::model::triangulation::GeneratedTriangulationLog {
+                generated,
+                message: format!("Cut topology '{topology_name}' to pit shell"),
+            })
+        };
+        let apply = move |app: &mut App,
+                          result: Result<
+            crate::model::triangulation::GeneratedTriangulationLog,
+        >| {
+            app.apply_generated_triangulation_job(result);
+        };
+        self.spawn_job(
+            "Cutting topology by pit shell…",
+            vec![
+                crate::app::jobs::JobKey::Triangulation(topology_id),
+                crate::app::jobs::JobKey::Triangulation(pit_shell_id),
+            ],
+            compute,
+            apply,
+        );
+        Ok(())
     }
 
     /// Cut the triangulation to the Z band [z_min, z_max], clipping triangles
@@ -131,29 +167,54 @@ impl<'a> App<'a> {
             (tri.mesh.clone(), tri.name.clone())
         };
 
-        let verts_raw = mesh.vertices();
-        let mut new_verts: Vec<tri00t::Vertex> = Vec::new();
-        let mut new_faces: Vec<[u32; 3]> = Vec::new();
+        let compute = move |cancel: &crate::app::jobs::CancelFlag|
+              -> Result<crate::model::triangulation::GeneratedTriangulationLog> {
+            let verts_raw = mesh.vertices();
+            let mut new_verts: Vec<tri00t::Vertex> = Vec::new();
+            let mut new_faces: Vec<[u32; 3]> = Vec::new();
 
-        for face in mesh.face_vertex_indices_iter() {
-            let raw = [verts_raw[face[0]], verts_raw[face[1]], verts_raw[face[2]]];
-            for clipped in clip_triangle_z(raw, z_min, z_max) {
-                let base = new_verts.len() as u32;
-                new_verts.extend_from_slice(&clipped);
-                new_faces.push([base, base + 1, base + 2]);
+            for (index, face) in mesh.face_vertex_indices_iter().enumerate() {
+                if index % 65_536 == 0 && cancel.is_cancelled() {
+                    anyhow::bail!("Cancelled");
+                }
+                let raw = [verts_raw[face[0]], verts_raw[face[1]], verts_raw[face[2]]];
+                for clipped in clip_triangle_z(raw, z_min, z_max) {
+                    let base = new_verts.len() as u32;
+                    new_verts.extend_from_slice(&clipped);
+                    new_faces.push([base, base + 1, base + 2]);
+                }
             }
-        }
 
-        if new_faces.is_empty() {
-            anyhow::bail!("No triangulation geometry lies within the specified Z range");
-        }
-        userspace_log!(
-            "Cut triangulation '{}' by Z band [{:.3}, {:.3}]",
-            tri_name,
-            z_min,
-            z_max
+            if new_faces.is_empty() {
+                anyhow::bail!("No triangulation geometry lies within the specified Z range");
+            }
+            let generated = super::session::build_generated_triangulation(
+                name,
+                new_verts,
+                new_faces,
+                TriSurfaceType::Surface,
+                crate::model::triangulation::unique_edges,
+            )?;
+            Ok(crate::model::triangulation::GeneratedTriangulationLog {
+                generated,
+                message: format!(
+                    "Cut triangulation '{tri_name}' by Z band [{z_min:.3}, {z_max:.3}]"
+                ),
+            })
+        };
+        let apply = move |app: &mut App,
+                          result: Result<
+            crate::model::triangulation::GeneratedTriangulationLog,
+        >| {
+            app.apply_generated_triangulation_job(result);
+        };
+        self.spawn_job(
+            "Cutting triangulation by Z…",
+            vec![crate::app::jobs::JobKey::Triangulation(tri_id)],
+            compute,
+            apply,
         );
-        self.finish_generated_triangulation(name, new_verts, new_faces, TriSurfaceType::Surface)
+        Ok(())
     }
 
     /// Vertically clip one triangulation against another topology. Only the XY
@@ -169,35 +230,69 @@ impl<'a> App<'a> {
             anyhow::bail!("Cut object and reference topology must be different triangulations");
         }
 
-        let target = self
-            .triangulations
-            .iter()
-            .find(|triangulation| triangulation.id == target_id)
-            .ok_or_else(|| anyhow::anyhow!("Cut triangulation not found"))?;
-        let reference = self
-            .triangulations
-            .iter()
-            .find(|triangulation| triangulation.id == reference_id)
-            .ok_or_else(|| anyhow::anyhow!("Reference topology not found"))?;
+        let (target_mesh, target_name) = {
+            let target = self
+                .triangulations
+                .iter()
+                .find(|triangulation| triangulation.id == target_id)
+                .ok_or_else(|| anyhow::anyhow!("Cut triangulation not found"))?;
+            (target.mesh.clone(), target.name.clone())
+        };
+        let (reference_mesh, reference_name) = {
+            let reference = self
+                .triangulations
+                .iter()
+                .find(|triangulation| triangulation.id == reference_id)
+                .ok_or_else(|| anyhow::anyhow!("Reference topology not found"))?;
+            (reference.mesh.clone(), reference.name.clone())
+        };
 
-        let (new_vertices, new_faces) = clip_mesh_by_surface(&target.mesh, &reference.mesh, side)?;
-        if new_faces.is_empty() {
-            let retained = match side {
-                TriSurfaceCutSide::CutTop => "at or below",
-                TriSurfaceCutSide::CutBottom => "at or above",
-            };
-            anyhow::bail!(
-                "No cut-object geometry lies {retained} the reference topology within its XY coverage"
-            );
-        }
-
-        userspace_log!(
-            "Cut triangulation '{}' by surface '{}' ({:?})",
-            target.name,
-            reference.name,
-            side
+        let compute = move |cancel: &crate::app::jobs::CancelFlag|
+              -> Result<crate::model::triangulation::GeneratedTriangulationLog> {
+            let (new_vertices, new_faces) =
+                clip_mesh_by_surface(&target_mesh, &reference_mesh, side)?;
+            if cancel.is_cancelled() {
+                anyhow::bail!("Cancelled");
+            }
+            if new_faces.is_empty() {
+                let retained = match side {
+                    TriSurfaceCutSide::CutTop => "at or below",
+                    TriSurfaceCutSide::CutBottom => "at or above",
+                };
+                anyhow::bail!(
+                    "No cut-object geometry lies {retained} the reference topology within its XY coverage"
+                );
+            }
+            let generated = super::session::build_generated_triangulation(
+                name,
+                new_vertices,
+                new_faces,
+                TriSurfaceType::Surface,
+                crate::model::triangulation::unique_edges,
+            )?;
+            Ok(crate::model::triangulation::GeneratedTriangulationLog {
+                generated,
+                message: format!(
+                    "Cut triangulation '{target_name}' by surface '{reference_name}' ({side:?})"
+                ),
+            })
+        };
+        let apply = move |app: &mut App,
+                          result: Result<
+            crate::model::triangulation::GeneratedTriangulationLog,
+        >| {
+            app.apply_generated_triangulation_job(result);
+        };
+        self.spawn_job(
+            "Cutting triangulation by surface…",
+            vec![
+                crate::app::jobs::JobKey::Triangulation(target_id),
+                crate::app::jobs::JobKey::Triangulation(reference_id),
+            ],
+            compute,
+            apply,
         );
-        self.finish_generated_triangulation(name, new_vertices, new_faces, TriSurfaceType::Surface)
+        Ok(())
     }
 }
 
@@ -387,7 +482,8 @@ impl PreparedClipPolygon {
         }
 
         let mesh =
-            tri00t::Triangulation::from_vertices_and_faces(prepared_vertices, prepared_faces);
+            tri00t::Triangulation::from_vertices_and_faces(prepared_vertices, prepared_faces)
+                .ok()?;
         let spatial = crate::model::spatial::TriangleBvh::build(&mesh);
 
         Some(Self {
@@ -774,7 +870,7 @@ pub(super) fn prepare_pit_shell_surface(
         anyhow::bail!("Pit shell contains no usable (non-degenerate) faces");
     }
 
-    let mesh = tri00t::Triangulation::from_vertices_and_faces(prepared_vertices, prepared_faces);
+    let mesh = tri00t::Triangulation::from_vertices_and_faces(prepared_vertices, prepared_faces)?;
     let spatial = crate::model::spatial::TriangleBvh::build(&mesh);
     Ok(PreparedReferenceSurface {
         mesh: std::sync::Arc::new(mesh),
@@ -797,7 +893,6 @@ pub(super) fn triangle_area_3d(triangle: [tri00t::Vertex; 3]) -> f64 {
 /// remove topology and carry no meaningful Z.
 #[derive(Debug)]
 pub(super) struct PitShellLowerEnvelope {
-    #[cfg_attr(not(test), allow(dead_code))]
     _mesh: std::sync::Arc<tri00t::Triangulation>,
     triangles: Vec<[tri00t::Vertex; 3]>,
     covered: Vec<bool>,
@@ -991,7 +1086,7 @@ pub(super) fn build_pit_shell_lower_envelope(
         anyhow::bail!("Pit shell has no XY footprint to build a lower envelope from");
     }
 
-    let mesh = tri00t::Triangulation::from_vertices_and_faces(vertices, faces);
+    let mesh = tri00t::Triangulation::from_vertices_and_faces(vertices, faces)?;
     let spatial = crate::model::spatial::TriangleBvh::build(&mesh);
     Ok(PitShellLowerEnvelope {
         _mesh: std::sync::Arc::new(mesh),
@@ -1068,7 +1163,7 @@ pub(super) fn prepare_reference_surface_relaxed(
         anyhow::bail!("Reference topology must contain at least one non-vertical 2.5D face");
     }
 
-    let mesh = tri00t::Triangulation::from_vertices_and_faces(prepared_vertices, prepared_faces);
+    let mesh = tri00t::Triangulation::from_vertices_and_faces(prepared_vertices, prepared_faces)?;
     let spatial = crate::model::spatial::TriangleBvh::build(&mesh);
     Ok(PreparedReferenceSurface {
         mesh: std::sync::Arc::new(mesh),

@@ -2,6 +2,8 @@
 
 use glam::{DMat4, DQuat, DVec2, DVec3};
 
+use crate::model::PolyVertex;
+
 pub(crate) fn point_to_dvec3(point: &dxf::Point) -> DVec3 {
     DVec3::new(point.x, point.y, point.z)
 }
@@ -68,6 +70,177 @@ impl Transform {
 // -------------------------------------------------------------------------
 // Geometric polygon/polyline offset
 // -------------------------------------------------------------------------
+
+const BULGE_MIN_SEGMENTS: usize = 16;
+const BULGE_MAX_SEGMENTS: usize = 4096;
+const BULGE_TARGET_SEGMENT_LENGTH: f64 = 0.15;
+
+/// Expand bulged XY segments to straight points for geometry algorithms that
+/// cannot retain the original circular-arc representation. The returned
+/// closed ring does not repeat its first point. Elevation is interpolated
+/// linearly along each arc, matching the design-string convention.
+pub(crate) fn tessellate_polyline_bulges(verts: &[PolyVertex], closed: bool) -> Vec<DVec3> {
+    match verts.len() {
+        0 => return Vec::new(),
+        1 => return vec![verts[0].pos],
+        _ => {}
+    }
+
+    let edge_count = if closed { verts.len() } else { verts.len() - 1 };
+    let mut points = Vec::with_capacity(verts.len());
+    points.push(verts[0].pos);
+
+    for i in 0..edge_count {
+        let start = verts[i];
+        let end = verts[(i + 1) % verts.len()].pos;
+        let include_end = !closed || i + 1 < edge_count;
+        append_bulge_segment_points(&mut points, start.pos, end, start.bulge, include_end);
+    }
+
+    points
+}
+
+/// Expand one bulged XY segment, including both endpoints. Elevation follows
+/// the segment parameter linearly rather than being rotated about world Z.
+pub(crate) fn tessellate_bulge_segment(start: DVec3, end: DVec3, bulge: f64) -> Vec<DVec3> {
+    let mut points = vec![start];
+    append_bulge_segment_points(&mut points, start, end, bulge, true);
+    points
+}
+
+/// Exact axis-aligned bounds of a polyline including circular-arc extrema.
+pub(crate) fn polyline_bulge_bounds(verts: &[PolyVertex], closed: bool) -> Option<(DVec3, DVec3)> {
+    let first = verts.first()?;
+    let mut min = first.pos;
+    let mut max = first.pos;
+    if verts.len() == 1 {
+        return Some((min, max));
+    }
+    let edge_count = if closed { verts.len() } else { verts.len() - 1 };
+    for i in 0..edge_count {
+        let start = verts[i];
+        let end = verts[(i + 1) % verts.len()].pos;
+        let (edge_min, edge_max) = bulge_segment_bounds(start.pos, end, start.bulge);
+        min = min.min(edge_min);
+        max = max.max(edge_max);
+    }
+    Some((min, max))
+}
+
+fn bulge_segment_bounds(start: DVec3, end: DVec3, bulge: f64) -> (DVec3, DVec3) {
+    let mut min = start.min(end);
+    let mut max = start.max(end);
+    let Some((center, start_vec, sweep, _)) = bulge_arc_parameters(start, end, bulge) else {
+        return (min, max);
+    };
+    let start_angle = start_vec.y.atan2(start_vec.x);
+    for angle in [
+        0.0,
+        std::f64::consts::FRAC_PI_2,
+        std::f64::consts::PI,
+        std::f64::consts::PI * 1.5,
+    ] {
+        let directed_delta = if sweep >= 0.0 {
+            (angle - start_angle).rem_euclid(std::f64::consts::TAU)
+        } else {
+            (start_angle - angle).rem_euclid(std::f64::consts::TAU)
+        };
+        if directed_delta <= sweep.abs() + 1.0e-12 {
+            let radius = start_vec.length();
+            let point = DVec3::new(
+                center.x + radius * angle.cos(),
+                center.y + radius * angle.sin(),
+                start.z + (end.z - start.z) * directed_delta / sweep.abs(),
+            );
+            min = min.min(point);
+            max = max.max(point);
+        }
+    }
+    (min, max)
+}
+
+fn bulge_arc_parameters(start: DVec3, end: DVec3, bulge: f64) -> Option<(DVec2, DVec2, f64, f64)> {
+    let chord = end.truncate() - start.truncate();
+    let chord_len = chord.length();
+    if !bulge.is_finite() || bulge.abs() <= f64::EPSILON || chord_len <= f64::EPSILON {
+        return None;
+    }
+    let sweep = 4.0 * bulge.atan();
+    let radius = chord_len * (1.0 + bulge * bulge) / (4.0 * bulge.abs());
+    let midpoint = (start.truncate() + end.truncate()) * 0.5;
+    let left = DVec2::new(-chord.y, chord.x) / chord_len;
+    let center = midpoint + left * chord_len * (1.0 - bulge * bulge) / (4.0 * bulge);
+    Some((center, start.truncate() - center, sweep, radius))
+}
+
+fn append_bulge_segment_points(
+    points: &mut Vec<DVec3>,
+    start: DVec3,
+    end: DVec3,
+    bulge: f64,
+    include_end: bool,
+) {
+    let Some((center, start_vec, theta, radius)) = bulge_arc_parameters(start, end, bulge) else {
+        if include_end {
+            points.push(end);
+        }
+        return;
+    };
+    let requested = (radius * theta.abs() / BULGE_TARGET_SEGMENT_LENGTH).ceil();
+    let segments = if requested.is_finite() {
+        (requested as usize).clamp(BULGE_MIN_SEGMENTS, BULGE_MAX_SEGMENTS)
+    } else {
+        BULGE_MAX_SEGMENTS
+    };
+
+    for step in 1..=segments {
+        if step == segments && !include_end {
+            break;
+        }
+        if step == segments {
+            points.push(end);
+            continue;
+        }
+        let t = step as f64 / segments as f64;
+        let angle = theta * t;
+        let (sin, cos) = angle.sin_cos();
+        let rotated = DVec2::new(
+            start_vec.x * cos - start_vec.y * sin,
+            start_vec.x * sin + start_vec.y * cos,
+        );
+        let xy = center + rotated;
+        points.push(DVec3::new(xy.x, xy.y, start.z + (end.z - start.z) * t));
+    }
+}
+
+/// Approximate the same text box used by document rendering and picking.
+pub(crate) fn text_bounds_corners(
+    pos: DVec3,
+    content: &str,
+    height: f64,
+    rotation: f64,
+) -> [DVec3; 4] {
+    const LINE_HEIGHT_FACTOR: f64 = 1.1;
+    let height = height.abs().max(0.001);
+    let longest_line = content
+        .lines()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let line_count = content.lines().count().max(1);
+    let width = height * 0.58 * longest_line as f64;
+    let text_height = height * (1.0 + LINE_HEIGHT_FACTOR * (line_count - 1) as f64);
+    let (sin, cos) = rotation.sin_cos();
+    let right = DVec3::new(cos, sin, 0.0);
+    let down = DVec3::new(sin, -cos, 0.0);
+    let padding = height * 0.15;
+    let top_left = pos - right * padding - down * padding;
+    let top_right = pos + right * (width + padding) - down * padding;
+    let bottom_right = top_right + down * (text_height + padding * 2.0);
+    let bottom_left = top_left + down * (text_height + padding * 2.0);
+    [top_left, top_right, bottom_right, bottom_left]
+}
 
 /// Intersect adjacent offset edge lines; `None` when (near-)parallel.
 fn intersect_offset_edges(a: DVec2, r: DVec2, b: DVec2, s: DVec2) -> Option<DVec2> {
@@ -221,24 +394,32 @@ pub(crate) fn geometric_offset_project_to_rl(
         normals.push(DVec2::new(-dir.y, dir.x));
     }
 
-    let vertex_normal = |i: usize| -> DVec2 {
+    let vertex_offset = |i: usize, signed_dist: f64| -> DVec2 {
         let (prev, next) = if closed {
             (
                 normals[(i + edge_count - 1) % edge_count],
                 normals[i % edge_count],
             )
         } else if i == 0 {
-            return normals[0];
+            return signed_dist * normals[0];
         } else if i == n - 1 {
-            return normals[edge_count - 1];
+            return signed_dist * normals[edge_count - 1];
         } else {
             (normals[i - 1], normals[i])
         };
         let sum = prev + next;
-        if sum.length() > 1e-10 {
-            sum.normalize()
+        if sum.length() <= 1e-10 {
+            return signed_dist * next;
+        }
+        let bisector = sum.normalize();
+        let normal_component = bisector.dot(next);
+        if normal_component.abs() <= 1e-10 {
+            signed_dist * next
         } else {
-            next
+            // A corner must be farther along its bisector than the requested
+            // perpendicular edge offset. Dividing by this projection is
+            // equivalent to intersecting the two offset edge lines.
+            bisector * (signed_dist / normal_component)
         }
     };
 
@@ -249,9 +430,9 @@ pub(crate) fn geometric_offset_project_to_rl(
             let dist = if tan_angle.abs() < 1e-9 {
                 0.0
             } else {
-                (target_rl - v.z) / tan_angle
+                ((target_rl - v.z) / tan_angle).abs()
             };
-            let xy = v.truncate() + side * dist * vertex_normal(i);
+            let xy = v.truncate() + vertex_offset(i, side * dist);
             DVec3::new(xy.x, xy.y, target_rl)
         })
         .collect()

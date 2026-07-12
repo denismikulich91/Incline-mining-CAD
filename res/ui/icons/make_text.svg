@@ -1,114 +1,21 @@
-<?xml version="1.0" encoding="UTF-8" standalone="no"?>
-<!-- Uploaded to: SVG Repo, www.svgrepo.com, Generator: SVG Repo Mixer Tools -->
-
-<svg
-   width="800px"
-   height="800px"
-   viewBox="0 0 16 16"
-   fill="none"
-   version="1.1"
-   id="svg1"
-   sodipodi:docname="make_text.svg"
-   inkscape:version="1.4.4 (dcaf3e7d9e, 2026-05-05)"
-   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
-   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
-   xmlns="http://www.w3.org/2000/svg"
-   xmlns:svg="http://www.w3.org/2000/svg">
-  <defs
-     id="defs1">
-    <clipPath
-       clipPathUnits="userSpaceOnUse"
-       id="clipPath8">
-      <path
-         fill-rule="evenodd"
-         clip-rule="evenodd"
-         d="M 6.651132,0.3520255 H 9.52489 l 4.942072,15.2568355 h -2.88845 L 10.6519,12.748204 H 5.5241588 L 4.5975186,15.608861 H 1.709051 Z M 6.450799,9.8875476 H 9.7252228 L 8.0880064,4.833263 Z"
-         fill="#000000"
-         id="path8"
-         style="fill:#004455;fill-opacity:1;stroke-width:0.93251" />
-    </clipPath>
-    <clipPath
-       clipPathUnits="userSpaceOnUse"
-       id="clipPath9">
-      <path
-         fill-rule="evenodd"
-         clip-rule="evenodd"
-         d="M 6.651132,0.3520255 H 9.52489 l 4.942072,15.2568355 h -2.88845 L 10.6519,12.748204 H 5.5241588 L 4.5975186,15.608861 H 1.709051 Z M 6.450799,9.8875476 H 9.7252228 L 8.0880064,4.833263 Z"
-         fill="#000000"
-         id="path9"
-         style="fill:#004455;fill-opacity:1;stroke-width:0.93251" />
-    </clipPath>
-    <clipPath
-       clipPathUnits="userSpaceOnUse"
-       id="clipPath10">
-      <path
-         fill-rule="evenodd"
-         clip-rule="evenodd"
-         d="M 6.651132,0.3520255 H 9.52489 l 4.942072,15.2568355 h -2.88845 L 10.6519,12.748204 H 5.5241588 L 4.5975186,15.608861 H 1.709051 Z M 6.450799,9.8875476 H 9.7252228 L 8.0880064,4.833263 Z"
-         fill="#000000"
-         id="path10"
-         style="fill:#004455;fill-opacity:1;stroke-width:0.93251" />
-    </clipPath>
-    <clipPath
-       clipPathUnits="userSpaceOnUse"
-       id="clipPath11">
-      <path
-         fill-rule="evenodd"
-         clip-rule="evenodd"
-         d="M 6.651132,0.3520255 H 9.52489 l 4.942072,15.2568355 h -2.88845 L 10.6519,12.748204 H 5.5241588 L 4.5975186,15.608861 H 1.709051 Z M 6.450799,9.8875476 H 9.7252228 L 8.0880064,4.833263 Z"
-         fill="#000000"
-         id="path11"
-         style="fill:#004455;fill-opacity:1;stroke-width:0.93251" />
-    </clipPath>
-  </defs>
-  <sodipodi:namedview
-     id="namedview1"
-     pagecolor="#ffffff"
-     bordercolor="#000000"
-     borderopacity="0.25"
-     inkscape:showpageshadow="2"
-     inkscape:pageopacity="0.0"
-     inkscape:pagecheckerboard="0"
-     inkscape:deskcolor="#d1d1d1"
-     inkscape:zoom="1.0226532"
-     inkscape:cx="150.58868"
-     inkscape:cy="444.43219"
-     inkscape:window-width="2560"
-     inkscape:window-height="1366"
-     inkscape:window-x="0"
-     inkscape:window-y="0"
-     inkscape:window-maximized="1"
-     inkscape:current-layer="svg1" />
-  <rect
-     style="fill:#003c98;fill-opacity:1;stroke:none;stroke-width:1.03735;stroke-linecap:round"
-     id="rect1"
-     width="16"
-     height="4.9111972"
-     x="0"
-     y="11.088802"
-     clip-path="url(#clipPath11)" />
-  <rect
-     style="fill:#0065ff;fill-opacity:1;stroke:none;stroke-width:0.89994;stroke-linecap:round"
-     id="rect2"
-     width="16"
-     height="3.6962678"
-     x="0"
-     y="8.2139273"
-     clip-path="url(#clipPath10)" />
-  <rect
-     style="fill:#003c98;fill-opacity:1;stroke:none;stroke-width:0.858513;stroke-linecap:round"
-     id="rect3"
-     width="16"
-     height="3.3637996"
-     x="0"
-     y="5.8670902"
-     clip-path="url(#clipPath9)" />
-  <rect
-     style="fill:#0065ff;fill-opacity:1;stroke:none;stroke-width:1.1451;stroke-linecap:round"
-     id="rect4"
-     width="16"
-     height="5.9844322"
-     x="0"
-     y="8.3266727e-17"
-     clip-path="url(#clipPath8)" />
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="800px" height="800px" fill="none" version="1.1" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
+ <defs>
+  <clipPath id="b">
+   <path d="m6.6511 0.35203h2.8738l4.9421 15.257h-2.8884l-0.92661-2.8607h-5.1277l-0.92664 2.8607h-2.8885zm-0.20033 9.5355h3.2744l-1.6372-5.0543z" clip-rule="evenodd" fill="#000" fill-rule="evenodd" style="fill:#045;stroke-width:.93251"/>
+  </clipPath>
+  <clipPath id="a">
+   <path d="m6.6511 0.35203h2.8738l4.9421 15.257h-2.8884l-0.92661-2.8607h-5.1277l-0.92664 2.8607h-2.8885zm-0.20033 9.5355h3.2744l-1.6372-5.0543z" clip-rule="evenodd" fill="#000" fill-rule="evenodd" style="fill:#045;stroke-width:.93251"/>
+  </clipPath>
+  <clipPath id="d">
+   <path d="m6.6511 0.35203h2.8738l4.9421 15.257h-2.8884l-0.92661-2.8607h-5.1277l-0.92664 2.8607h-2.8885zm-0.20033 9.5355h3.2744l-1.6372-5.0543z" clip-rule="evenodd" fill="#000" fill-rule="evenodd" style="fill:#045;stroke-width:.93251"/>
+  </clipPath>
+  <clipPath id="c">
+   <path d="m6.6511 0.35203h2.8738l4.9421 15.257h-2.8884l-0.92661-2.8607h-5.1277l-0.92664 2.8607h-2.8885zm-0.20033 9.5355h3.2744l-1.6372-5.0543z" clip-rule="evenodd" fill="#000" fill-rule="evenodd" style="fill:#045;stroke-width:.93251"/>
+  </clipPath>
+ </defs>
+ <rect y="11.089" width="16" height="4.9112" clip-path="url(#c)" style="fill:#003c98"/>
+ <rect y="8.2139" width="16" height="3.6963" clip-path="url(#d)" style="fill:#0065ff"/>
+ <rect y="5.8671" width="16" height="3.3638" clip-path="url(#a)" style="fill:#003c98"/>
+ <rect y="8.3267e-17" width="16" height="5.9844" clip-path="url(#b)" style="fill:#0065ff"/>
 </svg>

@@ -160,7 +160,6 @@ impl<'a> App<'a> {
 
         let before = obj.clone();
         let verts = verts.clone();
-        let n = verts.len();
 
         let v_start = verts[vi].pos;
         let v_end = verts[vj].pos;
@@ -168,18 +167,7 @@ impl<'a> App<'a> {
         let cp2 = DVec3::from(self.editor.bezier_cp2);
         let segments = self.editor.bezier_segments.max(2) as usize;
 
-        // Build new vertex list: insert bezier intermediate points between vi and vj
-        let mut new_verts: Vec<PolyVertex> = Vec::with_capacity(n + segments);
-        for (k, vert) in verts.iter().enumerate().take(n) {
-            new_verts.push(*vert);
-            if k == vi {
-                for seg in 1..segments {
-                    let t = seg as f64 / segments as f64;
-                    let p = bezier_eval(v_start, cp1, cp2, v_end, t);
-                    new_verts.push(PolyVertex::straight(p));
-                }
-            }
-        }
+        let new_verts = replace_edge_with_bezier(&verts, vi, v_start, v_end, cp1, cp2, segments);
 
         let mut after = before.clone();
         if let Object::Polyline {
@@ -229,4 +217,33 @@ impl<'a> App<'a> {
 pub(crate) fn bezier_eval(p0: DVec3, p1: DVec3, p2: DVec3, p3: DVec3, t: f64) -> DVec3 {
     let u = 1.0 - t;
     u * u * u * p0 + 3.0 * u * u * t * p1 + 3.0 * u * t * t * p2 + t * t * t * p3
+}
+
+fn replace_edge_with_bezier(
+    verts: &[PolyVertex],
+    start_index: usize,
+    start: DVec3,
+    end: DVec3,
+    cp1: DVec3,
+    cp2: DVec3,
+    segments: usize,
+) -> Vec<PolyVertex> {
+    let mut result = Vec::with_capacity(verts.len() + segments.saturating_sub(1));
+    for (index, vertex) in verts.iter().copied().enumerate() {
+        result.push(vertex);
+        if index != start_index {
+            continue;
+        }
+        // The circular bulge owned by the old edge must not survive on the
+        // first straight Bezier sample.
+        result
+            .last_mut()
+            .expect("the source vertex was just pushed")
+            .bulge = 0.0;
+        for segment in 1..segments {
+            let t = segment as f64 / segments as f64;
+            result.push(PolyVertex::straight(bezier_eval(start, cp1, cp2, end, t)));
+        }
+    }
+    result
 }

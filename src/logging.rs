@@ -4,7 +4,7 @@ use std::{
     collections::VecDeque,
     fmt, fs, io,
     path::PathBuf,
-    sync::{Mutex, OnceLock, TryLockError},
+    sync::{Arc, Mutex, OnceLock, TryLockError},
 };
 
 use chrono::{DateTime, Local};
@@ -19,6 +19,8 @@ struct RuntimeLog {
     started_at: DateTime<Local>,
     lines: VecDeque<ConsoleLine>,
     bytes: usize,
+    revision: u64,
+    snapshot: Option<(u64, Arc<[ConsoleLine]>)>,
 }
 
 #[derive(Clone)]
@@ -33,6 +35,8 @@ impl RuntimeLog {
             started_at: Local::now(),
             lines: VecDeque::new(),
             bytes: 0,
+            revision: 0,
+            snapshot: None,
         }
     }
 
@@ -44,6 +48,19 @@ impl RuntimeLog {
                 self.bytes = self.bytes.saturating_sub(removed.text.len() + 1);
             }
         }
+        self.revision = self.revision.wrapping_add(1);
+        self.snapshot = None;
+    }
+
+    fn snapshot(&mut self) -> Arc<[ConsoleLine]> {
+        if let Some((revision, snapshot)) = &self.snapshot
+            && *revision == self.revision
+        {
+            return Arc::clone(snapshot);
+        }
+        let snapshot: Arc<[ConsoleLine]> = self.lines.iter().cloned().collect();
+        self.snapshot = Some((self.revision, Arc::clone(&snapshot)));
+        snapshot
     }
 
     fn contents(&self) -> String {
@@ -159,8 +176,10 @@ fn append_line(text: String, level: Level) {
     with_runtime_log(|log| log.push(ConsoleLine { text, level }));
 }
 
-pub(crate) fn console_lines() -> Vec<ConsoleLine> {
-    with_runtime_log(|log| log.lines.iter().cloned().collect())
+/// Immutable revision-cached console data. Repeated UI frames only clone the
+/// `Arc`; line strings are copied once when a new log record arrives.
+pub(crate) fn console_lines() -> Arc<[ConsoleLine]> {
+    with_runtime_log(RuntimeLog::snapshot)
 }
 
 pub(crate) fn log_to_distributor(args: fmt::Arguments<'_>, level: Level) {

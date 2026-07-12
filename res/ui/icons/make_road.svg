@@ -1,95 +1,17 @@
-<?xml version="1.0" encoding="UTF-8" standalone="no"?>
-<!-- Uploaded to: SVG Repo, www.svgrepo.com, Generator: SVG Repo Mixer Tools -->
-
-<svg
-   width="800px"
-   height="800px"
-   viewBox="0 0 24 24"
-   fill="none"
-   version="1.1"
-   id="svg1"
-   sodipodi:docname="make_road.svg"
-   inkscape:version="1.4.4 (dcaf3e7d9e, 2026-05-05)"
-   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
-   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
-   xmlns="http://www.w3.org/2000/svg"
-   xmlns:svg="http://www.w3.org/2000/svg">
-  <defs
-     id="defs1">
-    <rect
-       x="46.936733"
-       y="122.23108"
-       width="650.26932"
-       height="567.15219"
-       id="rect7" />
-    <clipPath
-       clipPathUnits="userSpaceOnUse"
-       id="clipPath10">
-      <path
-         style="fill:#ffffff;fill-opacity:1;stroke:none;stroke-width:0.183958;stroke-linecap:round"
-         d="M 0,24 12,5.0456988 24,24 Z"
-         id="path10" />
-    </clipPath>
-    <clipPath
-       clipPathUnits="userSpaceOnUse"
-       id="clipPath11">
-      <path
-         style="fill:#ffffff;fill-opacity:1;stroke:none;stroke-width:0.183958;stroke-linecap:round"
-         d="M 0,24 12,5.0456988 24,24 Z"
-         id="path11" />
-    </clipPath>
-    <clipPath
-       clipPathUnits="userSpaceOnUse"
-       id="clipPath12">
-      <path
-         style="fill:#ffffff;fill-opacity:1;stroke:none;stroke-width:0.183958;stroke-linecap:round"
-         d="M 0,24 12,5.0456988 24,24 Z"
-         id="path12" />
-    </clipPath>
-  </defs>
-  <sodipodi:namedview
-     id="namedview1"
-     pagecolor="#ffffff"
-     bordercolor="#000000"
-     borderopacity="0.25"
-     inkscape:showpageshadow="2"
-     inkscape:pageopacity="0.0"
-     inkscape:pagecheckerboard="0"
-     inkscape:deskcolor="#d1d1d1"
-     inkscape:zoom="0.36156251"
-     inkscape:cx="-92.653413"
-     inkscape:cy="420.39757"
-     inkscape:window-width="1429"
-     inkscape:window-height="1217"
-     inkscape:window-x="0"
-     inkscape:window-y="0"
-     inkscape:window-maximized="0"
-     inkscape:current-layer="svg1" />
-  <rect
-     style="fill:#754a03;fill-opacity:1;stroke:none;stroke-width:0.378622;stroke-linecap:round"
-     id="rect3"
-     width="24"
-     height="14.157304"
-     x="0"
-     y="2.220446e-16"
-     ry="0"
-     clip-path="url(#clipPath12)" />
-  <rect
-     style="fill:#442b02;fill-opacity:1;stroke:none;stroke-width:0.265857;stroke-linecap:round"
-     id="rect4"
-     width="24"
-     height="6.9801221"
-     x="0"
-     y="13.244598"
-     ry="0"
-     clip-path="url(#clipPath11)" />
-  <rect
-     style="fill:#332002;fill-opacity:1;stroke:none;stroke-width:0.218838;stroke-linecap:round"
-     id="rect5"
-     width="24"
-     height="4.7294726"
-     x="0"
-     y="19.270529"
-     ry="0"
-     clip-path="url(#clipPath10)" />
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="800px" height="800px" fill="none" version="1.1" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+ <defs>
+  <clipPath id="c">
+   <path d="m0 24 12-18.954 12 18.954z" style="fill:#fff"/>
+  </clipPath>
+  <clipPath id="b">
+   <path d="m0 24 12-18.954 12 18.954z" style="fill:#fff"/>
+  </clipPath>
+  <clipPath id="a">
+   <path d="m0 24 12-18.954 12 18.954z" style="fill:#fff"/>
+  </clipPath>
+ </defs>
+ <rect y="2.2204e-16" width="24" height="14.157" ry="0" clip-path="url(#a)" style="fill:#754a03"/>
+ <rect y="13.245" width="24" height="6.9801" ry="0" clip-path="url(#b)" style="fill:#442b02"/>
+ <rect y="19.271" width="24" height="4.7295" ry="0" clip-path="url(#c)" style="fill:#332002"/>
 </svg>

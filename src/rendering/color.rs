@@ -592,19 +592,19 @@ pub(crate) fn linear_to_srgb_byte(linear: f32) -> u8 {
 
 pub(crate) fn rgba_to_color32(rgba: [f32; 4]) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(
-        (rgba[0].clamp(0.0, 1.0) * 255.0) as u8,
-        (rgba[1].clamp(0.0, 1.0) * 255.0) as u8,
-        (rgba[2].clamp(0.0, 1.0) * 255.0) as u8,
-        (rgba[3].clamp(0.0, 1.0) * 255.0) as u8,
+        linear_to_srgb_byte(rgba[0]),
+        linear_to_srgb_byte(rgba[1]),
+        linear_to_srgb_byte(rgba[2]),
+        (rgba[3].clamp(0.0, 1.0) * 255.0).round() as u8,
     )
 }
 
 pub(crate) fn color32_to_rgba(c: egui::Color32) -> [f32; 4] {
     let (r, g, b, a) = c.to_srgba_unmultiplied().into();
     [
-        r as f32 / 255.0,
-        g as f32 / 255.0,
-        b as f32 / 255.0,
+        byte_to_linear_rgba(r),
+        byte_to_linear_rgba(g),
+        byte_to_linear_rgba(b),
         a as f32 / 255.0,
     ]
 }

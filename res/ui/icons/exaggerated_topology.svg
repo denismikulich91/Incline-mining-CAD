@@ -1,86 +1,9 @@
-<?xml version="1.0" encoding="UTF-8" standalone="no"?>
-<!-- Uploaded to: SVG Repo, www.svgrepo.com, Generator: SVG Repo Mixer Tools -->
-
-<svg
-   width="800px"
-   height="800px"
-   viewBox="0 0 24 24"
-   fill="none"
-   version="1.1"
-   id="svg1"
-   sodipodi:docname="exaggerated_topology.svg"
-   inkscape:version="1.4.4 (dcaf3e7d9e, 2026-05-05)"
-   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
-   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
-   xmlns="http://www.w3.org/2000/svg"
-   xmlns:svg="http://www.w3.org/2000/svg">
-  <defs
-     id="defs1">
-    <rect
-       x="307.04447"
-       y="228.81658"
-       width="246.41785"
-       height="289.44319"
-       id="rect661" />
-  </defs>
-  <sodipodi:namedview
-     id="namedview1"
-     pagecolor="#ffffff"
-     bordercolor="#000000"
-     borderopacity="0.25"
-     inkscape:showpageshadow="2"
-     inkscape:pageopacity="0.0"
-     inkscape:pagecheckerboard="0"
-     inkscape:deskcolor="#d1d1d1"
-     inkscape:zoom="0.5113266"
-     inkscape:cx="-557.3737"
-     inkscape:cy="364.73753"
-     inkscape:window-width="2560"
-     inkscape:window-height="1366"
-     inkscape:window-x="0"
-     inkscape:window-y="0"
-     inkscape:window-maximized="1"
-     inkscape:current-layer="svg1" />
-  <rect
-     style="fill:#7d69d6;fill-opacity:1;stroke:none;stroke-width:2.86178;stroke-linecap:round"
-     id="rect2"
-     width="19.830769"
-     height="19.918776"
-     x="4.1692305"
-     y="0" />
-  <rect
-     style="fill:#da40ff;fill-opacity:1;stroke:none;stroke-width:1.47;stroke-linecap:round"
-     id="rect1"
-     width="10.766112"
-     height="9.6807013"
-     x="0"
-     y="14.319299" />
-  <rect
-     style="fill:#6b4cf3;fill-opacity:1;stroke:none;stroke-width:2.34264;stroke-linecap:round"
-     id="rect3"
-     width="19.830769"
-     height="13.347632"
-     x="4.1692305"
-     y="0" />
-  <rect
-     style="fill:#6340ff;fill-opacity:1;stroke:none;stroke-width:1.6565;stroke-linecap:round"
-     id="rect4"
-     width="19.830769"
-     height="6.6738162"
-     x="4.1692305"
-     y="0" />
-  <rect
-     style="fill:#d048dc;fill-opacity:1;stroke:none;stroke-width:1.28713;stroke-linecap:round"
-     id="rect5"
-     width="10.766112"
-     height="7.4218707"
-     x="0"
-     y="14.319299" />
-  <rect
-     style="fill:#e01bff;fill-opacity:1;stroke:none;stroke-width:0.910138;stroke-linecap:round"
-     id="rect6"
-     width="10.766112"
-     height="3.7109354"
-     x="0"
-     y="14.319299" />
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="800px" height="800px" fill="none" version="1.1" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+ <rect x="4.1692" width="19.831" height="19.919" style="fill:#7d69d6"/>
+ <rect y="14.319" width="10.766" height="9.6807" style="fill:#da40ff"/>
+ <rect x="4.1692" width="19.831" height="13.348" style="fill:#6b4cf3"/>
+ <rect x="4.1692" width="19.831" height="6.6738" style="fill:#6340ff"/>
+ <rect y="14.319" width="10.766" height="7.4219" style="fill:#d048dc"/>
+ <rect y="14.319" width="10.766" height="3.7109" style="fill:#e01bff"/>
 </svg>

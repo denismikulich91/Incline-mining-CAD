@@ -102,7 +102,7 @@ impl<'a> App<'a> {
         }
     }
 
-    fn clear_road_preview_geometry(&mut self) {
+    pub(crate) fn clear_road_preview_geometry(&mut self) {
         self.editor.road_preview_center_world.clear();
         self.editor.road_preview_left_world.clear();
         self.editor.road_preview_right_world.clear();
@@ -201,6 +201,11 @@ impl<'a> App<'a> {
             self.history.execute(doc, Command::AddObject(new_road));
         }
 
+        self.discard_road_stroke();
+    }
+
+    /// Clear the in-progress road without leaving the road tool.
+    pub(crate) fn discard_road_stroke(&mut self) {
         self.editor.pending_stroke.clear();
         self.clear_road_preview_geometry();
         self.editor.road_preview_left_screen_px.clear();
@@ -210,14 +215,9 @@ impl<'a> App<'a> {
     }
 
     pub(crate) fn cancel_road(&mut self) {
-        self.editor.pending_stroke.clear();
-        self.clear_road_preview_geometry();
-        self.editor.road_preview_left_screen_px.clear();
-        self.editor.road_preview_right_screen_px.clear();
-        self.editor.road_preview_center_screen_px.clear();
+        self.discard_road_stroke();
         self.editor.road_dialog_open = false;
         self.editor.active_tool = ActiveTool::None;
-        self.invalidate_geometry();
     }
 
     pub(crate) fn create_triangulation_from_roads(

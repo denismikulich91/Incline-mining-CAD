@@ -46,7 +46,8 @@ use crate::{
     },
 };
 
-pub(crate) const SELECTION_COLOR_F32: [f32; 4] = [87.0 / 255.0, 163.0 / 255.0, 1.0, 1.0];
+/// Linear-space equivalent of [`SELECTION_COLOR`] (sRGB 87, 163, 255) for the renderer.
+pub(crate) const SELECTION_COLOR_F32: [f32; 4] = [0.0953, 0.3662, 1.0, 1.0];
 pub(crate) const SELECTION_COLOR: egui::Color32 = egui::Color32::from_rgb(87, 163, 255);
 
 /// Owned egui GUI state: context, winit bridge, and wgpu tessellation renderer.
@@ -103,6 +104,29 @@ impl Gui {
         self.state.on_window_event(window, event)
     }
 
+    pub(crate) fn register_native_texture(
+        &mut self,
+        device: &wgpu::Device,
+        view: &wgpu::TextureView,
+    ) -> egui::TextureId {
+        self.renderer
+            .register_native_texture(device, view, wgpu::FilterMode::Linear)
+    }
+
+    pub(crate) fn update_native_texture(
+        &mut self,
+        device: &wgpu::Device,
+        id: egui::TextureId,
+        view: &wgpu::TextureView,
+    ) {
+        self.renderer.update_egui_texture_from_wgpu_texture(
+            device,
+            view,
+            wgpu::FilterMode::Linear,
+            id,
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn render(
         &mut self,
@@ -148,10 +172,11 @@ impl Gui {
             );
         });
 
-        let repaint = full_output
+        let repaint_after = full_output
             .viewport_output
             .get(&egui::ViewportId::ROOT)
-            .is_some_and(|output| output.repaint_delay.is_zero());
+            .map(|output| output.repaint_delay)
+            .filter(|delay| *delay != std::time::Duration::MAX);
         let ui_pointer_active = self.ctx.dragged_id().is_some();
         self.state
             .handle_platform_output(window, full_output.platform_output);
@@ -204,7 +229,7 @@ impl Gui {
         }
 
         UiFrameOutput {
-            repaint,
+            repaint_after,
             geometry_dirty,
             ui_pointer_active,
             commands,
@@ -265,6 +290,21 @@ impl ViewportToolLabel {
 }
 
 fn viewport_label_text(editor: &EditorState) -> Option<ViewportToolLabel> {
+    if editor.slice_mode_enabled {
+        return Some(ViewportToolLabel::neutral(
+            "Slice view: middle-drag pan · W/S move slab · Q/E rotate · Esc exit",
+        ));
+    }
+    if editor.active_tool == ActiveTool::VerticalSlice {
+        return Some(ViewportToolLabel::neutral(
+            if editor.slice_pending_start.is_none() {
+                "Click the first point of the slice line"
+            } else {
+                "Click the second point of the slice line"
+            },
+        ));
+    }
+
     if editor.active_tool == ActiveTool::MeasureDistance
         && let (Some(start), Some(end)) = (editor.measurement_start, editor.measurement_end)
     {
@@ -356,9 +396,11 @@ fn draw_ui(
     let mut geometry_dirty = false;
 
     // --- Panel layout: compute rects for all fixed panels ---
-    let project_active = project.active_index.is_some();
-    let editing_enabled =
-        project.active_index.is_some() && editor.active_layer.is_some() && !editor.fly_mode_enabled;
+    let project_active = project.has_active_project;
+    let editing_enabled = project.has_active_project
+        && editor.active_layer.is_some()
+        && !editor.fly_mode_enabled
+        && !editor.slice_mode_enabled;
 
     let main_menu_rect =
         crate::ui::elements::main_menu::draw_main_menu(root_ui, editor, project, commands);
@@ -369,12 +411,7 @@ fn draw_ui(
     match active_tab {
         crate::ui::elements::tabs::TabClass::Preferences => {
             crate::ui::elements::preferences::draw_preferences(root_ui, editor, commands);
-            if editor.exit_confirm_open {
-                crate::ui::dialogs::confirmations::draw_exit_confirm_dialog(
-                    root_ui, commands, editor,
-                );
-            }
-            return false;
+            return draw_global_dialogs(root_ui, editor, document, project, block_models, commands);
         }
         crate::ui::elements::tabs::TabClass::BlockModelTable(id) => {
             crate::ui::elements::block_model::draw_block_model_table(
@@ -383,7 +420,7 @@ fn draw_ui(
                 block_models,
                 id,
             );
-            return false;
+            return draw_global_dialogs(root_ui, editor, document, project, block_models, commands);
         }
         crate::ui::elements::tabs::TabClass::Workspace => {}
     }
@@ -394,7 +431,6 @@ fn draw_ui(
         editor,
         project,
         commands,
-        document,
         editor.can_undo,
         editor.can_redo,
     );
@@ -402,10 +438,16 @@ fn draw_ui(
     let explorer_rect =
         crate::ui::elements::explorer::draw_explorer(root_ui, editor, project, commands);
 
-    // Draw console if enabled
-    if editor.show_console {
-        crate::ui::elements::console::draw_console(root_ui);
-    }
+    // The console belongs below the bottom toolbar. Reserve the toolbar's height
+    // before showing the console so dragging it to its maximum cannot starve the
+    // toolbar (or the side panels drawn afterward) of layout space.
+    let console_rect = editor.show_console.then(|| {
+        let max_height = (root_ui.available_height()
+            - crate::ui::elements::toolbars::BOTTOM_TOOLBAR_HEIGHT)
+            .max(0.0);
+        crate::ui::elements::console::draw_console(root_ui, max_height)
+    });
+
     let bottom_toolbar_rect = crate::ui::elements::toolbars::draw_bottom_toolbar(
         root_ui,
         editor,
@@ -424,6 +466,15 @@ fn draw_ui(
         crate::ui::elements::toolbars::draw_right_toolbar(root_ui, editor, commands);
 
     // --- Compute canvas rect (area not occupied by panels) ---
+    let canvas_bottom = console_rect.map_or_else(
+        || status_bar_rect.top().min(bottom_toolbar_rect.top()),
+        |rect| {
+            status_bar_rect
+                .top()
+                .min(bottom_toolbar_rect.top())
+                .min(rect.top())
+        },
+    );
     let canvas_rect = egui::Rect::from_min_max(
         egui::pos2(
             explorer_rect.right().max(left_toolbar_rect.right()),
@@ -432,10 +483,7 @@ fn draw_ui(
                 .max(tabs_rect.bottom())
                 .max(top_toolbar_rect.bottom()),
         ),
-        egui::pos2(
-            right_toolbar_rect.left(),
-            status_bar_rect.top().min(bottom_toolbar_rect.top()),
-        ),
+        egui::pos2(right_toolbar_rect.left(), canvas_bottom),
     );
 
     if let (Some(start), Some(end)) = (
@@ -619,19 +667,23 @@ fn draw_ui(
             painter.circle_filled(corner, CORNER_R, color);
         }
 
-        // Draw the chamfer preview polyline
+        // Draw the chamfer preview polyline. A segment is drawn only when
+        // both of its adjacent source vertices are visible, so clipped
+        // vertices cannot cause previews to connect nonadjacent points.
         if !editor.chamfer_preview_screen_px.is_empty() {
             let ppp = root_ui.ctx().pixels_per_point();
-            let pts: Vec<egui::Pos2> = editor
+            let pts: Vec<Option<egui::Pos2>> = editor
                 .chamfer_preview_screen_px
                 .iter()
-                .map(|(x, y)| egui::pos2(x / ppp, y / ppp))
+                .map(|point| point.map(|(x, y)| egui::pos2(x / ppp, y / ppp)))
                 .collect();
             let painter = root_ui.painter().with_clip_rect(canvas_rect);
             let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 220, 0));
             let n = pts.len();
             for i in 0..n {
-                painter.line_segment([pts[i], pts[(i + 1) % n]], stroke);
+                if let (Some(a), Some(b)) = (pts[i], pts[(i + 1) % n]) {
+                    painter.line_segment([a, b], stroke);
+                }
             }
         }
 
@@ -649,17 +701,30 @@ fn draw_ui(
         painter.circle_stroke(pos, 7.5, egui::Stroke::new(1.5, egui::Color32::WHITE));
     }
 
+    // Persistent design-point display. This is deliberately drawn before the
+    // tool overlays below: tools retain their own visibility rules and can
+    // highlight/resize the points they operate on independently.
+    if editor.show_points {
+        let ppp = root_ui.ctx().pixels_per_point();
+        let painter = root_ui.painter().with_clip_rect(canvas_rect);
+        for &(x, y) in &editor.visible_points_screen_px {
+            let pos = egui::pos2(x / ppp, y / ppp);
+            painter.circle_filled(pos, 3.5, egui::Color32::WHITE);
+            painter.circle_stroke(pos, 4.0, egui::Stroke::new(1.0, egui::Color32::BLACK));
+        }
+    }
+
     // Split At Points tool: vertex dots and selected split points
     if editor.active_tool == ActiveTool::SplitAtPoints {
         let ppp = root_ui.ctx().pixels_per_point();
         let painter = root_ui.painter().with_clip_rect(canvas_rect);
 
-        for &(x, y) in &editor.split_poly_verts_screen_px {
+        for &(x, y) in editor.split_poly_verts_screen_px.iter().flatten() {
             painter.circle_filled(egui::pos2(x / ppp, y / ppp), 5.0, egui::Color32::WHITE);
         }
 
         for selected in editor.split_selected_verts.iter().flatten() {
-            if let Some(&(x, y)) = editor.split_poly_verts_screen_px.get(*selected) {
+            if let Some(&Some((x, y))) = editor.split_poly_verts_screen_px.get(*selected) {
                 let pos = egui::pos2(x / ppp, y / ppp);
                 painter.circle_filled(pos, 7.0, SELECTION_COLOR);
                 painter.circle_stroke(pos, 8.5, egui::Stroke::new(1.5, egui::Color32::WHITE));
@@ -673,32 +738,34 @@ fn draw_ui(
         let painter = root_ui.painter().with_clip_rect(canvas_rect);
 
         // All polygon vertices as white dots
-        for &(x, y) in &editor.bezier_poly_verts_screen_px {
+        for &(x, y) in editor.bezier_poly_verts_screen_px.iter().flatten() {
             painter.circle_filled(egui::pos2(x / ppp, y / ppp), 5.0, egui::Color32::WHITE);
         }
 
         // Selected vertices in selection colour
         for slot in 0..2usize {
             if let Some(vi) = editor.bezier_selected_verts[slot]
-                && let Some(&(x, y)) = editor.bezier_poly_verts_screen_px.get(vi)
+                && let Some(&Some((x, y))) = editor.bezier_poly_verts_screen_px.get(vi)
             {
                 painter.circle_filled(egui::pos2(x / ppp, y / ppp), 7.0, SELECTION_COLOR);
             }
         }
 
-        // Dashed yellow preview polygon
+        // Dashed yellow preview polygon; segments need both endpoints visible.
         if !editor.bezier_preview_screen_px.is_empty() {
-            let pts: Vec<egui::Pos2> = editor
+            let pts: Vec<Option<egui::Pos2>> = editor
                 .bezier_preview_screen_px
                 .iter()
-                .map(|(x, y)| egui::pos2(x / ppp, y / ppp))
+                .map(|point| point.map(|(x, y)| egui::pos2(x / ppp, y / ppp)))
                 .collect();
             let dash_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 220, 0));
             let n = pts.len();
             for i in 0..n {
                 let next = (i + 1) % n;
-                for seg in dashed_line_segments(pts[i], pts[next], 6.0, 4.0) {
-                    painter.line_segment(seg, dash_stroke);
+                if let (Some(a), Some(b)) = (pts[i], pts[next]) {
+                    for seg in dashed_line_segments(a, b, 6.0, 4.0) {
+                        painter.line_segment(seg, dash_stroke);
+                    }
                 }
             }
         }
@@ -709,7 +776,7 @@ fn draw_ui(
         {
             // Tangent lines from anchor vertices to control points
             if let Some(vi) = editor.bezier_selected_verts[0]
-                && let Some(&v_px) = editor.bezier_poly_verts_screen_px.get(vi)
+                && let Some(&Some(v_px)) = editor.bezier_poly_verts_screen_px.get(vi)
             {
                 painter.line_segment(
                     [
@@ -723,7 +790,7 @@ fn draw_ui(
                 );
             }
             if let Some(vj) = editor.bezier_selected_verts[1]
-                && let Some(&v_px) = editor.bezier_poly_verts_screen_px.get(vj)
+                && let Some(&Some(v_px)) = editor.bezier_poly_verts_screen_px.get(vj)
             {
                 painter.line_segment(
                     [
@@ -773,6 +840,7 @@ fn draw_ui(
     crate::ui::dialogs::files::draw_vertical_exaggeration_dialog(root_ui, editor, canvas_rect);
     crate::ui::dialogs::editing::draw_move_to_layer_dialog(root_ui, editor, project, commands);
     crate::ui::dialogs::editing::draw_set_selection_z_dialog(root_ui, editor, commands);
+    crate::ui::dialogs::editing::draw_insert_point_at_elevation_dialog(root_ui, editor, commands);
     crate::ui::dialogs::editing::draw_move_layer_dialog(root_ui, editor, project, commands);
 
     // --- Canvas right-click context menu ---
@@ -821,15 +889,18 @@ fn draw_ui(
     }
     if editor.offset_awaiting_side_pick && !editor.offset_preview_screen_px.is_empty() {
         let ppp = root_ui.ctx().pixels_per_point();
-        let pts: Vec<egui::Pos2> = editor
+        // Entries stay index-aligned with the world arrays; a clipped vertex
+        // is `None` so guides pair the right endpoints and preview ranges
+        // never shift onto different vertices.
+        let pts: Vec<Option<egui::Pos2>> = editor
             .offset_preview_screen_px
             .iter()
-            .map(|(x, y)| egui::pos2(x / ppp, y / ppp))
+            .map(|point| point.map(|(x, y)| egui::pos2(x / ppp, y / ppp)))
             .collect();
-        let src_pts: Vec<egui::Pos2> = editor
+        let src_pts: Vec<Option<egui::Pos2>> = editor
             .offset_source_screen_px
             .iter()
-            .map(|(x, y)| egui::pos2(x / ppp, y / ppp))
+            .map(|point| point.map(|(x, y)| egui::pos2(x / ppp, y / ppp)))
             .collect();
         let painter = root_ui.painter().with_clip_rect(canvas_rect);
         let yellow = egui::Color32::from_rgb(255, 220, 0);
@@ -838,8 +909,10 @@ fn draw_ui(
             egui::Color32::from_rgba_unmultiplied(255, 230, 40, 220),
         );
         for (from, to) in src_pts.iter().zip(pts.iter()) {
-            for seg in dashed_line_segments(*from, *to, 6.0, 4.0) {
-                painter.line_segment(seg, guide);
+            if let (Some(from), Some(to)) = (from, to) {
+                for seg in dashed_line_segments(*from, *to, 6.0, 4.0) {
+                    painter.line_segment(seg, guide);
+                }
             }
         }
         let stroke = egui::Stroke::new(2.0, yellow);
@@ -853,8 +926,10 @@ fn draw_ui(
                 } else {
                     i + 1
                 };
-                if next < end {
-                    painter.line_segment([pts[i], pts[next]], stroke);
+                if next < end
+                    && let (Some(a), Some(b)) = (pts[i], pts[next])
+                {
+                    painter.line_segment([a, b], stroke);
                 }
             }
         }
@@ -871,6 +946,15 @@ fn draw_ui(
         ViewportLabel::new("viewport_tool_label", label.text, canvas_rect)
             .style(label.style)
             .show(root_ui.ctx());
+    }
+    // Slice view: config dock + top-down minimap
+    if editor.slice_mode_enabled {
+        crate::ui::dialogs::editing::draw_slice_panel(root_ui, editor, commands, canvas_rect);
+        crate::ui::widgets::viewport::ViewportMiniMap::new("slice_minimap", canvas_rect).show(
+            root_ui.ctx(),
+            editor,
+            commands,
+        );
     }
     // Batter Berm
     if editor.active_tool == ActiveTool::BatterBermOffset && !editor.batter_berm_dialog_open {
@@ -987,6 +1071,25 @@ fn draw_ui(
     )
     .show(root_ui.ctx(), editor, commands);
 
+    geometry_dirty |=
+        draw_global_dialogs(root_ui, editor, document, project, block_models, commands);
+
+    geometry_dirty
+}
+
+/// Draw dialogs after the active tab's content so modal lifecycle state is
+/// never hidden by a Preferences or data-table tab. These dialogs are global
+/// application state even when their contents refer to workspace data.
+fn draw_global_dialogs(
+    root_ui: &mut egui::Ui,
+    editor: &mut EditorState,
+    document: &mut Document,
+    project: &UiProjectView,
+    block_models: &[OpenBlockModel],
+    commands: &mut Vec<UiCommand>,
+) -> bool {
+    let mut geometry_dirty = false;
+
     // Exit confirmation
     if editor.exit_confirm_open {
         crate::ui::dialogs::confirmations::draw_exit_confirm_dialog(root_ui, commands, editor);
@@ -1005,16 +1108,9 @@ fn draw_ui(
     }
 
     // Dirty PIDB close confirmation
-    if editor.pending_close_project.is_some() {
-        crate::ui::dialogs::confirmations::draw_close_project_dialog(
+    if editor.pending_close_pidb.is_some() {
+        crate::ui::dialogs::confirmations::draw_close_pidb_dialog(
             root_ui, commands, editor, project,
-        );
-    }
-
-    // Dirty-layer unload confirmation
-    if !editor.pending_unload_queue.is_empty() {
-        crate::ui::dialogs::confirmations::draw_pending_unload_layer_dialog(
-            root_ui, commands, editor,
         );
     }
 

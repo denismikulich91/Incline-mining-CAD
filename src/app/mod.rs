@@ -5,8 +5,10 @@ pub(crate) mod io; /* Handles session serialisation */
 pub(crate) mod jobs; // Reusable background-compute job queue
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs,
+    hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
     time::{Duration, Instant},
@@ -31,6 +33,7 @@ use crate::{
         block_model::{BlockModelId, BlockModelSource, OpenBlockModel},
         formats::MeshFormat,
         pidb::{self, OpenProject, Workspace},
+        raster::OpenRasterTexture,
         spatial::ObjectSnapIndex,
         triangulation::{OpenTriangulation, TriangulationId},
     },
@@ -83,10 +86,101 @@ pub(crate) struct GizmoDragState {
     pub(crate) start_delta: DVec3,
 }
 
+/// A live Move preview belongs to the project whose objects were captured.
+/// Keeping that identity with the originals prevents a later project switch
+/// from committing or restoring the preview in a different document.
+pub(crate) struct MoveSession {
+    pub(crate) project_runtime_id: u32,
+    pub(crate) originals: Vec<Object>,
+}
+
+/// Stable identity for one background operation. Every pending receiver owns
+/// exactly one ticket, so cancellation/completion can settle only its own
+/// progress state instead of decrementing a shared counter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct BackgroundTaskTicket(u64);
+
+#[derive(Default)]
+struct BackgroundTaskState {
+    next_ticket: u64,
+    cpu_pending: HashSet<BackgroundTaskTicket>,
+    awaiting_apply: HashSet<BackgroundTaskTicket>,
+    gpu_pending: HashSet<BackgroundTaskTicket>,
+}
+
+impl BackgroundTaskState {
+    fn begin(&mut self) -> BackgroundTaskTicket {
+        loop {
+            let ticket = BackgroundTaskTicket(self.next_ticket);
+            self.next_ticket = self.next_ticket.wrapping_add(1);
+            if !self.awaiting_apply.contains(&ticket)
+                && !self.gpu_pending.contains(&ticket)
+                && self.cpu_pending.insert(ticket)
+            {
+                return ticket;
+            }
+        }
+    }
+
+    fn settle_cpu(&mut self, ticket: BackgroundTaskTicket, needs_gpu: bool) {
+        if !self.cpu_pending.remove(&ticket) {
+            debug_assert!(
+                false,
+                "unknown or double-completed background ticket {ticket:?}"
+            );
+            return;
+        }
+        let inserted = self.awaiting_apply.insert(ticket);
+        debug_assert!(inserted, "background ticket was already awaiting apply");
+        let removed = self.awaiting_apply.remove(&ticket);
+        debug_assert!(removed, "background apply ticket disappeared");
+        if needs_gpu {
+            let inserted = self.gpu_pending.insert(ticket);
+            debug_assert!(inserted, "background ticket was already pending GPU upload");
+        }
+    }
+
+    fn cancel(&mut self, ticket: BackgroundTaskTicket) {
+        let removed = self.cpu_pending.remove(&ticket)
+            || self.awaiting_apply.remove(&ticket)
+            || self.gpu_pending.remove(&ticket);
+        debug_assert!(
+            removed,
+            "unknown or double-cancelled background ticket {ticket:?}"
+        );
+    }
+
+    fn finish_gpu_uploads(&mut self) {
+        self.gpu_pending.clear();
+    }
+
+    fn has_gpu_uploads(&self) -> bool {
+        !self.gpu_pending.is_empty()
+    }
+
+    fn is_busy(&self) -> bool {
+        !self.cpu_pending.is_empty()
+            || !self.awaiting_apply.is_empty()
+            || !self.gpu_pending.is_empty()
+    }
+}
+
 pub(crate) struct App<'a> {
     close_requested: bool,
+    /// Set when the renderer failed unrecoverably. Distinct from the ordinary
+    /// `close_requested` flag: fatal shutdown first writes recovery copies of
+    /// every dirty PIDB and waits for background writers to settle.
+    fatal_shutdown: bool,
+    /// Consecutive surface-validation failures survived via reconfigure.
+    /// Reset by a successful frame; beyond the bound the failure is fatal.
+    render_validation_recovery_attempts: u32,
     exit_after_pending_saves: bool,
+    discard_changes_on_deferred_exit: bool,
     redraw_requested: bool,
+    /// Wake deadline requested by egui (cursor blink, tooltip delay, etc.).
+    /// Keeping it in the application event loop prevents timed repaints from
+    /// being discarded when there is otherwise no window activity.
+    next_ui_repaint_deadline: Option<Instant>,
     window: Option<Arc<Window>>,
     graphics: Option<Graphics<'a>>,
     /// Latest non-zero window size awaiting surface reconfiguration. Resize
@@ -99,6 +193,9 @@ pub(crate) struct App<'a> {
     last_road_preview_update_instant: Option<Instant>,
     editor: EditorState,
     workspace: Workspace,
+    /// Explorer/menu snapshot reused while its allocation-free source
+    /// fingerprint is unchanged.
+    ui_project_view_cache: RefCell<Option<(u64, Arc<UiProjectView>)>>,
     startup_dialog_dismissed: bool,
     triangulations: Vec<OpenTriangulation>,
     triangulation_dirs: Vec<PathBuf>,
@@ -117,6 +214,9 @@ pub(crate) struct App<'a> {
     point_clouds: Vec<crate::model::point_cloud::OpenPointCloud>,
     point_cloud_files: Vec<PathBuf>,
     next_point_cloud_id: u64,
+    raster_textures: Vec<OpenRasterTexture>,
+    raster_files: Vec<PathBuf>,
+    next_raster_texture_id: u64,
     empty_document: Document,
     scene_document: Document,
     snap_index: ObjectSnapIndex,
@@ -128,11 +228,11 @@ pub(crate) struct App<'a> {
     /// `refresh_scene_road_network`; cleared with the snap index.
     scene_road_network: Option<crate::model::road_network::ResolvedNetwork>,
     /// Ghost-free compromised-road keys of the active document, keyed by
-    /// `(active project index, document revision)`. Grandfathers pre-existing
-    /// rule violations during per-cursor-move ghost validation without
-    /// rebuilding the ghost-free topology each tick.
+    /// document revision. Grandfathers pre-existing rule violations during
+    /// per-cursor-move ghost validation without rebuilding the ghost-free
+    /// topology each tick.
     road_preexisting_cache: Option<(
-        usize,
+        u32,
         u64,
         std::collections::HashSet<crate::model::road_network::RoadKey>,
     )>,
@@ -149,21 +249,27 @@ pub(crate) struct App<'a> {
     /// True after a pending right press has become an active camera orbit drag.
     right_orbit_active: bool,
     pending_topology_click: Option<(SceneEntityId, DVec3)>,
-    move_session_original: Option<Vec<Object>>,
-    topology_load_pending_gpu: bool,
-    /// Number of triangulation loads currently running on background threads.
-    pending_loads: usize,
+    move_session_original: Option<MoveSession>,
+    background_tasks: BackgroundTaskState,
     pending_triangulation_loads: Vec<(
+        BackgroundTaskTicket,
         PathBuf,
         mpsc::Receiver<anyhow::Result<crate::model::triangulation::LoadedTriangulation>>,
     )>,
     pending_block_model_loads: Vec<(
+        BackgroundTaskTicket,
         BlockModelSource,
         mpsc::Receiver<anyhow::Result<crate::model::block_model::LoadedBlockModel>>,
     )>,
     pending_point_cloud_loads: Vec<(
+        BackgroundTaskTicket,
         PathBuf,
         mpsc::Receiver<anyhow::Result<crate::model::point_cloud::LoadedPointCloud>>,
+    )>,
+    pending_raster_loads: Vec<(
+        BackgroundTaskTicket,
+        PathBuf,
+        mpsc::Receiver<anyhow::Result<crate::model::raster::LoadedRasterTexture>>,
     )>,
     pub(crate) pending_file_dialogs: Vec<PendingFileDialog>,
     /// Triangulation saves/exports running on background threads; drained by
@@ -179,8 +285,12 @@ impl<'a> App<'a> {
     pub(crate) fn new() -> Result<Self> {
         let mut app = Self {
             close_requested: false,
+            fatal_shutdown: false,
+            render_validation_recovery_attempts: 0,
             exit_after_pending_saves: false,
+            discard_changes_on_deferred_exit: false,
             redraw_requested: false,
+            next_ui_repaint_deadline: None,
             window: None,
             graphics: None,
             pending_resize: None,
@@ -190,6 +300,7 @@ impl<'a> App<'a> {
             last_road_preview_update_instant: None,
             editor: EditorState::new(),
             workspace: Workspace::default(),
+            ui_project_view_cache: RefCell::new(None),
             startup_dialog_dismissed: false,
             triangulations: Vec::new(),
             triangulation_dirs: Vec::new(),
@@ -205,6 +316,9 @@ impl<'a> App<'a> {
             point_clouds: Vec::new(),
             point_cloud_files: Vec::new(),
             next_point_cloud_id: 0,
+            raster_textures: Vec::new(),
+            raster_files: Vec::new(),
+            next_raster_texture_id: 0,
             empty_document: Document::new(),
             scene_document: Document::new(),
             snap_index: ObjectSnapIndex::default(),
@@ -220,11 +334,11 @@ impl<'a> App<'a> {
             right_orbit_active: false,
             pending_topology_click: None,
             move_session_original: None,
-            topology_load_pending_gpu: false,
-            pending_loads: 0,
+            background_tasks: BackgroundTaskState::default(),
             pending_triangulation_loads: Vec::new(),
             pending_block_model_loads: Vec::new(),
             pending_point_cloud_loads: Vec::new(),
+            pending_raster_loads: Vec::new(),
             pending_file_dialogs: Vec::new(),
             pending_saves: Vec::new(),
             pending_jobs: Vec::new(),
@@ -252,6 +366,7 @@ impl<'a> App<'a> {
 
         app.load_session_projects(&session);
         app.editor.topology_wireframes_enabled = config.topology_wireframes_enabled;
+        app.editor.show_points = config.show_points;
         app.editor.dark_mode = config.dark_mode;
         app.editor.show_console = config.show_console;
         app.editor.show_world_axis_gizmo = config.show_world_axis_gizmo;
@@ -264,6 +379,49 @@ impl<'a> App<'a> {
             .clamp(1, 64);
         app.editor.frame_counter_enabled = config.frame_counter_enabled;
         app.editor.debug_chunk_coloring = config.debug_chunk_coloring;
+        app.editor.debug_clip_planes = config.debug_clip_planes;
+        app.editor.plan_orbit_sensitivity = io::finite_clamped(
+            config.plan_orbit_sensitivity,
+            0.0001,
+            0.02,
+            io::default_plan_orbit_sensitivity(),
+        );
+        app.editor.plan_zoom_sensitivity = io::finite_clamped(
+            config.plan_zoom_sensitivity,
+            0.0001,
+            0.05,
+            io::default_plan_zoom_sensitivity(),
+        );
+        app.editor.plan_invert_vertical_look = config.plan_invert_vertical_look;
+        app.editor.plan_invert_horizontal_look = config.plan_invert_horizontal_look;
+        app.editor.plan_zoom_towards_cursor = config.plan_zoom_towards_cursor;
+        app.editor.fly_field_of_view_degrees = io::finite_clamped(
+            config.fly_field_of_view_degrees,
+            20.0,
+            120.0,
+            io::default_fly_field_of_view_degrees(),
+        );
+        app.editor.fly_mouse_look_sensitivity = io::finite_clamped(
+            config.fly_mouse_look_sensitivity,
+            0.0001,
+            0.02,
+            io::default_fly_mouse_look_sensitivity(),
+        );
+        app.editor.fly_invert_vertical_look = config.fly_invert_vertical_look;
+        app.editor.fly_invert_horizontal_look = config.fly_invert_horizontal_look;
+        app.editor.fly_near_clip_limit = io::finite_clamped(
+            config.fly_near_clip_limit,
+            0.01,
+            100.0,
+            io::default_fly_near_clip_limit(),
+        );
+        app.editor.fly_max_clip_span = io::finite_clamped(
+            config.fly_max_clip_span,
+            100.0,
+            1_000_000.0,
+            io::default_fly_max_clip_span(),
+        );
+        app.configure_graphics_camera_preferences();
 
         Ok(app)
     }
@@ -278,10 +436,15 @@ impl<'a> App<'a> {
         let Some(index) = self.workspace.project_index_for_object(object_id) else {
             return false;
         };
-        if self.workspace.active_index != Some(index) {
-            self.history.clear();
-        }
-        self.workspace.set_active_index(index);
+        self.activate_project_index(index);
+        true
+    }
+
+    pub(crate) fn activate_project_for_layer(&mut self, layer_id: LayerId) -> bool {
+        let Some(index) = self.workspace.project_index_for_layer(layer_id) else {
+            return false;
+        };
+        self.activate_project_index(index);
         true
     }
 
@@ -300,92 +463,44 @@ impl<'a> App<'a> {
     }
 
     fn set_active_project(&mut self, project: OpenProject) {
-        self.workspace.add_and_activate(project);
+        let index = self.workspace.add_and_activate(project);
         self.clear_editor_transient_state();
+        self.history
+            .activate(self.workspace.projects[index].runtime_id);
         self.invalidate_geometry();
         self.persist_session();
     }
 
+    fn activate_project_index(&mut self, index: usize) {
+        if self.workspace.active_index == Some(index) {
+            return;
+        }
+        let active_tool = self.editor.active_tool;
+        self.clear_editor_transient_state();
+        // Object interaction is allowed to retarget the current tool to a
+        // different PIDB. Its project-specific preview state was cleared
+        // above, but the chosen tool itself remains armed.
+        self.editor.active_tool = active_tool;
+        self.workspace.set_active_index(index);
+        self.history
+            .activate(self.workspace.projects[index].runtime_id);
+        self.persist_session();
+        self.invalidate_overlay();
+    }
+
     fn clear_editor_transient_state(&mut self) {
-        self.history.clear();
-        self.editor.selected_handles.clear();
-        self.editor.hidden_handles.clear();
-        self.editor.frozen_handles.clear();
-        self.editor.translucent_handles.clear();
-        self.editor.active_layer = None;
-        self.editor.active_tool = crate::ui::state::ActiveTool::None;
-        self.editor.new_layer_dialog_open = false;
-        self.editor.new_layer_project_index = None;
-        self.editor.selection_box_start_px = None;
-        self.editor.selection_box_current_px = None;
-        self.editor.pending_stroke.clear();
-        self.editor.poly_finish_dialog = false;
-        self.editor.poly_finish_dialog_px = None;
-        self.editor.move_to_layer_dialog = None;
-        self.editor.move_layer_dialog = None;
+        // Resolve document-backed drafts while their source identity is still
+        // available. These helpers locate the owning project explicitly, so
+        // this is also safe when a newly opened project has already become
+        // active.
+        if self.has_pending_move_delta() {
+            self.restore_move_session_original();
+        }
+        if self.editor.text_editing_enabled {
+            self.cancel_text_edit();
+        }
+        self.editor.clear_project_transients();
         self.pending_topology_click = None;
-        self.editor.measurement_start = None;
-        self.editor.measurement_end = None;
-        self.editor.berm_angle_points.clear();
-        self.editor.text_editing_enabled = false;
-        self.editor.editing_labels_id = None;
-        self.editor.text_edit_dialog_px = None;
-        self.editor.text_edit_position_frames = 0;
-        self.editor.text_edit_focus_requested = false;
-        self.editor.text_edit_created = false;
-        // Cancel any in-progress offset operation.
-        self.editor.offset_dialog_open = false;
-        self.editor.offset_target_id = None;
-        self.editor.offset_target_ids.clear();
-        self.editor.offset_awaiting_side_pick = false;
-        self.editor.offset_preview_world.clear();
-        self.editor.offset_source_world.clear();
-        self.editor.offset_preview_screen_px.clear();
-        self.editor.offset_source_screen_px.clear();
-        self.editor.offset_preview_ranges.clear();
-        // Cancel any in-progress relimit operation.
-        self.editor.relimit_dialog_open = false;
-        self.editor.relimit_source_id = None;
-        self.editor.relimit_awaiting_source_pick = false;
-        self.editor.relimit_waiting_for_pick = false;
-        self.editor.relimit_confirming_end = false;
-        self.editor.relimit_second_id = None;
-        self.editor.relimit_intersection_3d = None;
-        self.editor.relimit_candidates.clear();
-        self.editor.relimit_hover_target_id = None;
-        self.editor.relimit_hover_target_screen_px.clear();
-        self.editor.relimit_preview_from_px = None;
-        self.editor.relimit_preview_to_px = None;
-        // Clear road/fuse/batter-berm previews.
-        self.editor.road_dialog_open = false;
-        self.editor.road_preview_left_world.clear();
-        self.editor.road_preview_right_world.clear();
-        self.editor.road_preview_left_screen_px.clear();
-        self.editor.road_preview_right_screen_px.clear();
-        self.editor.road_preview_center_screen_px.clear();
-        self.editor.fuse_segments.clear();
-        self.editor.fuse_awaiting_endpoint = None;
-        self.editor.fuse_endpoint_markers.clear();
-        self.editor.fuse_chain_tail = None;
-        self.editor.fuse_close_marker = None;
-        self.editor.batter_berm_dialog_open = false;
-        self.editor.batter_berm_target_id = None;
-        self.editor.batter_berm_rings_world.clear();
-        self.editor.batter_berm_source_world.clear();
-        self.editor.batter_berm_guides_world.clear();
-        self.editor.batter_berm_rings_screen_px.clear();
-        self.editor.batter_berm_source_screen_px.clear();
-        self.editor.batter_berm_guides_screen_px.clear();
-        self.editor.batter_berm_preview_key = None;
-        self.editor.tool_highlight_id = None;
-        // Clear chamfer tool state.
-        self.editor.chamfer_poly_id = None;
-        self.editor.chamfer_corner_index = None;
-        self.editor.chamfer_gizmo_drag_start_px = None;
-        self.editor.chamfer_gizmo_hovered = false;
-        self.editor.chamfer_preview_screen_px.clear();
-        // Clear bezier tool state.
-        self.clear_bezier_state();
         // Clear any in-progress move session so it cannot bleed into the new PIDB.
         self.move_session_original = None;
         self.drag = None;
@@ -437,7 +552,7 @@ impl<'a> App<'a> {
     /// invalidated it. Call before handing `self.snap_index` to a query.
     fn refresh_snap_index(&mut self) {
         if self.snap_index_dirty {
-            self.snap_index = ObjectSnapIndex::build(self.scene_document.objects());
+            self.snap_index = ObjectSnapIndex::build(&self.scene_document);
             self.snap_index_dirty = false;
         }
     }
@@ -460,21 +575,20 @@ impl<'a> App<'a> {
     fn road_preexisting_compromised(
         &mut self,
     ) -> std::collections::HashSet<crate::model::road_network::RoadKey> {
-        let Some(index) = self.workspace.active_index else {
+        let Some(project) = self.workspace.active_project() else {
             return Default::default();
         };
-        let Some(document) = self.workspace.active_document() else {
-            return Default::default();
-        };
+        let runtime_id = project.runtime_id;
+        let document = &project.pidb.document;
         let revision = document.revision();
-        if let Some((cached_index, cached_revision, keys)) = &self.road_preexisting_cache
-            && *cached_index == index
+        if let Some((cached_runtime_id, cached_revision, keys)) = &self.road_preexisting_cache
+            && *cached_runtime_id == runtime_id
             && *cached_revision == revision
         {
             return keys.clone();
         }
         let keys = crate::model::road_network::prepare(document, None).compromised_keys();
-        self.road_preexisting_cache = Some((index, revision, keys.clone()));
+        self.road_preexisting_cache = Some((runtime_id, revision, keys.clone()));
         keys
     }
 
@@ -485,34 +599,47 @@ impl<'a> App<'a> {
         self.redraw_requested = true;
     }
 
-    pub(crate) fn begin_topology_load(&mut self) {
-        self.pending_loads += 1;
-        if let Some(window) = &self.window {
-            window.set_cursor(CursorIcon::Progress);
-        }
+    pub(crate) fn begin_topology_load(&mut self) -> BackgroundTaskTicket {
+        let ticket = self.background_tasks.begin();
+        self.update_background_task_cursor();
         self.redraw_requested = true;
+        ticket
     }
 
+    /// Move one CPU ticket through the UI-apply phase and either settle it or
+    /// retain it until the renderer confirms its GPU upload is complete.
+    pub(crate) fn finish_background_task(&mut self, ticket: BackgroundTaskTicket, needs_gpu: bool) {
+        self.background_tasks.settle_cpu(ticket, needs_gpu);
+        self.update_background_task_cursor();
+    }
+
+    pub(crate) fn cancel_background_task(&mut self, ticket: BackgroundTaskTicket) {
+        self.background_tasks.cancel(ticket);
+        self.update_background_task_cursor();
+    }
+
+    /// GPU-upload completion for the load pipeline: called after a render in
+    /// which all renderer upload queues are empty.
     pub(crate) fn finish_topology_load(&mut self) {
-        self.topology_load_pending_gpu = false;
-        if self.pending_loads == 0
-            && let Some(window) = &self.window
-        {
-            window.set_cursor(CursorIcon::Default);
-        }
+        self.background_tasks.finish_gpu_uploads();
+        self.update_background_task_cursor();
     }
 
-    /// Complete one background save. Unlike `finish_topology_load` this must
-    /// not clear `topology_load_pending_gpu` — that flag belongs to the load
-    /// pipeline, whose deferred completion still needs it if a load's GPU
-    /// upload is outstanding when a save finishes.
-    pub(crate) fn finish_background_save(&mut self) {
-        self.pending_loads = self.pending_loads.saturating_sub(1);
-        if self.pending_loads == 0
-            && !self.topology_load_pending_gpu
-            && let Some(window) = &self.window
-        {
-            window.set_cursor(CursorIcon::Default);
+    pub(crate) fn topology_uploads_pending(&self) -> bool {
+        self.background_tasks.has_gpu_uploads()
+    }
+
+    pub(crate) fn background_tasks_pending(&self) -> bool {
+        self.background_tasks.is_busy()
+    }
+
+    fn update_background_task_cursor(&self) {
+        if let Some(window) = &self.window {
+            window.set_cursor(if self.background_tasks.is_busy() {
+                CursorIcon::Progress
+            } else {
+                CursorIcon::Default
+            });
         }
     }
 
@@ -529,6 +656,23 @@ impl<'a> App<'a> {
         }
     }
 
+    /// One definition of scene emptiness for load/apply and camera fitting.
+    /// Evaluate immediately before installing a completed async result so
+    /// concurrent loaders cannot all act on a stale start-time snapshot.
+    pub(crate) fn scene_has_renderables(&self) -> bool {
+        self.workspace.projects.iter().any(|project| {
+            project
+                .pidb
+                .document
+                .objects()
+                .iter()
+                .any(|object| project.loaded_layers.contains(&object.layer()))
+        }) || !self.triangulations.is_empty()
+            || !self.block_models.is_empty()
+            || !self.point_clouds.is_empty()
+            || !self.raster_textures.is_empty()
+    }
+
     fn teardown_window(&mut self) {
         self.graphics = None;
         self.window = None;
@@ -537,37 +681,136 @@ impl<'a> App<'a> {
         self.redraw_requested = false;
     }
 
-    fn project_view(&self) -> UiProjectView {
-        let projects = self
+    fn sync_slice_preview_window(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        if !self.editor.slice_preview_detached
+            || self
+                .graphics
+                .as_ref()
+                .is_some_and(|graphics| graphics.slice_preview_window_id().is_some())
+        {
+            return;
+        }
+        let attributes = Window::default_attributes()
+            .with_title(format!("{} — Top-down slice preview", crate::APP_NAME))
+            .with_window_icon(window_icon())
+            .with_min_inner_size(winit::dpi::PhysicalSize::new(320, 240))
+            .with_inner_size(winit::dpi::PhysicalSize::new(800, 700));
+        #[cfg(target_os = "linux")]
+        let attributes = attributes.with_name(crate::APP_ID, crate::APP_ID);
+        let result = event_loop
+            .create_window(attributes)
+            .map(Arc::new)
+            .map_err(anyhow::Error::from)
+            .and_then(|window| {
+                self.graphics
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("renderer is not initialized"))?
+                    .open_slice_preview(window)
+            });
+        if let Err(error) = result {
+            log::error!("Failed to detach top-down preview: {error:#}");
+            self.editor.slice_preview_detached = false;
+        }
+    }
+
+    fn project_view_key(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.workspace.active_index.hash(&mut hasher);
+        self.startup_dialog_dismissed.hash(&mut hasher);
+        for project in &self.workspace.projects {
+            project.runtime_id.hash(&mut hasher);
+            project.path.hash(&mut hasher);
+            project.pidb.metadata.name.hash(&mut hasher);
+            project.has_unsaved_changes().hash(&mut hasher);
+            let mut loaded_layers: Vec<_> = project.loaded_layers.iter().copied().collect();
+            loaded_layers.sort_unstable_by_key(|layer| layer.0);
+            loaded_layers.hash(&mut hasher);
+            for layer in project.pidb.document.layers() {
+                layer.id.hash(&mut hasher);
+                layer.name.hash(&mut hasher);
+            }
+        }
+
+        self.triangulation_files.hash(&mut hasher);
+        self.triangulation_dirs.hash(&mut hasher);
+        self.triangulation_dir_entries.hash(&mut hasher);
+        self.active_triangulation.hash(&mut hasher);
+        for triangulation in &self.triangulations {
+            triangulation.id.hash(&mut hasher);
+            triangulation.name.hash(&mut hasher);
+            triangulation.path.hash(&mut hasher);
+            (triangulation.visible
+                && !self
+                    .editor
+                    .hidden_handles
+                    .contains(&triangulation.entity_id()))
+            .hash(&mut hasher);
+            triangulation.is_saved.hash(&mut hasher);
+            triangulation.raster_texture.hash(&mut hasher);
+            triangulation.color.map(f32::to_bits).hash(&mut hasher);
+        }
+
+        self.block_model_files.hash(&mut hasher);
+        self.active_block_model.hash(&mut hasher);
+        for model in &self.block_models {
+            model.id.hash(&mut hasher);
+            model.name.hash(&mut hasher);
+            model.source.hash(&mut hasher);
+            model.visible.hash(&mut hasher);
+            model.renderable_block_indices.len().hash(&mut hasher);
+            model.model.numeric_variables().len().hash(&mut hasher);
+        }
+
+        self.point_cloud_files.hash(&mut hasher);
+        for cloud in &self.point_clouds {
+            cloud.id.hash(&mut hasher);
+            cloud.name.hash(&mut hasher);
+            cloud.path.hash(&mut hasher);
+            cloud.visible.hash(&mut hasher);
+            cloud.points.len().hash(&mut hasher);
+        }
+
+        self.raster_files.hash(&mut hasher);
+        for raster in &self.raster_textures {
+            raster.id.hash(&mut hasher);
+            raster.name.hash(&mut hasher);
+            raster.path.hash(&mut hasher);
+            raster.source_size.hash(&mut hasher);
+            raster.driver_name.hash(&mut hasher);
+            raster.projection.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    fn project_view(&self) -> Arc<UiProjectView> {
+        let key = self.project_view_key();
+        if let Some((cached_key, view)) = self.ui_project_view_cache.borrow().as_ref()
+            && *cached_key == key
+        {
+            return Arc::clone(view);
+        }
+        let projects: Vec<UiProjectEntry> = self
             .workspace
             .projects
             .iter()
             .enumerate()
-            .map(|(i, p)| {
-                let dirty_layers = p.dirty_layers();
-                let dirty = !dirty_layers.is_empty();
-                UiProjectEntry {
-                    name: p.pidb.metadata.name.clone(),
-                    dirty,
-                    index: i,
-                    is_active: self.workspace.active_index == Some(i),
-                    path: p.path.clone(),
-                    layers: p
-                        .pidb
-                        .document
-                        .layers()
-                        .iter()
-                        .map(|l| {
-                            let is_loaded = p.loaded_layers.contains(&l.id);
-                            UiLayerEntry {
-                                id: l.id,
-                                name: l.name.clone(),
-                                is_loaded,
-                                dirty: dirty_layers.contains(&l.id),
-                            }
-                        })
-                        .collect(),
-                }
+            .map(|(index, project)| UiProjectEntry {
+                runtime_id: project.runtime_id,
+                name: project.pidb.metadata.name.clone(),
+                dirty: project.has_unsaved_changes(),
+                is_active: self.workspace.active_index == Some(index),
+                path: project.path.clone(),
+                layers: project
+                    .pidb
+                    .document
+                    .layers()
+                    .iter()
+                    .map(|layer| UiLayerEntry {
+                        id: layer.id,
+                        name: layer.name.clone(),
+                        is_loaded: project.loaded_layers.contains(&layer.id),
+                    })
+                    .collect(),
             })
             .collect();
         let loaded_by_path: BTreeMap<PathBuf, &OpenTriangulation> = self
@@ -587,7 +830,7 @@ impl<'a> App<'a> {
                 triangulations.push(UiTriangulationEntry {
                     id: Some(tri.id),
                     name: tri.name.clone(),
-                    visible: tri.visible,
+                    visible: tri.visible && !self.editor.hidden_handles.contains(&tri.entity_id()),
                     is_active: self.active_triangulation == Some(tri.id),
                     is_loaded: true,
                     is_saved: tri.is_saved,
@@ -622,7 +865,8 @@ impl<'a> App<'a> {
                             triangulations.push(UiTriangulationEntry {
                                 id: Some(tri.id),
                                 name: tri.name.clone(),
-                                visible: tri.visible,
+                                visible: tri.visible
+                                    && !self.editor.hidden_handles.contains(&tri.entity_id()),
                                 is_active: self.active_triangulation == Some(tri.id),
                                 is_loaded: true,
                                 is_saved: tri.is_saved,
@@ -656,7 +900,7 @@ impl<'a> App<'a> {
                 triangulations.push(UiTriangulationEntry {
                     id: Some(tri.id),
                     name: tri.name.clone(),
-                    visible: tri.visible,
+                    visible: tri.visible && !self.editor.hidden_handles.contains(&tri.entity_id()),
                     is_active: self.active_triangulation == Some(tri.id),
                     is_loaded: true,
                     is_saved: tri.is_saved,
@@ -770,6 +1014,51 @@ impl<'a> App<'a> {
             }
         }
 
+        let loaded_raster_by_path: BTreeMap<PathBuf, &OpenRasterTexture> = self
+            .raster_textures
+            .iter()
+            .map(|raster| (raster.path.clone(), raster))
+            .collect();
+        // Highlight only rasters a loaded triangulation is actually using;
+        // dormant session assignments waiting to be restored don't count.
+        let draped_raster_ids: BTreeSet<_> = self
+            .triangulations
+            .iter()
+            .filter_map(|triangulation| triangulation.raster_texture)
+            .collect();
+        let mut raster_textures = Vec::new();
+        let mut seen_rasters = BTreeSet::new();
+        for path in &self.raster_files {
+            if !seen_rasters.insert(path.clone()) {
+                continue;
+            }
+            if let Some(raster) = loaded_raster_by_path.get(path) {
+                raster_textures.push(crate::ui::state::UiRasterTextureEntry {
+                    name: raster.name.clone(),
+                    path: path.clone(),
+                    is_loaded: true,
+                    is_draped: draped_raster_ids.contains(&raster.id),
+                    source_size: raster.source_size,
+                    driver_name: raster.driver_name.clone(),
+                    projection: raster.projection.clone(),
+                });
+            } else {
+                raster_textures.push(crate::ui::state::UiRasterTextureEntry {
+                    name: path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("")
+                        .to_owned(),
+                    path: path.clone(),
+                    is_loaded: false,
+                    is_draped: false,
+                    source_size: [0, 0],
+                    driver_name: String::new(),
+                    projection: String::new(),
+                });
+            }
+        }
+
         let active_path = self.workspace.active_project().and_then(|p| p.path.clone());
         let active_triangulation_for_menu = self.active_triangulation.and_then(|id| {
             self.triangulations
@@ -777,22 +1066,26 @@ impl<'a> App<'a> {
                 .find(|tri| tri.id == id)
                 .map(|tri| (tri.id, tri.color))
         });
-        UiProjectView {
+        let view = Arc::new(UiProjectView {
             projects,
             triangulations,
             block_models,
             point_clouds,
-            active_index: self.workspace.active_index,
-            needs_startup_dialog: self.workspace.projects.is_empty()
+            raster_textures,
+            has_active_project: self.workspace.has_active_project(),
+            needs_startup_dialog: !self.workspace.has_active_project()
                 && !self.startup_dialog_dismissed,
             active_path,
             active_triangulation_for_menu,
-        }
+        });
+        *self.ui_project_view_cache.borrow_mut() = Some((key, Arc::clone(&view)));
+        view
     }
 
     /// Restore projects from a saved session. Called from `main` after startup.
-    /// Non-existent paths are silently skipped. If no CLI arg activated a project,
-    /// the session's active path determines which project becomes active.
+    /// Non-existent or invalid paths are skipped independently. All restored
+    /// PIDBs are parsed and kept open; the saved active path restores only the
+    /// editing target.
     pub(crate) fn load_session_projects(&mut self, session: &crate::app::io::Session) {
         let had_active = self.workspace.has_active_project();
         for path in &session.project_paths {
@@ -803,61 +1096,29 @@ impl<'a> App<'a> {
                 );
                 continue;
             }
-            // Skip if already open (e.g. opened via CLI arg).
-            if self
-                .workspace
-                .projects
-                .iter()
-                .any(|p| p.path.as_deref() == Some(path.as_path()))
-            {
+            if self.workspace.project_index_for_path(path).is_some() {
                 continue;
             }
             match pidb::load(path).and_then(|pidb| pidb::open_project(Some(path.clone()), pidb)) {
                 Ok(project) => {
                     self.workspace.add_inactive(project);
                 }
-                Err(e) => {
-                    log::warn!("Failed to reopen session project {}: {e}", path.display());
+                Err(error) => {
+                    log::warn!(
+                        "Failed to reopen session project {}: {error}",
+                        path.display()
+                    );
                 }
             }
         }
-        // Sort projects alphabetically by name (stable sort keeps existing order for ties).
-        if let Some(active_idx) = self.workspace.active_index {
-            let active_path = self
-                .workspace
-                .projects
-                .get(active_idx)
-                .and_then(|p| p.path.clone());
-            self.workspace
-                .projects
-                .sort_by(|a, b| a.pidb.metadata.name.cmp(&b.pidb.metadata.name));
-            // Restore the active index after sort.
-            self.workspace.active_index = active_path.as_deref().and_then(|ap| {
-                self.workspace
-                    .projects
-                    .iter()
-                    .position(|p| p.path.as_deref() == Some(ap))
-            });
-        } else {
-            self.workspace
-                .projects
-                .sort_by(|a, b| a.pidb.metadata.name.cmp(&b.pidb.metadata.name));
+        if !had_active
+            && let Some(active_path) = &session.active_path
+            && let Some(index) = self.workspace.project_index_for_path(active_path)
+        {
+            self.workspace.set_active_index(index);
         }
-        // If nothing was active from a CLI arg, activate the session's saved active project.
-        if !had_active {
-            if let Some(active_path) = &session.active_path
-                && let Some(i) = self
-                    .workspace
-                    .projects
-                    .iter()
-                    .position(|p| p.path.as_deref() == Some(active_path.as_path()))
-            {
-                self.workspace.active_index = Some(i);
-            }
-            // Fall back to first project if still nothing active.
-            if !self.workspace.has_active_project() && !self.workspace.projects.is_empty() {
-                self.workspace.active_index = Some(0);
-            }
+        if let Some(project) = self.workspace.active_project() {
+            self.history.activate(project.runtime_id);
         }
 
         // Restore folder-scanned triangulation directories.
@@ -894,6 +1155,11 @@ impl<'a> App<'a> {
         for path in &session.point_cloud_file_paths {
             if path.is_file() && !self.point_cloud_files.contains(path) {
                 self.point_cloud_files.push(path.clone());
+            }
+        }
+        for path in &session.raster_file_paths {
+            if path.is_file() && !self.raster_files.contains(path) {
+                self.raster_files.push(path.clone());
             }
         }
     }
@@ -935,7 +1201,7 @@ impl<'a> App<'a> {
             .workspace
             .projects
             .iter()
-            .filter_map(|p| p.path.clone())
+            .filter_map(|project| project.path.clone())
             .collect();
         paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
         let active_path = self.workspace.active_project().and_then(|p| p.path.clone());
@@ -957,6 +1223,10 @@ impl<'a> App<'a> {
             let deduped: BTreeSet<_> = self.point_cloud_files.iter().cloned().collect();
             deduped.into_iter().collect()
         };
+        let raster_file_paths: Vec<PathBuf> = {
+            let deduped: BTreeSet<_> = self.raster_files.iter().cloned().collect();
+            deduped.into_iter().collect()
+        };
         let session = crate::app::io::Session {
             project_paths: paths,
             active_path,
@@ -965,6 +1235,7 @@ impl<'a> App<'a> {
             triangulation_excluded_paths,
             block_model_sources,
             point_cloud_file_paths,
+            raster_file_paths,
         };
         if let Err(e) = crate::app::io::save_session(&session) {
             log::warn!("Failed to save session: {e}");
@@ -1033,6 +1304,23 @@ impl<'a> ApplicationHandler for App<'a> {
     }
 
     fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        // Background writers must be observed before honoring an exit request;
+        // otherwise a completed-but-unpolled export can be terminated here.
+        self.poll_saves();
+        if self.fatal_shutdown {
+            // The renderer is unusable, recovery copies have already been
+            // written; exit as soon as atomic background writers settle so an
+            // active export is not terminated mid-write.
+            if self.pending_saves.is_empty() {
+                self.teardown_window();
+                event_loop.exit();
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_millis(16),
+                ));
+            }
+            return;
+        }
         if self.close_requested {
             self.teardown_window();
             event_loop.exit();
@@ -1040,6 +1328,14 @@ impl<'a> ApplicationHandler for App<'a> {
         }
 
         self.poll_file_dialogs();
+        let now = Instant::now();
+        if self
+            .next_ui_repaint_deadline
+            .is_some_and(|deadline| deadline <= now)
+        {
+            self.next_ui_repaint_deadline = None;
+            self.redraw_requested = true;
+        }
         let continuous_redraw = self
             .graphics
             .as_ref()
@@ -1055,7 +1351,7 @@ impl<'a> ApplicationHandler for App<'a> {
             };
             if let Some(last_render) = self.last_render_time {
                 let deadline = last_render + frame_interval;
-                if Instant::now() < deadline {
+                if now < deadline {
                     event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
                     return;
                 }
@@ -1064,13 +1360,17 @@ impl<'a> ApplicationHandler for App<'a> {
             window.request_redraw();
         }
 
-        if !self.pending_file_dialogs.is_empty()
+        let task_poll_deadline = (!self.pending_file_dialogs.is_empty()
             || !self.pending_saves.is_empty()
-            || !self.pending_jobs.is_empty()
-        {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(16),
-            ));
+            || !self.pending_jobs.is_empty())
+        .then(|| now + Duration::from_millis(16));
+        let wake_deadline = match (task_poll_deadline, self.next_ui_repaint_deadline) {
+            (Some(task), Some(ui)) => Some(task.min(ui)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        };
+        if let Some(deadline) = wake_deadline {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }

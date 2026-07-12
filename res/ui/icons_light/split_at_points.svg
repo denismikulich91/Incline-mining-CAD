@@ -1,82 +1,9 @@
-<?xml version="1.0" encoding="UTF-8" standalone="no"?>
-<!-- Uploaded to: SVG Repo, www.svgrepo.com, Generator: SVG Repo Mixer Tools -->
-
-<svg
-   width="800px"
-   height="800px"
-   viewBox="0 0 24 24"
-   fill="none"
-   version="1.1"
-   id="svg1"
-   sodipodi:docname="split_at_points.svg"
-   inkscape:version="1.4.4 (dcaf3e7d9e, 2026-05-05)"
-   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
-   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
-   xmlns="http://www.w3.org/2000/svg"
-   xmlns:svg="http://www.w3.org/2000/svg">
-  <defs
-     id="defs1">
-    <rect
-       x="46.936733"
-       y="122.23108"
-       width="650.26932"
-       height="567.15219"
-       id="rect7" />
-  </defs>
-  <sodipodi:namedview
-     id="namedview1"
-     pagecolor="#ffffff"
-     bordercolor="#000000"
-     borderopacity="0.25"
-     inkscape:showpageshadow="2"
-     inkscape:pageopacity="0.0"
-     inkscape:pagecheckerboard="0"
-     inkscape:deskcolor="#d1d1d1"
-     inkscape:zoom="1.0226532"
-     inkscape:cx="308.51123"
-     inkscape:cy="356.42582"
-     inkscape:window-width="2560"
-     inkscape:window-height="1366"
-     inkscape:window-x="0"
-     inkscape:window-y="0"
-     inkscape:window-maximized="1"
-     inkscape:current-layer="svg1" />
-  <path
-     style="fill:none;stroke:#000000;stroke-width:2.36462;stroke-linecap:round;stroke-linejoin:round;stroke-dasharray:none;stroke-dashoffset:171.18;stroke-opacity:1"
-     d="M 8.5267926,2.4299823 H 2.6088674 V 21.363516 h 6.2999364"
-     id="path1" />
-  <ellipse
-     style="fill:#ff1700;fill-opacity:1;stroke:none;stroke-width:1.9979;stroke-linecap:round;stroke-linejoin:round;stroke-dasharray:none;stroke-dashoffset:171.18;stroke-opacity:1"
-     id="path2"
-     cx="9.8452492"
-     cy="2.5228496"
-     rx="1.6542497"
-     ry="2.0828176" />
-  <ellipse
-     style="fill:#ff6200;fill-opacity:1;stroke:none;stroke-width:1.9979;stroke-linecap:round;stroke-linejoin:round;stroke-dasharray:none;stroke-dashoffset:171.18;stroke-opacity:1"
-     id="ellipse2"
-     cx="9.8452492"
-     cy="21.38555"
-     rx="1.6542497"
-     ry="2.0828176" />
-  <path
-     style="fill:none;stroke:#000000;stroke-width:2.28473;stroke-linecap:round;stroke-linejoin:round;stroke-dasharray:none;stroke-dashoffset:171.18;stroke-opacity:1"
-     d="m 16.210879,2.4299823 h 5.524819 V 21.363516 h -5.881455"
-     id="path3" />
-  <ellipse
-     style="fill:#ff6200;fill-opacity:1;stroke:none;stroke-width:1.9304;stroke-linecap:round;stroke-linejoin:round;stroke-dasharray:none;stroke-dashoffset:171.18;stroke-opacity:1"
-     id="ellipse3"
-     cx="-14.980002"
-     cy="2.5228496"
-     rx="1.5443637"
-     ry="2.0828176"
-     transform="scale(-1,1)" />
-  <ellipse
-     style="fill:#ff1700;fill-opacity:1;stroke:none;stroke-width:1.9304;stroke-linecap:round;stroke-linejoin:round;stroke-dasharray:none;stroke-dashoffset:171.18;stroke-opacity:1"
-     id="ellipse4"
-     cx="-14.980002"
-     cy="21.38555"
-     rx="1.5443637"
-     ry="2.0828176"
-     transform="scale(-1,1)" />
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="800px" height="800px" fill="none" version="1.1" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+ <path d="m8.5268 2.43h-5.9179v18.934h6.2999" style="fill:none;stroke-dashoffset:171.18;stroke-linecap:round;stroke-linejoin:round;stroke-width:2.3646;stroke:#000"/>
+ <ellipse cx="9.8452" cy="2.5228" rx="1.6542" ry="2.0828" style="fill:#ff1700"/>
+ <ellipse cx="9.8452" cy="21.386" rx="1.6542" ry="2.0828" style="fill:#ff6200"/>
+ <path d="m16.211 2.43h5.5248v18.934h-5.8815" style="fill:none;stroke-dashoffset:171.18;stroke-linecap:round;stroke-linejoin:round;stroke-width:2.2847;stroke:#000"/>
+ <ellipse transform="scale(-1,1)" cx="-14.98" cy="2.5228" rx="1.5444" ry="2.0828" style="fill:#ff6200"/>
+ <ellipse transform="scale(-1,1)" cx="-14.98" cy="21.386" rx="1.5444" ry="2.0828" style="fill:#ff1700"/>
 </svg>

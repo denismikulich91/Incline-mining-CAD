@@ -96,27 +96,15 @@ impl<'a> App<'a> {
                     return;
                 }
 
-                let owner_changed = if let SceneEntityId::Object(object_id) = handle
-                    && let Some(index) = self.workspace.project_index_for_object(object_id)
-                {
-                    let changed = self.workspace.active_index != Some(index);
-                    if changed {
-                        self.history.clear();
-                        self.editor.selected_handles.clear();
-                    }
-                    self.workspace.set_active_index(index);
+                if let SceneEntityId::Object(object_id) = handle {
+                    self.activate_project_for_object(object_id);
                     self.editor.active_layer = self
                         .workspace
                         .active_document()
                         .and_then(|document| document.get_object(object_id))
                         .map(Object::layer);
-                    changed
-                } else {
-                    false
-                };
-                let selection_mode = if owner_changed {
-                    SelectionMode::Replace
-                } else if self.modifiers.shift_key() {
+                }
+                let selection_mode = if self.modifiers.shift_key() {
                     SelectionMode::Toggle
                 } else if self.modifiers.control_key() {
                     SelectionMode::Add
@@ -196,18 +184,16 @@ impl<'a> App<'a> {
                     .as_ref()
                     .map(|g| {
                         if cross_select {
-                            g.entities_touching_screen_rect(start, end)
+                            g.entities_touching_screen_rect(start, end, &self.editor.frozen_handles)
                         } else {
-                            g.entities_in_screen_rect(start, end)
+                            g.entities_in_screen_rect(start, end, &self.editor.frozen_handles)
                         }
                     })
                     .unwrap_or_default();
-                let active_project = self.workspace.active_index;
                 let active_object_ids = self.active_project_object_ids();
                 self.editor.selected_handles.clear();
                 for handle in enclosed {
                     if let crate::model::SceneEntityId::Object(id) = handle
-                        && active_project.is_some()
                         && active_object_ids.contains(&id)
                     {
                         self.editor.selected_handles.insert(handle);
@@ -234,9 +220,9 @@ impl<'a> App<'a> {
                     .as_ref()
                     .map(|g| {
                         if cross_select {
-                            g.entities_touching_screen_rect(start, end)
+                            g.entities_touching_screen_rect(start, end, &self.editor.frozen_handles)
                         } else {
-                            g.entities_in_screen_rect(start, end)
+                            g.entities_in_screen_rect(start, end, &self.editor.frozen_handles)
                         }
                     })
                     .unwrap_or_default();
@@ -310,18 +296,15 @@ impl<'a> App<'a> {
             .as_ref()
             .map(|graphics| {
                 if cross_select {
-                    graphics.entities_touching_screen_rect(start, end)
+                    graphics.entities_touching_screen_rect(start, end, &self.editor.frozen_handles)
                 } else {
-                    graphics.entities_in_screen_rect(start, end)
+                    graphics.entities_in_screen_rect(start, end, &self.editor.frozen_handles)
                 }
             })
             .unwrap_or_default();
-        let active_project = self.workspace.active_index;
         let active_object_ids = self.active_project_object_ids();
         enclosed.retain(|handle| match handle {
-            SceneEntityId::Object(object_id) => {
-                active_project.is_some() && active_object_ids.contains(object_id)
-            }
+            SceneEntityId::Object(object_id) => active_object_ids.contains(object_id),
             SceneEntityId::Triangulation(_) => true,
             SceneEntityId::BlockModel(_) => true,
         });
@@ -428,13 +411,20 @@ impl<'a> App<'a> {
     }
 }
 
-fn is_closed_polygon(obj: &Object) -> bool {
-    matches!(obj, Object::Polyline { verts, closed: true, .. } if verts.len() >= 3)
+fn is_triangulation_polyline(obj: &Object) -> bool {
+    matches!(
+        obj,
+        Object::Polyline {
+            verts,
+            closed,
+            ..
+        } if verts.len() >= if *closed { 3 } else { 2 }
+    )
 }
 
 fn is_triangulation_source_object(obj: &Object, source: TriCreateSource) -> bool {
     match source {
-        TriCreateSource::Polygons => is_closed_polygon(obj),
+        TriCreateSource::Polylines => is_triangulation_polyline(obj),
         TriCreateSource::Roads => {
             matches!(obj, Object::Road { centerline, .. } if centerline.len() >= 2)
         }

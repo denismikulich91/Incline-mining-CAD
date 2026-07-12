@@ -3,7 +3,11 @@
 use glam::DVec3;
 
 use crate::model::{
-    Document, Object, SceneEntityId, block_model::OpenBlockModel, point_cloud::OpenPointCloud,
+    Document, Object, SceneEntityId,
+    block_model::OpenBlockModel,
+    geometry::{polyline_bulge_bounds, text_bounds_corners},
+    point_cloud::OpenPointCloud,
+    road_network::{RoadKey, resolve},
     triangulation::OpenTriangulation,
 };
 
@@ -24,6 +28,7 @@ pub(crate) fn scene_bounds(
         .filter(|layer| !layer.visible)
         .map(|layer| layer.id)
         .collect();
+    let road_network = resolve(document, None);
     for object in document.objects() {
         if hidden_layers.contains(&object.layer())
             || hidden.contains(&SceneEntityId::Object(object.id()))
@@ -32,18 +37,46 @@ pub(crate) fn scene_bounds(
         }
 
         match object {
-            Object::Point { pos, .. } | Object::Text { pos, .. } => {
+            Object::Point { pos, .. } => {
                 min = min.min(*pos);
                 max = max.max(*pos);
                 any = true;
             }
-            Object::Polyline { verts, .. }
-            | Object::Road {
-                centerline: verts, ..
+            Object::Text {
+                pos,
+                content,
+                height,
+                rotation,
+                ..
             } => {
-                for vertex in verts {
-                    min = min.min(vertex.pos);
-                    max = max.max(vertex.pos);
+                for corner in text_bounds_corners(*pos, content, *height, *rotation) {
+                    min = min.min(corner);
+                    max = max.max(corner);
+                    any = true;
+                }
+            }
+            Object::Polyline { verts, closed, .. } => {
+                if let Some((object_min, object_max)) = polyline_bulge_bounds(verts, *closed) {
+                    min = min.min(object_min);
+                    max = max.max(object_max);
+                    any = true;
+                }
+            }
+            Object::Road { id, centerline, .. } => {
+                let mut found_resolved = false;
+                for edge in road_network.edges_for(RoadKey::Object(*id)) {
+                    for point in edge.center.iter().chain(&edge.left).chain(&edge.right) {
+                        min = min.min(*point);
+                        max = max.max(*point);
+                        any = true;
+                        found_resolved = true;
+                    }
+                }
+                if !found_resolved
+                    && let Some((object_min, object_max)) = polyline_bulge_bounds(centerline, false)
+                {
+                    min = min.min(object_min);
+                    max = max.max(object_max);
                     any = true;
                 }
             }

@@ -10,6 +10,10 @@ use glam::DVec3;
 use super::tri00t;
 
 const SNAPPY_STREAM_IDENTIFIER: &[u8] = b"\xff\x06\x00\x00sNaPpY";
+/// A DUF is parsed from one expanded design stream. Bound that stream before
+/// the heuristic scanners can retain geometry derived from it.
+const MAX_DUF_EXPANDED_BYTES: usize = 512 << 20;
+const DUF_DECODE_CHUNK_BYTES: usize = 64 << 10;
 
 const PROP_LAYER_NAME: u32 = 0x594;
 const PROP_COORD_X0: u32 = 0x52c;
@@ -84,6 +88,7 @@ pub(crate) struct DufSkipped {
 pub(crate) enum DufError {
     Io(io::Error),
     Decompress(String),
+    Invalid(String),
 }
 
 impl fmt::Display for DufError {
@@ -91,6 +96,7 @@ impl fmt::Display for DufError {
         match self {
             Self::Io(error) => write!(f, "{error}"),
             Self::Decompress(message) => write!(f, "{message}"),
+            Self::Invalid(message) => write!(f, "invalid DUF: {message}"),
         }
     }
 }
@@ -100,6 +106,7 @@ impl Error for DufError {
         match self {
             Self::Io(error) => Some(error),
             Self::Decompress(_) => None,
+            Self::Invalid(_) => None,
         }
     }
 }
@@ -111,10 +118,36 @@ pub(crate) fn read_duf(path: impl AsRef<Path>) -> Result<DufData, DufError> {
 
 pub(crate) fn read_duf_bytes(bytes: &[u8]) -> Result<DufData, DufError> {
     let data = decode_snappy_frame(bytes)?;
-    Ok(parse_duf_stream(&data))
+    // `scan_layers` deliberately supplies a synthetic "DUF Import" layer
+    // when a real file has geometry but no readable layer table. Do not use
+    // that fallback as evidence that arbitrary Snappy payloads are DUFs.
+    let has_named_layer = scan_string_property(&data, PROP_LAYER_NAME)
+        .into_iter()
+        .map(|name| clean_layer_name(&name))
+        .any(|name| is_useful_layer_name(&name));
+    let parsed = parse_duf_stream(&data);
+    let recognized = has_named_layer
+        || !parsed.points.is_empty()
+        || !parsed.polylines.is_empty()
+        || !parsed.polyfaces.is_empty()
+        || parsed.skipped.unsupported_design_entities > 0
+        || parsed.skipped.unsupported_mesh_entities > 0;
+    if !recognized {
+        return Err(DufError::Invalid(
+            "expanded stream contains no recognizable design structure".to_owned(),
+        ));
+    }
+    Ok(parsed)
 }
 
 pub(crate) fn decode_snappy_frame(bytes: &[u8]) -> Result<Vec<u8>, DufError> {
+    decode_snappy_frame_with_limit(bytes, MAX_DUF_EXPANDED_BYTES)
+}
+
+fn decode_snappy_frame_with_limit(
+    bytes: &[u8],
+    max_expanded_bytes: usize,
+) -> Result<Vec<u8>, DufError> {
     if !bytes.starts_with(SNAPPY_STREAM_IDENTIFIER) {
         return Err(DufError::Decompress(
             "DUF file is not a Snappy framed stream".to_owned(),
@@ -122,8 +155,41 @@ pub(crate) fn decode_snappy_frame(bytes: &[u8]) -> Result<Vec<u8>, DufError> {
     }
     let mut decoder = snap::read::FrameDecoder::new(bytes);
     let mut out = Vec::new();
-    io::Read::read_to_end(&mut decoder, &mut out)
-        .map_err(|error| DufError::Decompress(format!("Snappy decompression failed: {error}")))?;
+    let mut chunk = [0_u8; DUF_DECODE_CHUNK_BYTES];
+    loop {
+        let read = io::Read::read(&mut decoder, &mut chunk).map_err(|error| {
+            DufError::Decompress(format!("Snappy decompression failed: {error}"))
+        })?;
+        if read == 0 {
+            break;
+        }
+        let expanded_len = out.len().checked_add(read).ok_or_else(|| {
+            DufError::Decompress("Snappy expanded size overflows addressable memory".to_owned())
+        })?;
+        if expanded_len > max_expanded_bytes {
+            return Err(DufError::Decompress(format!(
+                "Snappy-expanded DUF exceeds the import limit of {max_expanded_bytes} bytes"
+            )));
+        }
+
+        if expanded_len > out.capacity() {
+            // Grow geometrically but never request capacity beyond the
+            // configured logical ceiling. `try_reserve_exact` turns address
+            // space exhaustion into an import error instead of a panic.
+            let target_capacity = out
+                .capacity()
+                .saturating_mul(2)
+                .max(expanded_len)
+                .min(max_expanded_bytes);
+            out.try_reserve_exact(target_capacity - out.len())
+                .map_err(|error| {
+                    DufError::Decompress(format!(
+                        "Could not allocate the Snappy-expanded DUF stream: {error}"
+                    ))
+                })?;
+        }
+        out.extend_from_slice(&chunk[..read]);
+    }
     Ok(out)
 }
 

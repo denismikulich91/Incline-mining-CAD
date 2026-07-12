@@ -4,6 +4,7 @@ pub(crate) struct ExplorerEntry {
     title: egui::WidgetText,
     selected: bool,
     icon_size: egui::Vec2,
+    reserve_toggle_gutter: bool,
 }
 
 impl ExplorerEntry {
@@ -16,6 +17,7 @@ impl ExplorerEntry {
             title: title.into(),
             selected: false,
             icon_size: egui::vec2(16.0, 16.0),
+            reserve_toggle_gutter: false,
         }
     }
 
@@ -29,6 +31,14 @@ impl egui::Widget for ExplorerEntry {
     fn ui(self, ui: &mut egui::Ui) -> egui::Response {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         ui.horizontal(|ui| {
+            if self.reserve_toggle_gutter {
+                // CollapsingState reserves exactly `spacing.indent` for its toggle.
+                // Match its zero-spacing gutter so this leaf starts at the same x.
+                let item_spacing = ui.spacing().item_spacing;
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.add_space(ui.spacing().indent);
+                ui.spacing_mut().item_spacing = item_spacing;
+            }
             let icon = ui.add(
                 egui::Image::new(self.icon)
                     .fit_to_exact_size(self.icon_size)

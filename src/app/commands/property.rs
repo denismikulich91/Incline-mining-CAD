@@ -100,18 +100,11 @@ impl<'a> App<'a> {
 
     pub(crate) fn move_objects_to_layer(
         &mut self,
-        project_index: usize,
         ids: Vec<ObjectId>,
         target_layer: LayerId,
         copy: bool,
     ) {
-        if self.workspace.active_index != Some(project_index) {
-            self.history.clear();
-            self.workspace.set_active_index(project_index);
-            self.editor.selected_handles.clear();
-        }
-
-        let Some(project) = self.workspace.projects.get_mut(project_index) else {
+        let Some(project) = self.workspace.active_project_mut() else {
             return;
         };
         if project.pidb.document.layer(target_layer).is_none() {

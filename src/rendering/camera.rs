@@ -9,7 +9,7 @@ use winit::{
 
 use crate::Size;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Camera {
     pub(crate) position: DVec3,
     yaw: f64,
@@ -90,6 +90,21 @@ impl Camera {
         self.position = center + DVec3::Z * zoom.max(MIN_ORTHO_ZOOM);
     }
 
+    /// Place the camera at `position` looking along `forward` with the given
+    /// `up`, keeping the focal point `target_distance` ahead.
+    pub(crate) fn look_to(
+        &mut self,
+        position: DVec3,
+        forward: DVec3,
+        up: DVec3,
+        target_distance: f64,
+    ) {
+        self.position = position;
+        self.target = position + forward * target_distance.max(MIN_ORTHO_ZOOM);
+        self.up = up;
+        self.sync_angles_from_forward();
+    }
+
     /// Centre the current view on `center` without changing its orientation.
     /// The camera distance tracks the orthographic half-height because the
     /// controller derives the projection zoom from that distance each frame.
@@ -102,28 +117,49 @@ impl Camera {
 
 const MIN_ORTHO_ZOOM: f64 = 1.0e-4;
 pub(crate) const PERSPECTIVE_FOV_Y: f64 = 40.0_f64.to_radians();
+const MIN_PERSPECTIVE_NEAR: f64 = 0.25;
+const MAX_PERSPECTIVE_DEPTH_SPAN: f64 = 150_000.0;
+const PERSPECTIVE_NEAR_PADDING_FRACTION: f64 = 0.1;
 
+fn padded_perspective_near(min_depth: f64, padding: f64, far: f64, near_limit: f64) -> f64 {
+    // A scene-scale padding value is useful at the far plane but disastrous
+    // at the near plane: subtracting (say) 25 m from geometry 20 m away would
+    // collapse the near plane to its hard minimum and throw away perspective
+    // depth precision. Keep at most a 10% margin in front of the nearest bounds.
+    let near_padding = padding.min(min_depth.max(0.0) * PERSPECTIVE_NEAR_PADDING_FRACTION);
+    (min_depth - near_padding)
+        .max(near_limit)
+        .min(far * (1.0 - f64::EPSILON))
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct Projection {
     aspect: f64,
     znear: f64,
     zfar: f64,
     pub(crate) zoom: f64,
     perspective: bool,
+    perspective_fov_y: f64,
+    min_perspective_near: f64,
+    max_perspective_depth_span: f64,
 }
 
 impl Projection {
     pub(crate) fn new(width: u32, height: u32, znear: f64, zfar: f64) -> Self {
         Self {
-            aspect: width as f64 / height as f64,
+            aspect: width.max(1) as f64 / height.max(1) as f64,
             znear,
             zfar,
             zoom: 1.0,
             perspective: false,
+            perspective_fov_y: PERSPECTIVE_FOV_Y,
+            min_perspective_near: MIN_PERSPECTIVE_NEAR,
+            max_perspective_depth_span: MAX_PERSPECTIVE_DEPTH_SPAN,
         }
     }
 
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
-        self.aspect = width as f64 / height as f64;
+        self.aspect = width.max(1) as f64 / height.max(1) as f64;
     }
 
     pub(crate) fn set_symmetric_depth_extent(&mut self, half_depth: f64) {
@@ -132,31 +168,125 @@ impl Projection {
         self.zfar = half_depth;
     }
 
+    /// Fit the clip planes to camera-space depths measured along the view
+    /// direction. Orthographic projection keeps its symmetric range, while
+    /// perspective can use the nearest visible depth as a genuinely tight
+    /// near plane (which is important for depth-buffer precision).
+    pub(crate) fn set_view_depth_range(&mut self, min_depth: f64, max_depth: f64, padding: f64) {
+        if !self.perspective {
+            self.set_symmetric_depth_extent(min_depth.abs().max(max_depth.abs()) + padding);
+            return;
+        }
+
+        let requested_far = (max_depth + padding).max(self.min_perspective_near * 2.0);
+        self.znear =
+            padded_perspective_near(min_depth, padding, requested_far, self.min_perspective_near);
+        self.zfar = requested_far.min(self.znear + self.max_perspective_depth_span);
+    }
+
     pub(crate) fn expand_symmetric_depth_extent(&mut self, half_depth: f64) {
         let current_half_depth = self.znear.abs().max(self.zfar.abs());
         self.set_symmetric_depth_extent(current_half_depth.max(half_depth));
     }
 
-    pub(crate) fn calc_matrix(&self) -> DMat4 {
-        if self.perspective {
-            let far = self.znear.abs().max(self.zfar.abs()).max(10_000.0);
-            let near = (far * 1.0e-4).max(1.0);
-            return dcamera::rh::proj::directx::perspective(
-                PERSPECTIVE_FOV_Y,
-                self.aspect,
-                near,
-                far,
-            );
+    pub(crate) fn expand_view_depth_range(&mut self, min_depth: f64, max_depth: f64, padding: f64) {
+        if !self.perspective {
+            self.expand_symmetric_depth_extent(min_depth.abs().max(max_depth.abs()) + padding);
+            return;
         }
 
-        let half_w = self.aspect * self.zoom;
-        let half_h = self.zoom;
-        dcamera::rh::proj::directx::orthographic(
-            -half_w, half_w, -half_h, half_h, self.znear, self.zfar,
-        )
+        let requested_far = (max_depth + padding).max(self.min_perspective_near * 2.0);
+        if max_depth + padding > self.min_perspective_near {
+            let near = padded_perspective_near(
+                min_depth,
+                padding,
+                requested_far.max(self.zfar),
+                self.min_perspective_near,
+            );
+            self.znear = self.znear.min(near);
+        }
+        self.zfar = self
+            .zfar
+            .max(requested_far)
+            .min(self.znear + self.max_perspective_depth_span);
+    }
+
+    pub(crate) fn calc_matrix(&self) -> DMat4 {
+        let projection = if self.perspective {
+            dcamera::rh::proj::directx::perspective(
+                self.perspective_fov_y,
+                self.aspect,
+                self.znear,
+                self.zfar,
+            )
+        } else {
+            let half_w = self.aspect * self.zoom;
+            let half_h = self.zoom;
+            dcamera::rh::proj::directx::orthographic(
+                -half_w, half_w, -half_h, half_h, self.znear, self.zfar,
+            )
+        };
+
+        // WebGPU pipelines cannot change their depth comparison dynamically,
+        // so both projection modes use the same reversed depth convention.
+        // Orthographic precision remains linear and otherwise unchanged;
+        // perspective gains the floating-point precision benefits of reversed-Z.
+        // In D3D/WebGPU clip space this remaps z to w-z: near 0 -> 1, far 1 -> 0.
+        let reverse_depth = DMat4::from_cols(
+            glam::DVec4::X,
+            glam::DVec4::Y,
+            glam::DVec4::new(0.0, 0.0, -1.0, 0.0),
+            glam::DVec4::new(0.0, 0.0, 1.0, 1.0),
+        );
+        reverse_depth * projection
+    }
+
+    pub(crate) fn clip_planes(&self) -> (f64, f64) {
+        (self.znear, self.zfar)
+    }
+
+    pub(crate) fn is_perspective(&self) -> bool {
+        self.perspective
+    }
+
+    pub(crate) fn perspective_fov_y(&self) -> f64 {
+        self.perspective_fov_y
+    }
+
+    pub(crate) fn configure_perspective(
+        &mut self,
+        field_of_view_degrees: f64,
+        near_clip_limit: f64,
+        max_clip_span: f64,
+    ) {
+        self.perspective_fov_y = field_of_view_degrees.to_radians();
+        self.min_perspective_near = near_clip_limit;
+        self.max_perspective_depth_span = max_clip_span;
+        if self.perspective {
+            self.znear = self.znear.max(self.min_perspective_near);
+            self.zfar = self
+                .zfar
+                .max(self.znear * (1.0 + f64::EPSILON))
+                .min(self.znear + self.max_perspective_depth_span);
+        }
     }
 
     pub(crate) fn set_perspective(&mut self, perspective: bool) {
+        if perspective && !self.perspective {
+            let far = self
+                .znear
+                .abs()
+                .max(self.zfar.abs())
+                .max(self.min_perspective_near * 2.0);
+            self.znear = (far * 1.0e-4)
+                .max(self.min_perspective_near)
+                .min(far * (1.0 - f64::EPSILON));
+            self.zfar = far.min(self.znear + self.max_perspective_depth_span);
+        } else if !perspective && self.perspective {
+            let half_depth = self.zfar.max(1.0);
+            self.znear = -half_depth;
+            self.zfar = half_depth;
+        }
         self.perspective = perspective;
     }
 }
@@ -253,6 +383,9 @@ pub(crate) struct CameraController {
     speed: f64,
     zoom_sensitivity: f64,
     rotate_sensitivity: f64,
+    invert_vertical_look: bool,
+    invert_horizontal_look: bool,
+    zoom_towards_cursor: bool,
     pub(crate) mouse_loc: (f32, f32),
     orbit_anchor: Option<DVec3>,
     view_transition: Option<ViewTransition>,
@@ -274,15 +407,37 @@ impl CameraController {
             speed,
             zoom_sensitivity,
             rotate_sensitivity,
+            invert_vertical_look: false,
+            invert_horizontal_look: false,
+            zoom_towards_cursor: true,
             mouse_loc: (0., 0.),
             orbit_anchor: None,
             view_transition: None,
         }
     }
 
+    pub(crate) fn configure_preferences(
+        &mut self,
+        orbit_sensitivity: f64,
+        zoom_sensitivity: f64,
+        invert_vertical_look: bool,
+        invert_horizontal_look: bool,
+        zoom_towards_cursor: bool,
+    ) {
+        self.rotate_sensitivity = orbit_sensitivity;
+        self.zoom_sensitivity = zoom_sensitivity;
+        self.invert_vertical_look = invert_vertical_look;
+        self.invert_horizontal_look = invert_horizontal_look;
+        self.zoom_towards_cursor = zoom_towards_cursor;
+    }
+
     pub(crate) fn begin_orbit(&mut self, anchor: DVec3) {
         self.view_transition = None;
         self.orbit_anchor = Some(anchor);
+    }
+
+    pub(crate) fn cancel_view_transition(&mut self) {
+        self.view_transition = None;
     }
 
     pub(crate) fn end_orbit(&mut self) {
@@ -443,7 +598,11 @@ impl CameraController {
         };
         let zoom_factor = to_target_distance_modifier * zoom_scale;
         let aspect = screen_size.0 as f64 / screen_size.1.max(1.0) as f64;
-        let zoom_lateral = (right * mouse_loc_rel.x * aspect + up * mouse_loc_rel.y) * zoom_factor;
+        let zoom_lateral = if self.zoom_towards_cursor {
+            (right * mouse_loc_rel.x * aspect + up * mouse_loc_rel.y) * zoom_factor
+        } else {
+            DVec3::ZERO
+        };
         camera.position += scrollward * zoom_factor + zoom_lateral;
         camera.target += zoom_lateral;
         self.scroll = 0.0;
@@ -459,8 +618,16 @@ impl CameraController {
         // Orbit position and target around the selected pivot.
         if self.rotate_horizontal != 0.0 || self.rotate_vertical != 0.0 {
             let pivot = self.orbit_anchor.unwrap_or(camera.target);
-            let horizontal_rotate_angle = self.rotate_horizontal * self.rotate_sensitivity;
-            let desired_pitch_delta = -self.rotate_vertical * self.rotate_sensitivity;
+            let horizontal_sign = if self.invert_horizontal_look {
+                -1.0
+            } else {
+                1.0
+            };
+            let vertical_sign = if self.invert_vertical_look { 1.0 } else { -1.0 };
+            let horizontal_rotate_angle =
+                self.rotate_horizontal * self.rotate_sensitivity * horizontal_sign;
+            let desired_pitch_delta =
+                self.rotate_vertical * self.rotate_sensitivity * vertical_sign;
             let next_pitch = (camera.pitch + desired_pitch_delta).clamp(-max_pitch, max_pitch);
             let vertical_rotate_angle = next_pitch - camera.pitch;
             let horizontal_rotation = DQuat::from_rotation_z(-horizontal_rotate_angle);
@@ -588,6 +755,8 @@ pub(crate) struct FlyCameraController {
     look_delta: DVec2,
     speed: f64,
     look_sensitivity: f64,
+    invert_vertical_look: bool,
+    invert_horizontal_look: bool,
     velocity: DVec3,
     skip_movement_frame: bool,
 }
@@ -606,9 +775,22 @@ impl FlyCameraController {
             look_delta: DVec2::ZERO,
             speed,
             look_sensitivity,
+            invert_vertical_look: false,
+            invert_horizontal_look: false,
             velocity: DVec3::ZERO,
             skip_movement_frame: false,
         }
+    }
+
+    pub(crate) fn configure_preferences(
+        &mut self,
+        look_sensitivity: f64,
+        invert_vertical_look: bool,
+        invert_horizontal_look: bool,
+    ) {
+        self.look_sensitivity = look_sensitivity;
+        self.invert_vertical_look = invert_vertical_look;
+        self.invert_horizontal_look = invert_horizontal_look;
     }
 
     pub(crate) fn begin_capture(&mut self) {
@@ -675,8 +857,14 @@ impl FlyCameraController {
 
     pub(crate) fn update_camera(&mut self, camera: &mut Camera, dt: Duration) {
         let target_distance = camera.position.distance(camera.target);
-        camera.yaw -= self.look_delta.x * self.look_sensitivity;
-        camera.pitch = (camera.pitch - self.look_delta.y * self.look_sensitivity)
+        let horizontal_sign = if self.invert_horizontal_look {
+            1.0
+        } else {
+            -1.0
+        };
+        let vertical_sign = if self.invert_vertical_look { 1.0 } else { -1.0 };
+        camera.yaw += self.look_delta.x * self.look_sensitivity * horizontal_sign;
+        camera.pitch = (camera.pitch + self.look_delta.y * self.look_sensitivity * vertical_sign)
             .clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
         camera.apply_angle_orientation(target_distance);
         self.look_delta = DVec2::ZERO;

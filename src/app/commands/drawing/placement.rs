@@ -166,6 +166,10 @@ impl<'a> App<'a> {
             self.editor.pending_stroke.pop();
         }
         if self.editor.pending_stroke.len() < 3 {
+            // A two-vertex stroke cannot form a polygon. This can happen when
+            // the user clicks the first vertex to close it, so finish it as
+            // the only valid shape instead of leaving the stroke pending.
+            self.commit_stroke_open();
             return;
         }
         let Some(layer) = self.active_layer() else {
@@ -225,10 +229,14 @@ impl<'a> App<'a> {
 
     /// Attempt to finish the active drawing tool via Enter.
     /// If no stroke is in progress, exits the active drawing tool.
-    /// For MakePoly with enough verts, opens the finish dialog at the cursor.
+    /// For MakePoly with three or more verts, opens the finish dialog at the cursor.
+    /// A two-vertex stroke can only be an open polyline, so it commits directly.
     /// For MakeLine, clears the chain anchor so the next click starts a new string.
     pub(crate) fn try_finish_tool(&mut self) {
         match self.editor.active_tool {
+            ActiveTool::MakePoly if self.editor.pending_stroke.len() == 2 => {
+                self.commit_stroke_open();
+            }
             ActiveTool::MakePoly if self.editor.pending_stroke.len() >= 2 => {
                 self.editor.poly_finish_dialog = true;
                 self.editor.poly_finish_dialog_px = self.editor.cursor_screen_px;

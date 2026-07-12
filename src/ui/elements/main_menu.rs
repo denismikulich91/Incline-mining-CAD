@@ -15,16 +15,16 @@ pub(crate) fn draw_main_menu(
         .show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    let dirty_count = project.projects.iter().filter(|entry| entry.dirty).count();
+                    let has_dirty = project.projects.iter().any(|entry| entry.dirty);
                     if ui
-                        .add_enabled(dirty_count > 0, egui::Button::new("Save All"))
+                        .add_enabled(has_dirty, egui::Button::new("Save All"))
                         .clicked()
                     {
                         commands.push(UiCommand::SaveAllPidbs);
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("New PIDB").clicked() {
+                    if ui.button("New PIDB...").clicked() {
                         commands.push(UiCommand::NewPidb);
                         ui.close();
                     }
@@ -33,18 +33,22 @@ pub(crate) fn draw_main_menu(
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Import").clicked() {
+                    if ui.button("Import...").clicked() {
                         editor.show_import = true;
                         editor.show_export = false;
                         ui.close();
                     }
-                    if ui.button("Export").clicked() {
+                    if ui.button("Add Triangulation Folder...").clicked() {
+                        commands.push(UiCommand::OpenTriangulationFolder);
+                        ui.close();
+                    }
+                    if ui.button("Export...").clicked() {
                         editor.show_import = false;
                         editor.show_export = true;
                         ui.close();
                     }
-                    if ui.button("Add Triangulation Folder").clicked() {
-                        commands.push(UiCommand::OpenTriangulationFolder);
+                    if ui.button("Export Viewport Image...").clicked() {
+                        commands.push(UiCommand::ExportViewportImage);
                         ui.close();
                     }
                     ui.separator();
@@ -79,6 +83,11 @@ pub(crate) fn draw_main_menu(
                         commands.push(UiCommand::SetShowConsole(show_console));
                     }
 
+                    let mut show_points = editor.show_points;
+                    if ui.checkbox(&mut show_points, "View Points").changed() {
+                        commands.push(UiCommand::SetShowPoints(show_points));
+                    }
+
                     let mut wireframes_enabled = editor.topology_wireframes_enabled;
                     if ui
                         .checkbox(&mut wireframes_enabled, "Enable Wireframes")
@@ -86,6 +95,7 @@ pub(crate) fn draw_main_menu(
                     {
                         commands.push(UiCommand::SetTopologyWireframes(wireframes_enabled));
                     }
+
                     let mut debug_chunk_coloring = editor.debug_chunk_coloring;
                     if ui
                         .checkbox(&mut debug_chunk_coloring, "Colour Triangles by GPU Chunk")
@@ -95,8 +105,18 @@ pub(crate) fn draw_main_menu(
                     }
                 });
 
-                // Not implemented
                 ui.menu_button("Object", |ui| {
+                    ui.menu_button("Insert Point", |ui| {
+                        if ui.button("At intersection").clicked() {
+                            commands.push(UiCommand::InsertPointsAtIntersections);
+                            ui.close();
+                        }
+                        if ui.button("At elevation...").clicked() {
+                            commands.push(UiCommand::OpenInsertPointAtElevationDialog);
+                            ui.close();
+                        }
+                    });
+                    ui.separator();
                     if ui.button("Set Selection Z Value...").clicked() {
                         commands.push(UiCommand::OpenSetSelectionZValueDialog);
                         ui.close();
@@ -115,7 +135,7 @@ pub(crate) fn draw_main_menu(
                 });
 
                 ui.menu_button("Triangulation", |ui| {
-                    if ui.button("Create Triangulation").clicked() {
+                    if ui.button("Create Triangulation...").clicked() {
                         commands.push(UiCommand::OpenCreateTriangulation);
                         ui.close();
                     }
@@ -133,30 +153,17 @@ pub(crate) fn draw_main_menu(
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Cut Topology with Shell").clicked() {
+                    if ui.button("Cut Topology with Shell...").clicked() {
                         commands.push(UiCommand::OpenCutTopologyByPitShell);
                         ui.close();
                     }
-                    if ui.button("Merge Shell into Topology").clicked() {
+                    if ui.button("Merge Shell into Topology...").clicked() {
                         commands.push(UiCommand::OpenIncludeSolidInTopology);
                         ui.close();
                     }
                     ui.separator();
                     if ui.button("Generate Contours...").clicked() {
                         commands.push(UiCommand::OpenContourTriangulation);
-                        ui.close();
-                    }
-                });
-
-                ui.menu_button("Geology", |ui| {
-                    if ui
-                        .add_enabled(
-                            !project.block_models.is_empty(),
-                            egui::Button::new("Create Ore Triangulation..."),
-                        )
-                        .clicked()
-                    {
-                        commands.push(UiCommand::OpenCreateOreTriangulation);
                         ui.close();
                     }
                 });
@@ -174,29 +181,17 @@ pub(crate) fn draw_main_menu(
                     }
                 });
 
-                // Not implemented
-                ui.add_enabled_ui(false, |ui| {
-                    ui.menu_button("Geotech", |_ui| {});
-                });
-
-                // Not implemented
-                ui.add_enabled_ui(false, |ui| {
-                    ui.menu_button("Drill and Blast", |_ui| {});
-                });
-
-                // Not implemented
-                ui.add_enabled_ui(false, |ui| {
-                    ui.menu_button("Open Pit", |_ui| {});
-                });
-
-                // Not implemented
-                ui.add_enabled_ui(false, |ui| {
-                    ui.menu_button("Underground", |_ui| {});
-                });
-
-                // Not implemented
-                ui.add_enabled_ui(false, |ui| {
-                    ui.menu_button("Help", |_ui| {});
+                ui.menu_button("Geology", |ui| {
+                    if ui
+                        .add_enabled(
+                            !project.block_models.is_empty(),
+                            egui::Button::new("Create Ore Triangulation..."),
+                        )
+                        .clicked()
+                    {
+                        commands.push(UiCommand::OpenCreateOreTriangulation);
+                        ui.close();
+                    }
                 });
             });
         })

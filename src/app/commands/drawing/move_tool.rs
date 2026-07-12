@@ -1,7 +1,7 @@
 use glam::DVec3;
 
 use crate::{
-    app::{App, GizmoDragState},
+    app::{App, GizmoDragState, MoveSession},
     model::{Command, Object, ObjectId, SceneEntityId},
     userspace_log,
 };
@@ -10,10 +10,20 @@ impl<'a> App<'a> {
     pub(crate) fn apply_move_delta(&mut self, delta: DVec3) {
         self.ensure_move_session_original();
         self.preview_move_delta(delta);
-        let Some(originals) = self.move_session_original.take() else {
+        let Some(session) = self.move_session_original.take() else {
             return;
         };
-        let commands: Vec<Command> = originals
+        let active_runtime_id = self
+            .workspace
+            .active_project()
+            .map(|project| project.runtime_id);
+        if active_runtime_id != Some(session.project_runtime_id) {
+            self.restore_move_session(session);
+            self.reset_move_editor_state();
+            return;
+        }
+        let commands: Vec<Command> = session
+            .originals
             .into_iter()
             .filter_map(|before| {
                 let after = self.active_document().get_object(before.id()).cloned()?;
@@ -26,9 +36,7 @@ impl<'a> App<'a> {
             self.history.push_applied(Command::Batch(commands));
             userspace_log!("Applied move delta ({delta}) to {moved} object(s)");
         }
-        self.editor.move_vertex_target = None;
-        self.editor.move_panel_delta = [0.0; 3];
-        self.editor.move_panel_last_preview = [f64::NAN; 3];
+        self.reset_move_editor_state();
         self.invalidate_geometry();
         self.invalidate_overlay();
     }
@@ -37,9 +45,7 @@ impl<'a> App<'a> {
         self.gizmo_drag = None;
         self.editor.gizmo_drag_axis_index = None;
         self.restore_move_session_original();
-        self.editor.move_vertex_target = None;
-        self.editor.move_panel_delta = [0.0; 3];
-        self.editor.move_panel_last_preview = [f64::NAN; 3];
+        self.reset_move_editor_state();
         userspace_log!("Cancelled move operation");
         self.invalidate_geometry();
         self.invalidate_overlay();
@@ -55,13 +61,21 @@ impl<'a> App<'a> {
         self.gizmo_drag = None;
         self.editor.gizmo_drag_axis_index = None;
 
-        let Some(originals) = self.move_session_original.take() else {
-            self.editor.move_vertex_target = None;
-            self.editor.move_panel_delta = [0.0; 3];
-            self.editor.move_panel_last_preview = [f64::NAN; 3];
+        let Some(session) = self.move_session_original.take() else {
+            self.reset_move_editor_state();
             return;
         };
-        let commands: Vec<Command> = originals
+        let active_runtime_id = self
+            .workspace
+            .active_project()
+            .map(|project| project.runtime_id);
+        if active_runtime_id != Some(session.project_runtime_id) {
+            self.restore_move_session(session);
+            self.reset_move_editor_state();
+            return;
+        }
+        let commands: Vec<Command> = session
+            .originals
             .into_iter()
             .filter_map(|before| {
                 let after = self.active_document().get_object(before.id()).cloned()?;
@@ -74,9 +88,7 @@ impl<'a> App<'a> {
             self.history.push_applied(Command::Batch(commands));
         }
 
-        self.editor.move_vertex_target = None;
-        self.editor.move_panel_delta = [0.0; 3];
-        self.editor.move_panel_last_preview = [f64::NAN; 3];
+        self.reset_move_editor_state();
         self.invalidate_geometry();
         self.invalidate_overlay();
     }
@@ -154,29 +166,53 @@ impl<'a> App<'a> {
         let should_refresh = self
             .move_session_original
             .as_ref()
-            .map(|originals| {
-                originals.len() != selected_ids.len()
-                    || originals
+            .map(|session| {
+                self.workspace
+                    .active_project()
+                    .map(|project| project.runtime_id)
+                    != Some(session.project_runtime_id)
+                    || session.originals.len() != selected_ids.len()
+                    || session
+                        .originals
                         .iter()
                         .any(|object| !selected_ids.contains(&object.id()))
             })
             .unwrap_or(true);
         if should_refresh {
-            self.move_session_original = Some(
-                selected_ids
+            // A changed target set must never use already-previewed geometry as
+            // its new baseline. Restore first, then capture the new selection.
+            if self.move_session_original.is_some() {
+                self.restore_move_session_original();
+            }
+            let Some(project_runtime_id) = self
+                .workspace
+                .active_project()
+                .map(|project| project.runtime_id)
+            else {
+                return;
+            };
+            self.move_session_original = Some(MoveSession {
+                project_runtime_id,
+                originals: selected_ids
                     .iter()
                     .filter_map(|&object_id| self.active_document().get_object(object_id).cloned())
                     .collect(),
-            );
+            });
         }
     }
 
     pub(crate) fn preview_move_delta(&mut self, delta: DVec3) {
-        let Some(originals) = self.move_session_original.clone() else {
+        let Some(session) = self.move_session_original.as_ref() else {
             return;
         };
+        let project_runtime_id = session.project_runtime_id;
+        let originals = session.originals.clone();
         let vertex_target = self.editor.move_vertex_target;
-        if let Some(project) = self.workspace.active_project_mut() {
+        if let Some(index) = self
+            .workspace
+            .project_index_for_runtime_id(project_runtime_id)
+            && let Some(project) = self.workspace.projects.get_mut(index)
+        {
             for object in originals {
                 let mut moved = object.clone();
                 translate_move_target(&mut moved, vertex_target, delta);
@@ -185,16 +221,30 @@ impl<'a> App<'a> {
         }
     }
 
-    fn restore_move_session_original(&mut self) {
-        let Some(originals) = self.move_session_original.take() else {
+    pub(crate) fn restore_move_session_original(&mut self) {
+        let Some(session) = self.move_session_original.take() else {
             return;
         };
-        if let Some(project) = self.workspace.active_project_mut() {
-            for object in originals {
-                project.pidb.document.replace_object(object);
-            }
-            project.invalidate_dirty_layers();
+        self.restore_move_session(session);
+    }
+
+    fn restore_move_session(&mut self, session: MoveSession) {
+        let Some(index) = self
+            .workspace
+            .project_index_for_runtime_id(session.project_runtime_id)
+        else {
+            return;
+        };
+        let project = &mut self.workspace.projects[index];
+        for object in session.originals {
+            project.pidb.document.replace_object(object);
         }
+    }
+
+    fn reset_move_editor_state(&mut self) {
+        self.editor.move_vertex_target = None;
+        self.editor.move_panel_delta = [0.0; 3];
+        self.editor.move_panel_last_preview = [f64::NAN; 3];
     }
 
     fn selected_object_ids(&self) -> Vec<ObjectId> {

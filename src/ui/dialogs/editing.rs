@@ -199,10 +199,9 @@ pub(crate) fn draw_right_click_context(
             if has_doc_objects {
                 if ui.button("Move to Layer...").clicked() {
                     let target_layer = project
-                        .active_index
-                        .and_then(|index| {
-                            project.projects.iter().find(|entry| entry.index == index)
-                        })
+                        .projects
+                        .iter()
+                        .find(|entry| entry.is_active)
                         .and_then(|entry| entry.layers.first())
                         .map(|layer| layer.id);
                     editor.move_to_layer_dialog = Some(MoveToLayerDialog {
@@ -231,15 +230,7 @@ pub(crate) fn draw_move_to_layer_dialog(
     project: &UiProjectView,
     commands: &mut Vec<UiCommand>,
 ) {
-    let Some(active_project_index) = project.active_index else {
-        editor.move_to_layer_dialog = None;
-        return;
-    };
-    let Some(active_project) = project
-        .projects
-        .iter()
-        .find(|entry| entry.index == active_project_index)
-    else {
+    let Some(active_project) = project.projects.iter().find(|entry| entry.is_active) else {
         editor.move_to_layer_dialog = None;
         return;
     };
@@ -309,7 +300,6 @@ pub(crate) fn draw_move_to_layer_dialog(
     if apply {
         if let Some(target_layer) = dialog.target_layer {
             commands.push(UiCommand::MoveObjectsToLayer {
-                project_index: active_project_index,
                 object_ids: dialog.object_ids.clone(),
                 target_layer,
                 copy: dialog.copy,
@@ -382,6 +372,68 @@ pub(crate) fn draw_set_selection_z_dialog(
     }
 }
 
+pub(crate) fn draw_insert_point_at_elevation_dialog(
+    ui: &mut egui::Ui,
+    editor: &mut EditorState,
+    commands: &mut Vec<UiCommand>,
+) {
+    let Some(dialog) = editor.insert_point_at_elevation_dialog.as_mut() else {
+        return;
+    };
+
+    let object_count = dialog.object_ids.len();
+    let can_apply = dialog.elevation.is_finite() && object_count > 0;
+    let mut close = false;
+    let mut apply = false;
+    let mut open = true;
+
+    DragableMenu::new("Insert Point at Elevation")
+        .open(&mut open)
+        .min_width(280.0)
+        .show(ui.ctx(), |ui| {
+            ui.set_max_width(300.0);
+            let response =
+                MenuFieldF64::new("Elevation", &mut dialog.elevation, f64::MIN..=f64::MAX)
+                    .width(120.0)
+                    .show(ui);
+            if !dialog.elevation.is_finite() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(200, 70, 70),
+                    "Enter a valid elevation.",
+                );
+            }
+            ui.label("Segments lying at this elevation are ignored.");
+            ui.add_space(4.0);
+            let submitted =
+                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            ui.horizontal(|ui| {
+                if (submitted
+                    || ui
+                        .add_enabled(can_apply, egui::Button::new("Apply"))
+                        .clicked())
+                    && can_apply
+                {
+                    apply = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+            ui.label(format!("{object_count} polyline(s) selected"));
+        });
+
+    if apply {
+        commands.push(UiCommand::InsertPointsAtElevation {
+            object_ids: dialog.object_ids.clone(),
+            elevation: dialog.elevation,
+        });
+        editor.z_input = dialog.elevation;
+        editor.insert_point_at_elevation_dialog = None;
+    } else if close || !open {
+        editor.insert_point_at_elevation_dialog = None;
+    }
+}
+
 pub(crate) fn draw_move_layer_dialog(
     ui: &mut egui::Ui,
     editor: &mut EditorState,
@@ -394,7 +446,7 @@ pub(crate) fn draw_move_layer_dialog(
     let source_name = project
         .projects
         .iter()
-        .find(|entry| entry.index == dialog.source_project_index)
+        .find(|entry| entry.is_active)
         .and_then(|entry| {
             entry
                 .layers
@@ -404,28 +456,44 @@ pub(crate) fn draw_move_layer_dialog(
         })
         .unwrap_or("Layer");
 
-    if dialog.target_project_index.is_none_or(|target| {
-        target == dialog.source_project_index
-            || !project.projects.iter().any(|entry| entry.index == target)
-    }) {
-        dialog.target_project_index = project
+    let source_runtime_id = project
+        .projects
+        .iter()
+        .find(|entry| entry.layers.iter().any(|layer| layer.id == dialog.layer_id))
+        .map(|entry| entry.runtime_id);
+    let is_valid_target = |runtime_id: &u32| {
+        project.projects.iter().any(|entry| {
+            Some(entry.runtime_id) != source_runtime_id && entry.runtime_id == *runtime_id
+        })
+    };
+    if dialog
+        .target_project
+        .as_ref()
+        .is_none_or(|target| !is_valid_target(target))
+    {
+        dialog.target_project = project
             .projects
             .iter()
-            .find(|entry| entry.index != dialog.source_project_index)
-            .map(|entry| entry.index);
+            .find(|entry| Some(entry.runtime_id) != source_runtime_id)
+            .map(|entry| entry.runtime_id);
     }
 
     let selected_label = dialog
-        .target_project_index
-        .and_then(|index| project.projects.iter().find(|entry| entry.index == index))
+        .target_project
+        .and_then(|runtime_id| {
+            project
+                .projects
+                .iter()
+                .find(|entry| entry.runtime_id == runtime_id)
+        })
         .map(|entry| entry.name.as_str())
         .unwrap_or("Choose a PIDB");
     let pidb_options = project
         .projects
         .iter()
-        .filter(|entry| entry.index != dialog.source_project_index)
-        .map(|entry| (Some(entry.index), entry.name.clone().into()));
-    let can_apply = dialog.target_project_index.is_some();
+        .filter(|entry| Some(entry.runtime_id) != source_runtime_id)
+        .map(|entry| (Some(entry.runtime_id), entry.name.clone().into()));
+    let can_apply = dialog.target_project.is_some();
     let mut close = false;
     let mut apply = false;
     let mut open = true;
@@ -439,7 +507,7 @@ pub(crate) fn draw_move_layer_dialog(
             MenuFieldCombo::new(
                 "move_layer_target_project",
                 "PIDB",
-                &mut dialog.target_project_index,
+                &mut dialog.target_project,
                 selected_label,
                 pidb_options,
             )
@@ -460,11 +528,10 @@ pub(crate) fn draw_move_layer_dialog(
         });
 
     if apply {
-        if let Some(target_project_index) = dialog.target_project_index {
-            commands.push(UiCommand::MoveLayerToProject {
-                source_project_index: dialog.source_project_index,
+        if let Some(target_project) = dialog.target_project {
+            commands.push(UiCommand::MoveLayerToPidb {
                 layer_id: dialog.layer_id,
-                target_project_index,
+                target_project,
             });
         }
         editor.move_layer_dialog = None;
@@ -673,36 +740,15 @@ pub(crate) fn draw_create_layer_dialog(
     project: &UiProjectView,
     viewport_rect: egui::Rect,
 ) {
-    if editor
-        .new_layer_project_index
-        .is_none_or(|index| !project.projects.iter().any(|entry| entry.index == index))
-    {
-        editor.new_layer_project_index = project
-            .active_index
-            .or_else(|| project.projects.first().map(|entry| entry.index));
+    if !project.has_active_project {
+        editor.new_layer_dialog_open = false;
+        return;
     }
 
     ViewportDockPanel::new("create_layer_panel", "Create a new layer", viewport_rect)
         .min_width(220.0)
         .show(ui.ctx(), |ui| {
-            let selected_label = editor
-                .new_layer_project_index
-                .and_then(|index| project.projects.iter().find(|entry| entry.index == index))
-                .map(|entry| entry.name.as_str())
-                .unwrap_or("Choose a .pidb");
-            MenuFieldCombo::new(
-                "new_layer_project",
-                "Save to",
-                &mut editor.new_layer_project_index,
-                selected_label,
-                project
-                    .projects
-                    .iter()
-                    .map(|entry| (Some(entry.index), entry.name.clone().into())),
-            )
-            .show(ui);
-            let can_save = editor.new_layer_project_index.is_some()
-                && !editor.new_layer_name.trim().is_empty();
+            let can_save = !editor.new_layer_name.trim().is_empty();
             let name_response = MenuFieldText::new("Layer name", &mut editor.new_layer_name)
                 .hint_text("Required")
                 .show(ui);
@@ -714,17 +760,13 @@ pub(crate) fn draw_create_layer_dialog(
                         .add_enabled(can_save, egui::Button::new("Create Layer"))
                         .clicked())
                     && can_save
-                    && let Some(project_index) = editor.new_layer_project_index
                 {
                     commands.push(UiCommand::CreateLayer {
-                        project_index,
                         name: editor.new_layer_name.trim().to_string(),
                     });
-                    editor.new_layer_project_index = None;
                     editor.new_layer_dialog_open = false;
                 }
                 if ui.button("Cancel").clicked() {
-                    editor.new_layer_project_index = None;
                     editor.new_layer_dialog_open = false;
                 }
             });
@@ -737,14 +779,14 @@ pub(crate) fn draw_rename_layer_dialog(
     commands: &mut Vec<UiCommand>,
     editor: &mut EditorState,
 ) {
-    let Some((project_index, layer_id, _)) = editor.renaming_layer else {
+    let Some((layer_id, _)) = editor.renaming_layer else {
         return;
     };
     // Work on a local copy of the name buffer to avoid borrow conflicts inside the closure.
     let mut name_buf = editor
         .renaming_layer
         .as_ref()
-        .map(|(_, _, n)| n.clone())
+        .map(|(_, n)| n.clone())
         .unwrap_or_default();
     let mut close = false;
     let mut rename_to: Option<String> = None;
@@ -775,15 +817,11 @@ pub(crate) fn draw_rename_layer_dialog(
             });
         });
     // Write the edited buffer back.
-    if let Some((_, _, ref mut buf)) = editor.renaming_layer {
+    if let Some((_, ref mut buf)) = editor.renaming_layer {
         *buf = name_buf;
     }
     if let Some(new_name) = rename_to {
-        commands.push(UiCommand::RenameLayer {
-            project_index,
-            layer_id,
-            new_name,
-        });
+        commands.push(UiCommand::RenameLayer { layer_id, new_name });
     } else if close || !open {
         editor.renaming_layer = None;
     }
@@ -953,7 +991,12 @@ pub(crate) fn draw_offset_dialog(
                 OffsetMeasure::Height(HeightMode::Relative) => "Height change",
                 OffsetMeasure::Height(HeightMode::AbsoluteRL) => "Target RL",
             };
-            MenuFieldF64::new(value_label, &mut editor.offset_value_input, 0.0..=f64::MAX)
+            let value_range = if matches!(editor.offset_measure, OffsetMeasure::Height(_)) {
+                f64::MIN..=f64::MAX
+            } else {
+                0.0..=f64::MAX
+            };
+            MenuFieldF64::new(value_label, &mut editor.offset_value_input, value_range)
                 .speed(0.1)
                 .suffix("m")
                 .show(ui);
@@ -1375,11 +1418,11 @@ pub(crate) fn draw_bezier_panel(
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let can_apply = both_selected;
-                if ui
+                let apply_clicked = ui
                     .add_enabled(can_apply, egui::Button::new("Apply"))
-                    .clicked()
-                    && can_apply
-                {
+                    .clicked();
+                let enter_pressed = ui.input(|input| input.key_pressed(egui::Key::Enter));
+                if can_apply && (apply_clicked || enter_pressed) {
                     commands.push(UiCommand::ApplyBezier);
                 }
                 if ui.button("Cancel").clicked() {
@@ -1462,5 +1505,34 @@ pub(crate) fn draw_road_dialog(
                     commands.push(UiCommand::CommitRoad);
                 }
             });
+        });
+}
+
+/// Slice view dock: slab width, movement speed, Q/E rotate rate, and Exit.
+pub(crate) fn draw_slice_panel(
+    ui: &mut egui::Ui,
+    editor: &mut EditorState,
+    commands: &mut Vec<UiCommand>,
+    viewport_rect: egui::Rect,
+) {
+    ViewportDockPanel::new("slice_panel", "Slice View", viewport_rect)
+        .min_width(210.0)
+        .show(ui.ctx(), |ui| {
+            MenuFieldF64::new("Width", &mut editor.slice_width_input, 0.1..=1.0e6)
+                .speed(0.5)
+                .suffix("m")
+                .show(ui);
+            MenuFieldF64::new("Speed", &mut editor.slice_speed_input, 0.0..=1.0e6)
+                .speed(1.0)
+                .suffix("m/s")
+                .show(ui);
+            MenuFieldF64::new("Rotate", &mut editor.slice_rotate_input, 1.0..=720.0)
+                .speed(1.0)
+                .suffix("°/s")
+                .show(ui);
+            ui.add_space(4.0);
+            if ui.button("Exit slice").clicked() {
+                commands.push(UiCommand::SetSliceModeEnabled(false));
+            }
         });
 }

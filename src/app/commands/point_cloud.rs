@@ -9,7 +9,7 @@ use crate::{
     app::{App, file_name},
     model::{
         formats::point_cloud::{PointCloudFormat, read_point_cloud},
-        point_cloud::{LoadedPointCloud, OpenPointCloud, PointCloudId},
+        point_cloud::{LoadedPointCloud, OpenPointCloud, PointCloudId, prepare_for_render},
     },
     userspace_log, userspace_warn,
 };
@@ -45,43 +45,46 @@ impl<'a> App<'a> {
         if self
             .pending_point_cloud_loads
             .iter()
-            .any(|(pending, _)| *pending == path)
+            .any(|(_, pending, _)| *pending == path)
         {
             return;
         }
 
         let name = file_name(&path);
-        let scene_was_empty = self.triangulations.is_empty()
-            && self.block_models.is_empty()
-            && self.point_clouds.is_empty()
-            && self.scene_document.objects().is_empty();
-        self.begin_topology_load();
+        let ticket = self.begin_topology_load();
 
         let (tx, rx) = std::sync::mpsc::channel();
-        self.pending_point_cloud_loads.push((path.clone(), rx));
+        self.pending_point_cloud_loads
+            .push((ticket, path.clone(), rx));
         let window = self.window.clone();
-        std::thread::spawn(move || {
-            let result = (|| -> Result<LoadedPointCloud> {
-                let data = read_point_cloud(&path)
-                    .with_context(|| format!("Failed to read point cloud {}", path.display()))?;
-                if data.points.is_empty() {
-                    anyhow::bail!("Point cloud {} contains no points", path.display());
-                }
-                let mut min = DVec3::splat(f64::MAX);
-                let mut max = DVec3::splat(f64::MIN);
-                for point in &data.points {
-                    min = min.min(*point);
-                    max = max.max(*point);
-                }
-                Ok(LoadedPointCloud {
-                    name,
-                    path,
-                    points: std::sync::Arc::new(data.points),
-                    colors: data.colors.map(std::sync::Arc::new),
-                    bounds: (min, max),
-                    scene_was_empty,
-                })
-            })();
+        crate::app::jobs::spawn_pool_task(move || {
+            let result =
+                crate::app::jobs::run_compute_catching_panic(|| -> Result<LoadedPointCloud> {
+                    let data = read_point_cloud(&path).with_context(|| {
+                        format!("Failed to read point cloud {}", path.display())
+                    })?;
+                    if data.points.is_empty() {
+                        anyhow::bail!("Point cloud {} contains no points", path.display());
+                    }
+                    let mut min = DVec3::splat(f64::INFINITY);
+                    let mut max = DVec3::splat(f64::NEG_INFINITY);
+                    for point in data.points.iter().filter(|point| point.is_finite()) {
+                        min = min.min(*point);
+                        max = max.max(*point);
+                    }
+                    if !min.is_finite() || !max.is_finite() {
+                        anyhow::bail!("Point cloud {} contains no finite points", path.display());
+                    }
+                    let prepared =
+                        prepare_for_render(&data.points, data.colors.as_deref(), (min, max));
+                    Ok(LoadedPointCloud {
+                        name,
+                        path,
+                        points: std::sync::Arc::new(data.points),
+                        prepared: std::sync::Arc::new(prepared),
+                        bounds: (min, max),
+                    })
+                });
             let _ = tx.send(result);
             if let Some(window) = window {
                 window.request_redraw();
@@ -92,10 +95,10 @@ impl<'a> App<'a> {
     pub(crate) fn poll_point_cloud_loads(&mut self) {
         let receivers = std::mem::take(&mut self.pending_point_cloud_loads);
         let mut still_pending = Vec::new();
-        for (path, rx) in receivers {
+        for (ticket, path, rx) in receivers {
             match rx.try_recv() {
                 Ok(Ok(loaded)) => {
-                    self.pending_loads = self.pending_loads.saturating_sub(1);
+                    let should_fit = !self.scene_has_renderables();
                     let id = PointCloudId(self.next_point_cloud_id);
                     self.next_point_cloud_id += 1;
                     userspace_log!(
@@ -108,29 +111,30 @@ impl<'a> App<'a> {
                         name: loaded.name,
                         path: loaded.path,
                         points: loaded.points,
-                        colors: loaded.colors,
+                        prepared: loaded.prepared,
                         bounds: loaded.bounds,
                         visible: true,
                         color: DEFAULT_POINT_CLOUD_COLOR,
                         point_size: DEFAULT_POINT_SIZE,
                     });
-                    if loaded.scene_was_empty {
+                    if should_fit {
                         self.fit_view_to_extents();
                     }
-                    self.topology_load_pending_gpu = true;
+                    self.finish_background_task(ticket, true);
                     // Clouds render from point_cloud_gpu's per-id cache, not
                     // the document scene, so only bounds/redraw are stale.
                     self.invalidate_topology_bounds_and_redraw();
                 }
                 Ok(Err(error)) => {
-                    self.pending_loads = self.pending_loads.saturating_sub(1);
                     userspace_warn!("Failed to load point cloud: {error:#}");
-                    self.finish_topology_load();
+                    self.finish_background_task(ticket, false);
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => still_pending.push((path, rx)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    still_pending.push((ticket, path, rx));
+                }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.pending_loads = self.pending_loads.saturating_sub(1);
-                    self.finish_topology_load();
+                    userspace_warn!("Point-cloud loader disconnected for {}", path.display());
+                    self.finish_background_task(ticket, false);
                 }
             }
         }
@@ -147,10 +151,28 @@ impl<'a> App<'a> {
 
     pub(crate) fn close_point_cloud(&mut self, id: PointCloudId) {
         self.point_clouds.retain(|cloud| cloud.id != id);
+        self.cancel_jobs(|key| *key == crate::app::jobs::JobKey::PointCloud(id));
         self.invalidate_topology_bounds_and_redraw();
     }
 
     pub(crate) fn remove_point_cloud(&mut self, path: &Path) {
+        let pending = std::mem::take(&mut self.pending_point_cloud_loads);
+        for (ticket, pending_path, receiver) in pending {
+            if pending_path == path {
+                self.cancel_background_task(ticket);
+            } else {
+                self.pending_point_cloud_loads
+                    .push((ticket, pending_path, receiver));
+            }
+        }
+        if let Some(removed_id) = self
+            .point_clouds
+            .iter()
+            .find(|cloud| cloud.path == path)
+            .map(|cloud| cloud.id)
+        {
+            self.cancel_jobs(|key| *key == crate::app::jobs::JobKey::PointCloud(removed_id));
+        }
         self.point_clouds.retain(|cloud| cloud.path != path);
         self.point_cloud_files.retain(|existing| existing != path);
         self.persist_session();

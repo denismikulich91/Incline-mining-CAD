@@ -9,13 +9,14 @@ use crate::ui::{
     widgets::toolbar::{ColorSquarePicker, HatchPicker, ToolbarButton},
 };
 
+pub(crate) const BOTTOM_TOOLBAR_HEIGHT: f32 = 32.0;
+
 /// Draw the top toolbar (save, undo/redo, layer combo, Z level, line/fill colors, weight, hatch).
 pub(crate) fn draw_top_toolbar(
     ui: &mut egui::Ui,
     editor: &mut EditorState,
     project: &UiProjectView,
     commands: &mut Vec<UiCommand>,
-    document: &mut crate::ui::Document,
     can_undo: bool,
     can_redo: bool,
 ) -> egui::Rect {
@@ -29,7 +30,7 @@ pub(crate) fn draw_top_toolbar(
                     has_dirty,
                     ToolbarButton::new(
                         egui::Image::new(unthemed_icon!("save_floppy.svg")),
-                        "Save all layers",
+                        "Save All PIDBs",
                     ),
                 );
                 if save.clicked() {
@@ -52,9 +53,19 @@ pub(crate) fn draw_top_toolbar(
                 }
                 ui.separator();
                 ui.label("Layer: ");
+                let active_layers = project
+                    .projects
+                    .iter()
+                    .find(|entry| entry.is_active)
+                    .map(|entry| entry.layers.as_slice())
+                    .unwrap_or_default();
                 let selected_layer = editor
                     .active_layer
-                    .and_then(|id| document.layer(id))
+                    .and_then(|id| {
+                        active_layers
+                            .iter()
+                            .find(|layer| layer.id == id && layer.is_loaded)
+                    })
                     .map(|layer| layer.name.as_str())
                     .unwrap_or("None");
                 const MAX_LAYER_DISPLAY: usize = 22;
@@ -74,7 +85,7 @@ pub(crate) fn draw_top_toolbar(
                     .width(200.)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut editor.active_layer, None, "None");
-                        for layer in document.layers() {
+                        for layer in active_layers.iter().filter(|layer| layer.is_loaded) {
                             ui.selectable_value(
                                 &mut editor.active_layer,
                                 Some(layer.id),
@@ -125,6 +136,7 @@ pub(crate) fn draw_left_toolbar(
 ) -> egui::Rect {
     egui::Panel::left("left_tools_strip")
         .resizable(false)
+        .show_separator_line(false)
         .default_size(32.0)
         .show(ui, |ui| {
             egui::ScrollArea::vertical()
@@ -309,75 +321,104 @@ pub(crate) fn draw_right_toolbar(
 ) -> egui::Rect {
     egui::Panel::right("right_tools_strip")
         .resizable(false)
+        .show_separator_line(false)
         .default_size(32.0)
         .show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                // Reset view button
-                let response = ui.add(ToolbarButton::new(
-                    egui::Image::new(unthemed_icon!("reset_view.svg")),
-                    "Reset view",
-                ));
-                if response.clicked() {
-                    commands.push(UiCommand::ResetView);
-                }
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        // Reset view button
+                        let response = ui.add(ToolbarButton::new(
+                            egui::Image::new(unthemed_icon!("reset_view.svg")),
+                            "Reset view",
+                        ));
+                        if response.clicked() {
+                            commands.push(UiCommand::ResetView);
+                        }
 
-                // Zoom to bounds button
-                let response = ui.add(ToolbarButton::new(
-                    egui::Image::new(unthemed_icon!("globe.svg")),
-                    "Zoom to extents",
-                ));
-                if response.clicked() {
-                    commands.push(UiCommand::ZoomToExtents);
-                }
+                        // Zoom to bounds button
+                        let response = ui.add(ToolbarButton::new(
+                            egui::Image::new(unthemed_icon!("globe.svg")),
+                            "Zoom to extents",
+                        ));
+                        if response.clicked() {
+                            commands.push(UiCommand::ZoomToExtents);
+                        }
 
-                // Open Vertical Exaggeration menu button
-                let response = ui.add(
-                    ToolbarButton::new(
-                        egui::Image::new(unthemed_icon!("exaggerated_topology.svg")),
-                        format!(
-                            "Vertical Exaggeration ({:.2}×)",
-                            editor.vertical_exaggeration
-                        ),
-                    )
-                    .selected(editor.vertical_exaggeration != 1.0),
-                );
-                if response.clicked() {
-                    editor.vertical_exaggeration_input = editor.vertical_exaggeration;
-                    editor.vertical_exaggeration_dialog_open = true;
-                }
+                        // Open Vertical Exaggeration menu button
+                        let response = ui.add(
+                            ToolbarButton::new(
+                                egui::Image::new(unthemed_icon!("exaggerated_topology.svg")),
+                                format!(
+                                    "Vertical Exaggeration ({:.2}×)",
+                                    editor.vertical_exaggeration
+                                ),
+                            )
+                            .selected(editor.vertical_exaggeration != 1.0),
+                        );
+                        if response.clicked() {
+                            editor.vertical_exaggeration_input = editor.vertical_exaggeration;
+                            editor.vertical_exaggeration_dialog_open = true;
+                        }
 
-                // Enable x-ray vision
-                let response = ui.add(
-                    ToolbarButton::new(
-                        egui::Image::new(unthemed_icon!("xray.svg")),
-                        if editor.xray_enabled {
-                            "Disable X-Ray Vision"
-                        } else {
-                            "Enable X-Ray Vision"
-                        },
-                    )
-                    .selected(editor.xray_enabled),
-                );
-                if response.clicked() {
-                    editor.xray_enabled = !editor.xray_enabled;
-                }
+                        // Enable x-ray vision
+                        let response = ui.add(
+                            ToolbarButton::new(
+                                egui::Image::new(unthemed_icon!("xray.svg")),
+                                if editor.xray_enabled {
+                                    "Disable X-Ray Vision"
+                                } else {
+                                    "Enable X-Ray Vision"
+                                },
+                            )
+                            .selected(editor.xray_enabled),
+                        );
+                        if response.clicked() {
+                            editor.xray_enabled = !editor.xray_enabled;
+                        }
 
-                // Toggle fly mode
-                let response = ui.add(
-                    ToolbarButton::new(
-                        egui::Image::new(unthemed_icon!("aeroplane.svg")),
-                        if editor.fly_mode_enabled {
-                            "Disable Flying Mode"
-                        } else {
-                            "Enable Flying Mode"
-                        },
-                    )
-                    .selected(editor.fly_mode_enabled),
-                );
-                if response.clicked() {
-                    commands.push(UiCommand::SetFlyModeEnabled(!editor.fly_mode_enabled));
-                }
-            });
+                        // Vertical slice view: arm the two-click line placement, or
+                        // exit the mode if it is already active.
+                        let slice_engaged = editor.slice_mode_enabled
+                            || editor.active_tool == ActiveTool::VerticalSlice;
+                        let response = ui.add(
+                            ToolbarButton::new(
+                                egui::Image::new(unthemed_icon!("vertical_slice.svg")),
+                                if editor.slice_mode_enabled {
+                                    "Exit Slice View"
+                                } else {
+                                    "Vertical Slice View"
+                                },
+                            )
+                            .selected(slice_engaged),
+                        );
+                        if response.clicked() {
+                            if editor.slice_mode_enabled {
+                                commands.push(UiCommand::SetSliceModeEnabled(false));
+                            } else {
+                                commands.push(UiCommand::SetActiveTool(ActiveTool::VerticalSlice));
+                            }
+                        }
+
+                        // Toggle fly mode
+                        let response = ui.add(
+                            ToolbarButton::new(
+                                egui::Image::new(unthemed_icon!("aeroplane.svg")),
+                                if editor.fly_mode_enabled {
+                                    "Disable Flying Mode"
+                                } else {
+                                    "Enable Flying Mode"
+                                },
+                            )
+                            .selected(editor.fly_mode_enabled),
+                        );
+                        if response.clicked() {
+                            commands.push(UiCommand::SetFlyModeEnabled(!editor.fly_mode_enabled));
+                        }
+                    });
+                });
         })
         .response
         .rect
@@ -394,7 +435,7 @@ pub(crate) fn draw_bottom_toolbar(
 ) -> egui::Rect {
     egui::Panel::bottom("bottom_tools_strip")
         .resizable(false)
-        .default_size(32.0)
+        .default_size(BOTTOM_TOOLBAR_HEIGHT)
         .show(ui, |ui| {
             ui.horizontal_centered(|ui| {
                 let reveal_all = editor_action_button(
@@ -461,22 +502,27 @@ pub(crate) fn draw_bottom_toolbar(
 
                 ui.separator();
 
-                tool_button(
-                    ui,
-                    egui::Image::new(themed_icon!(ui, "measure_distance.svg")),
-                    "Measure distance",
-                    editor,
-                    commands,
-                    ActiveTool::MeasureDistance,
-                );
+                ui.add_enabled_ui(
+                    !editor.fly_mode_enabled && !editor.slice_mode_enabled,
+                    |ui| {
+                        tool_button(
+                            ui,
+                            egui::Image::new(themed_icon!(ui, "measure_distance.svg")),
+                            "Measure distance",
+                            editor,
+                            commands,
+                            ActiveTool::MeasureDistance,
+                        );
 
-                tool_button(
-                    ui,
-                    egui::Image::new(themed_icon!(ui, "measure_angle.svg")),
-                    "Measure berm angle",
-                    editor,
-                    commands,
-                    ActiveTool::MeasureBermAngle,
+                        tool_button(
+                            ui,
+                            egui::Image::new(themed_icon!(ui, "measure_angle.svg")),
+                            "Measure berm angle",
+                            editor,
+                            commands,
+                            ActiveTool::MeasureBermAngle,
+                        );
+                    },
                 );
             });
         })

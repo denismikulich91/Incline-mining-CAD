@@ -1,6 +1,10 @@
 //! Persistent GPU representation of immutable and infrequently-changing scene assets.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    hash::{DefaultHasher, Hash, Hasher},
+    sync::mpsc,
+};
 
 use glam::{DVec3, Vec3};
 use wgpu::util::DeviceExt;
@@ -12,6 +16,7 @@ use crate::{
             numeric_variable_default,
         },
         formats::tri00t,
+        raster::RasterTextureId,
         triangulation::{OpenTriangulation, TriangulationId},
     },
     rendering::{BlockInstance, SurfaceVertex},
@@ -25,7 +30,9 @@ const HIDDEN_BLOCK_GRADE: f32 = -2.0;
 /// Grades below this are discarded by `block_model.wgsl` (`grade < -1.5`).
 /// Geometry building must treat such blocks as absent — a discarded block
 /// leaves a hole, so it can't be allowed to cull its neighbours' faces.
-use super::block_model_ramp::{block_alpha, is_hidden_block_appearance, make_translucent};
+use super::block_model_ramp::{
+    VISIBLE_ALPHA_EPSILON, block_alpha, is_hidden_block_appearance, make_translucent,
+};
 
 #[derive(Clone, Copy)]
 enum BlockSurfaceSelection {
@@ -40,6 +47,8 @@ pub(crate) struct CachedTriangulationGpu {
     pub(crate) surface_style_bind_group: wgpu::BindGroup,
     /// Cached computed colour; used for transparency sorting and dirty-checking.
     pub(crate) color: [f32; 4],
+    pub(crate) raster_texture: Option<RasterTextureId>,
+    pub(crate) raster_opacity: f32,
     pub(crate) edge_chunks: Vec<CachedEdgeChunk>,
     pub(crate) edge_style_buffer: wgpu::Buffer,
     pub(crate) edge_style_bind_group: wgpu::BindGroup,
@@ -84,6 +93,7 @@ pub(crate) struct EdgeInstance {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SurfaceStyleUniform {
     color: [f32; 4],
+    params: [f32; 4],
 }
 
 /// Mirrors `ColorStop` for upload; `pos.x` holds the stop's `t`, the rest is
@@ -128,6 +138,18 @@ pub(crate) struct TriangulationGpuCache {
 #[derive(Default)]
 pub(crate) struct BlockModelGpuCache {
     models: HashMap<BlockModelId, CachedBlockModelGpu>,
+    pending_volume_builds: HashMap<BlockModelId, PendingVolumeBuild>,
+    prepared_volumes: HashMap<BlockModelId, PreparedVolume>,
+}
+
+struct PendingVolumeBuild {
+    key: u64,
+    receiver: mpsc::Receiver<anyhow::Result<Option<BlockVolumeAsset>>>,
+}
+
+struct PreparedVolume {
+    key: u64,
+    asset: Option<BlockVolumeAsset>,
 }
 
 pub(crate) struct CachedBlockModelGpu {
@@ -141,6 +163,7 @@ pub(crate) struct CachedBlockModelGpu {
     /// block models. When present it replaces both the opaque and transparent
     /// cube draws for this model, preserving front-to-back volumetric opacity.
     pub(crate) volume: Option<CachedBlockVolumeGpu>,
+    volume_asset_key: Option<u64>,
     pub(crate) surface_style_buffer: wgpu::Buffer,
     pub(crate) surface_style_bind_group: wgpu::BindGroup,
     pub(crate) translucent: bool,
@@ -157,11 +180,14 @@ pub(crate) struct CachedBlockModelGpu {
     /// shader-hidden blocks; when it changes, recolor-in-place is not enough.
     hidden_fingerprint: u64,
     scene_origin: DVec3,
+    rotation: glam::DMat3,
+    visible: bool,
+    fallback_alpha: f32,
 }
 
 pub(crate) use super::block_model_volume_cache::{
-    CachedBlockVolumeGpu, apply_scene_to_local, build_block_volume_gpu, stream_volume_bricks,
-    update_block_volume_style,
+    BlockVolumeAsset, CachedBlockVolumeGpu, apply_scene_to_local, build_block_volume_asset,
+    stream_volume_bricks, update_block_volume_style, upload_block_volume_gpu,
 };
 
 /// A block model surface chunk plus enough CPU-side state to re-colour it
@@ -194,10 +220,90 @@ pub(crate) struct CachedBlockModelChunkGpu {
 impl BlockModelGpuCache {
     pub(crate) fn clear(&mut self) {
         self.models.clear();
+        self.pending_volume_builds.clear();
+        self.prepared_volumes.clear();
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.models.is_empty()
+    }
+
+    pub(crate) fn has_pending_builds(&self) -> bool {
+        !self.pending_volume_builds.is_empty()
+    }
+
+    fn poll_volume_builds(&mut self) {
+        let pending = std::mem::take(&mut self.pending_volume_builds);
+        for (id, build) in pending {
+            match build.receiver.try_recv() {
+                Ok(Ok(asset)) => {
+                    self.prepared_volumes.insert(
+                        id,
+                        PreparedVolume {
+                            key: build.key,
+                            asset,
+                        },
+                    );
+                }
+                Ok(Err(error)) => {
+                    log::warn!("Block-volume preparation failed: {error:#}");
+                    self.prepared_volumes.insert(
+                        id,
+                        PreparedVolume {
+                            key: build.key,
+                            asset: None,
+                        },
+                    );
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.pending_volume_builds.insert(id, build);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    log::warn!("Block-volume preparation worker disconnected");
+                }
+            }
+        }
+    }
+
+    fn schedule_volume_builds(&mut self, block_models: &[OpenBlockModel], editor: &EditorState) {
+        for block_model in block_models {
+            let entity = block_model.entity_id();
+            let translucent = editor.translucent_handles.contains(&entity)
+                || block_model_has_partial_alpha_stops(block_model);
+            if !translucent || !block_model.active_values_available_for_render() {
+                continue;
+            }
+            let key = volume_asset_key(block_model);
+            let already_current = self
+                .models
+                .get(&block_model.id)
+                .is_some_and(|cached| cached.volume_asset_key == Some(key));
+            // Keep at most one CPU volume build per model. If a style drag
+            // changes the key while work is running, let that worker settle,
+            // discard its stale result, then build only the latest snapshot.
+            // Dropping a receiver alone would leave every superseded task
+            // queued on the bounded pool.
+            let already_pending = self.pending_volume_builds.contains_key(&block_model.id);
+            let already_prepared = self
+                .prepared_volumes
+                .get(&block_model.id)
+                .is_some_and(|prepared| prepared.key == key);
+            if already_current || already_pending || already_prepared {
+                continue;
+            }
+            self.pending_volume_builds.remove(&block_model.id);
+            self.prepared_volumes.remove(&block_model.id);
+            let snapshot = block_model.clone();
+            let (sender, receiver) = mpsc::channel();
+            crate::app::jobs::spawn_pool_task(move || {
+                let result = crate::app::jobs::run_compute_catching_panic(|| {
+                    build_block_volume_asset(&snapshot).map_err(anyhow::Error::msg)
+                });
+                let _ = sender.send(result);
+            });
+            self.pending_volume_builds
+                .insert(block_model.id, PendingVolumeBuild { key, receiver });
+        }
     }
 
     /// Advance cell-pool streaming for every cached volume: bricks near the
@@ -219,6 +325,65 @@ impl BlockModelGpuCache {
         self.models.get(&id)
     }
 
+    /// Nearest depth-writing block under a ray. The cached opaque instance
+    /// stream is the exact subset rendered with depth writes, so this avoids
+    /// scanning hidden/transparent blocks from the source model.
+    pub(crate) fn nearest_opaque_hit(
+        &self,
+        ray_origin: DVec3,
+        ray_direction: DVec3,
+        hidden: &HashSet<crate::model::SceneEntityId>,
+    ) -> Option<DVec3> {
+        let mut nearest = f64::INFINITY;
+        for (&id, cached) in &self.models {
+            if !cached.visible || hidden.contains(&crate::model::SceneEntityId::BlockModel(id)) {
+                continue;
+            }
+            let inverse_rotation = cached.rotation.transpose();
+            let local_origin = inverse_rotation * (ray_origin - cached.scene_origin);
+            let local_direction = inverse_rotation * ray_direction;
+            if let Some(volume) = cached.volume.as_ref() {
+                let scene_origin = (ray_origin - cached.scene_origin).as_vec3();
+                let scene_direction = ray_direction.as_vec3();
+                let volume_origin = apply_scene_to_local(&volume.scene_to_local, scene_origin);
+                let volume_direction =
+                    apply_scene_to_local(&volume.scene_to_local, scene_origin + scene_direction)
+                        - volume_origin;
+                if let Some(distance) = volume.nearest_opaque_cell_hit(
+                    volume_origin,
+                    volume_direction,
+                    &cached.color_transfer,
+                    cached.fallback_alpha,
+                ) {
+                    nearest = nearest.min(f64::from(distance));
+                }
+            }
+            for chunk in &cached.surface_chunks {
+                let padding = DVec3::splat(1.0e-3);
+                let chunk_min = cached.scene_origin + chunk.gpu.bounds_min.as_dvec3() - padding;
+                let chunk_max = cached.scene_origin + chunk.gpu.bounds_max.as_dvec3() + padding;
+                if ray_aabb_distance(ray_origin, ray_direction, chunk_min, chunk_max)
+                    .is_none_or(|distance| distance >= nearest)
+                {
+                    continue;
+                }
+                for instance in &chunk.cpu_instances {
+                    let lower = DVec3::from_array(instance.lower.map(f64::from));
+                    let upper = DVec3::from_array(instance.upper.map(f64::from));
+                    if let Some(distance) =
+                        ray_aabb_distance(local_origin, local_direction, lower, upper)
+                        && distance < nearest
+                    {
+                        nearest = distance;
+                    }
+                }
+            }
+        }
+        nearest
+            .is_finite()
+            .then(|| ray_origin + ray_direction * nearest)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn sync(
         &mut self,
@@ -234,12 +399,26 @@ impl BlockModelGpuCache {
     ) {
         let loaded: HashSet<_> = block_models.iter().map(|model| model.id).collect();
         self.models.retain(|id, _| loaded.contains(id));
+        self.pending_volume_builds
+            .retain(|id, _| loaded.contains(id));
+        self.prepared_volumes.retain(|id, _| loaded.contains(id));
+        self.poll_volume_builds();
+        self.schedule_volume_builds(block_models, editor);
         for block_model in block_models {
             let entity = block_model.entity_id();
             let selected = editor.selected_handles.contains(&entity);
             let force_translucent = editor.translucent_handles.contains(&entity);
             let has_partial_alpha_stops = block_model_has_partial_alpha_stops(block_model);
             let translucent = force_translucent || has_partial_alpha_stops;
+            let desired_volume_key = translucent.then(|| volume_asset_key(block_model));
+            let prepared_volume = desired_volume_key.and_then(|key| {
+                self.prepared_volumes
+                    .get(&block_model.id)
+                    .is_some_and(|prepared| prepared.key == key)
+                    .then(|| self.prepared_volumes.remove(&block_model.id))
+                    .flatten()
+            });
+            let volume_ready = prepared_volume.is_some();
             let mut line_color = if selected {
                 crate::ui::SELECTION_COLOR_F32
             } else {
@@ -256,6 +435,8 @@ impl BlockModelGpuCache {
             };
 
             if let Some(cached) = self.models.get_mut(&block_model.id) {
+                cached.visible = block_model.visible;
+                cached.fallback_alpha = block_model.color[3];
                 let variable_dirty = cached.variable != block_model.active_numeric_variable;
                 let geometry_dirty = cached.translucent != translucent
                     || cached.force_translucent != force_translucent;
@@ -273,6 +454,7 @@ impl BlockModelGpuCache {
                     && !scene_origin_dirty
                     && !edge_geom_dirty
                     && !edge_style_dirty
+                    && !volume_ready
                 {
                     continue;
                 }
@@ -281,8 +463,10 @@ impl BlockModelGpuCache {
                 // and the chunk branches below, and walking it is O(blocks) —
                 // compute it once, but only when something that can change it
                 // is dirty (skip it for edge/scene-origin-only updates).
+                let ramp_visibility_dirty = style_dirty
+                    && !same_ramp_visibility(&cached.color_transfer, &block_model.color_transfer);
                 let hidden_fingerprint =
-                    if variable_dirty || geometry_dirty || style_dirty || empty_visibility_dirty {
+                    if variable_dirty || empty_visibility_dirty || ramp_visibility_dirty {
                         hidden_blocks_fingerprint(block_model)
                     } else {
                         cached.hidden_fingerprint
@@ -300,24 +484,40 @@ impl BlockModelGpuCache {
                     && !geometry_dirty
                     && !empty_visibility_dirty
                     && !scene_origin_dirty;
-                if style_only && hidden_fingerprint == cached.hidden_fingerprint {
+                if let Some(prepared) = prepared_volume {
+                    cached.volume = prepared.asset.and_then(|asset| {
+                        upload_block_volume_gpu(
+                            device,
+                            queue,
+                            scene_origin,
+                            block_model,
+                            volume_layout,
+                            asset,
+                        )
+                    });
+                    cached.volume_asset_key = Some(prepared.key);
+                    cached.scene_origin = scene_origin;
+                    if cached.volume.is_some() {
+                        cached.surface_chunks.clear();
+                        cached.transparent_surface_chunks.clear();
+                    }
+                } else if !translucent {
+                    cached.volume = None;
+                    cached.volume_asset_key = None;
+                } else if cached.volume_asset_key != desired_volume_key {
+                    // A worker is preparing the new variable/visibility
+                    // snapshot. Never display the stale volume meanwhile;
+                    // bounded surface chunks remain as the fallback.
+                    cached.volume = None;
+                    cached.volume_asset_key = None;
+                } else if style_only && hidden_fingerprint == cached.hidden_fingerprint {
                     if let Some(volume) = cached.volume.as_mut() {
                         update_block_volume_style(queue, volume, scene_origin, block_model);
                     }
-                } else if variable_dirty
-                    || geometry_dirty
-                    || style_dirty
-                    || empty_visibility_dirty
-                    || scene_origin_dirty
-                {
-                    cached.volume = build_block_volume_gpu(
-                        device,
-                        queue,
-                        scene_origin,
-                        block_model,
-                        translucent,
-                        volume_layout,
-                    );
+                } else if scene_origin_dirty {
+                    if let Some(volume) = cached.volume.as_mut() {
+                        update_block_volume_style(queue, volume, scene_origin, block_model);
+                    }
                     cached.scene_origin = scene_origin;
                 }
                 let volume_present = cached.volume.is_some();
@@ -466,14 +666,20 @@ impl BlockModelGpuCache {
                 // when a volume renders the model) are skipped, and so the
                 // "nothing to render" guard below doesn't drop a model that
                 // renders purely through the raycaster.
-                let volume = build_block_volume_gpu(
-                    device,
-                    queue,
-                    scene_origin,
-                    block_model,
-                    translucent,
-                    volume_layout,
-                );
+                let (volume, volume_asset_key) = prepared_volume.map_or((None, None), |prepared| {
+                    let key = prepared.key;
+                    let volume = prepared.asset.and_then(|asset| {
+                        upload_block_volume_gpu(
+                            device,
+                            queue,
+                            scene_origin,
+                            block_model,
+                            volume_layout,
+                            asset,
+                        )
+                    });
+                    (volume, Some(key))
+                });
                 let (surface_chunks, transparent_surface_chunks) =
                     build_surface_chunks_unless_volume(
                         device,
@@ -535,6 +741,7 @@ impl BlockModelGpuCache {
                         surface_chunks,
                         transparent_surface_chunks,
                         volume,
+                        volume_asset_key,
                         surface_style_buffer,
                         surface_style_bind_group,
                         translucent,
@@ -549,11 +756,47 @@ impl BlockModelGpuCache {
                         hide_empty_color_values: block_model.hide_empty_color_values,
                         hidden_fingerprint: hidden_blocks_fingerprint(block_model),
                         scene_origin,
+                        rotation: block_model.model.rotation(),
+                        visible: block_model.visible,
+                        fallback_alpha: block_model.color[3],
                     },
                 );
             }
         }
     }
+}
+
+fn ray_aabb_distance(origin: DVec3, direction: DVec3, min: DVec3, max: DVec3) -> Option<f64> {
+    let mut near = 0.0_f64;
+    let mut far = f64::INFINITY;
+    for axis in 0..3 {
+        if direction[axis].abs() <= f64::EPSILON {
+            if origin[axis] < min[axis] || origin[axis] > max[axis] {
+                return None;
+            }
+            continue;
+        }
+        let inverse = direction[axis].recip();
+        let first = (min[axis] - origin[axis]) * inverse;
+        let second = (max[axis] - origin[axis]) * inverse;
+        near = near.max(first.min(second));
+        far = far.min(first.max(second));
+        if near > far {
+            return None;
+        }
+    }
+    Some(near)
+}
+
+fn volume_asset_key(block_model: &OpenBlockModel) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    block_model.active_numeric_variable.hash(&mut hasher);
+    block_model.hide_empty_color_values.hash(&mut hasher);
+    for stop in &block_model.color_transfer.stops {
+        stop.t.to_bits().hash(&mut hasher);
+        (stop.color[3] >= VISIBLE_ALPHA_EPSILON).hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 impl TriangulationGpuCache {
@@ -614,7 +857,9 @@ impl TriangulationGpuCache {
             };
 
             if let Some(cached) = self.meshes.get_mut(&triangulation.id) {
-                let surface_dirty = cached.color != color;
+                let surface_dirty = cached.color != color
+                    || cached.raster_texture != triangulation.raster_texture
+                    || cached.raster_opacity != triangulation.raster_opacity;
                 // Rebuild edge geometry only when edges flip between present and absent.
                 let edge_geom_dirty = (cached.edge_width == 0.0) != (edge_width == 0.0);
                 let edge_style_dirty =
@@ -625,9 +870,23 @@ impl TriangulationGpuCache {
                 }
 
                 if surface_dirty {
-                    let style = SurfaceStyleUniform { color };
+                    let style = SurfaceStyleUniform {
+                        color,
+                        params: [
+                            if triangulation.raster_texture.is_some() {
+                                triangulation.raster_opacity.clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            },
+                            0.0,
+                            0.0,
+                            0.0,
+                        ],
+                    };
                     queue.write_buffer(&cached.surface_style_buffer, 0, bytemuck::bytes_of(&style));
                     cached.color = color;
+                    cached.raster_texture = triangulation.raster_texture;
+                    cached.raster_opacity = triangulation.raster_opacity;
                 }
 
                 if edge_geom_dirty && edge_width > 0.0 && cached.edge_chunks.is_empty() {
@@ -656,7 +915,19 @@ impl TriangulationGpuCache {
                     continue;
                 }
 
-                let surface_style = SurfaceStyleUniform { color };
+                let surface_style = SurfaceStyleUniform {
+                    color,
+                    params: [
+                        if triangulation.raster_texture.is_some() {
+                            triangulation.raster_opacity.clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        },
+                        0.0,
+                        0.0,
+                        0.0,
+                    ],
+                };
                 let surface_style_buffer =
                     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("Surface Style Uniform"),
@@ -705,6 +976,8 @@ impl TriangulationGpuCache {
                         surface_style_buffer,
                         surface_style_bind_group,
                         color,
+                        raster_texture: triangulation.raster_texture,
+                        raster_opacity: triangulation.raster_opacity,
                         edge_chunks,
                         edge_style_buffer,
                         edge_style_bind_group,
@@ -952,6 +1225,7 @@ fn upload_surface_chunk(
     // Per-chunk debug colour uniform; the bind group keeps the buffer alive.
     let debug_style = SurfaceStyleUniform {
         color: chunk_debug_color(chunk_index),
+        params: [0.0; 4],
     };
     let debug_style_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Chunk Debug Style Uniform"),
@@ -1093,6 +1367,33 @@ fn hidden_blocks_fingerprint(block_model: &OpenBlockModel) -> u64 {
         .filter(|&&index| block_is_hidden(&color_values, color_transfer, index, hide_empty))
         .map(|&index| splitmix64(index as u64))
         .reduce(|| 0, |a, b| a ^ b)
+}
+
+/// Whether two ramps hide exactly the same grade intervals. RGB edits and
+/// alpha edits that stay above the discard epsilon cannot change volume
+/// occupancy, so they do not justify walking every block merely to reproduce
+/// the cached hidden-set fingerprint.
+fn same_ramp_visibility(a: &ColorTransferFunction, b: &ColorTransferFunction) -> bool {
+    fn visibility_runs(ramp: &ColorTransferFunction) -> Vec<(f32, bool)> {
+        let stops = &ramp.stops[..ramp.stops.len().min(MAX_COLOR_STOPS)];
+        let mut runs = Vec::with_capacity(stops.len() + 1);
+        let mut visible = false;
+        runs.push((0.0, visible));
+        for stop in stops {
+            let next_visible = stop.color[3] >= VISIBLE_ALPHA_EPSILON;
+            let at = stop.t.clamp(0.0, 1.0);
+            if next_visible != visible {
+                if runs.last().is_some_and(|(last_at, _)| *last_at == at) {
+                    runs.pop();
+                }
+                runs.push((at, next_visible));
+                visible = next_visible;
+            }
+        }
+        runs
+    }
+
+    visibility_runs(a) == visibility_runs(b)
 }
 
 pub(crate) fn grade_for_block(
@@ -1348,8 +1649,6 @@ fn block_model_style(block_model: &OpenBlockModel, translucent: bool) -> BlockMo
     let mut fallback_color = block_model.color;
     if translucent {
         make_translucent(&mut fallback_color);
-    } else {
-        fallback_color[3] = 1.0;
     }
     let mut stops = [ColorStopUniform {
         color: [0.0; 4],
@@ -1413,14 +1712,18 @@ fn block_matches_surface_selection(
 /// drawn through the translucent pipeline for grade colouring to blend
 /// correctly, even if the user hasn't toggled translucency manually.
 fn block_model_has_partial_alpha_stops(block_model: &OpenBlockModel) -> bool {
-    if block_model.active_numeric_variable.is_none() {
-        return false;
-    }
-    block_model
-        .color_transfer
-        .stops
-        .iter()
-        .any(|stop| stop.color[3] > 0.02 && stop.color[3] < 0.98)
+    partial_block_alpha(block_model.color[3])
+        || (block_model.active_numeric_variable.is_some()
+            && block_model
+                .color_transfer
+                .stops
+                .iter()
+                .any(|stop| partial_block_alpha(stop.color[3])))
+}
+
+fn partial_block_alpha(alpha: f32) -> bool {
+    const SHADER_VISIBLE_ALPHA: f32 = 0.004;
+    (SHADER_VISIBLE_ALPHA..0.98).contains(&alpha)
 }
 
 fn upload_block_model_surface_chunk(
@@ -1541,7 +1844,15 @@ fn empty_grade(hide_empty: bool) -> f32 {
 }
 
 fn normalized_grade(value: f64, range: (f64, f64)) -> f32 {
-    ((value - range.0) / (range.1 - range.0)).clamp(0.0, 1.0) as f32
+    let span = range.1 - range.0;
+    if span.abs() <= f64::EPSILON {
+        // A valid constant variable has a degenerate range. Keep its colour
+        // deterministic (the first ramp stop), rather than producing NaN and
+        // falling through shader comparisons unpredictably.
+        0.0
+    } else {
+        ((value - range.0) / span).clamp(0.0, 1.0) as f32
+    }
 }
 
 fn build_block_model_edge_chunks(
@@ -1553,7 +1864,7 @@ fn build_block_model_edge_chunks(
     let color_values = block_model_color_values(block_model);
     let mut chunks = Vec::new();
     let mut instances = Vec::new();
-    for &block_index in &block_model.renderable_block_indices {
+    for &block_index in block_model.renderable_block_indices.iter() {
         let Some(block) = block_model.blocks.get(block_index) else {
             continue;
         };

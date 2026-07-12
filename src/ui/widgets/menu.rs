@@ -576,15 +576,18 @@ impl<'value, T: PartialEq> MenuFieldCombo<'value, T> {
             width,
         } = self;
         menu_field_row(ui, label, |ui, _| {
+            let selected_tooltip = selected_text.text().to_owned();
             egui::ComboBox::from_id_salt(id)
                 .selected_text(selected_text)
                 .width(width)
+                .truncate()
                 .show_ui(ui, |ui| {
                     for (option, text) in options {
                         ui.selectable_value(value, option, text);
                     }
                 })
                 .response
+                .on_hover_text(selected_tooltip)
         })
     }
 }

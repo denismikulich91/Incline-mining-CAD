@@ -37,7 +37,7 @@ pub(crate) fn install_wayland_desktop_entry() -> anyhow::Result<()> {
         let desktop_changed = write_if_changed(&desktop_path, desktop_entry.as_bytes())?;
 
         if (icon_changed || desktop_changed) && is_kde_desktop() {
-            refresh_kde_service_cache()?;
+            refresh_kde_service_cache_async()?;
         }
 
         Ok(())
@@ -65,14 +65,26 @@ fn is_kde_desktop() -> bool {
     })
 }
 
-fn refresh_kde_service_cache() -> anyhow::Result<()> {
-    let status = std::process::Command::new("kbuildsycoca6")
-        .env("LANG", "C.UTF-8")
-        .env("LC_ALL", "C.UTF-8")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
-    anyhow::ensure!(status.success(), "kbuildsycoca6 exited with {status}");
+fn refresh_kde_service_cache_async() -> anyhow::Result<()> {
+    // The desktop entry and app-id are already installed before the window is
+    // created, so Wayland can associate it with the bundled logo. KDE's cache
+    // refresh is only needed when those files changed and must not stall every
+    // application launch while it scans the desktop database.
+    std::thread::Builder::new()
+        .name("incline-kde-cache-refresh".to_owned())
+        .spawn(|| {
+            let result = std::process::Command::new("kbuildsycoca6")
+                .env("LANG", "C.UTF-8")
+                .env("LC_ALL", "C.UTF-8")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            match result {
+                Ok(status) if status.success() => {}
+                Ok(status) => log::warn!("kbuildsycoca6 exited with {status}"),
+                Err(error) => log::warn!("could not start kbuildsycoca6: {error}"),
+            }
+        })?;
     Ok(())
 }
 

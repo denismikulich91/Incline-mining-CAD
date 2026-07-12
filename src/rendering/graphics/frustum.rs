@@ -27,8 +27,8 @@ impl Frustum {
                 row3 - row0, // right:  x <=  w
                 row3 + row1, // bottom: y >= -w
                 row3 - row1, // top:    y <=  w
-                row2,        // near:   z >=  0
-                row3 - row2, // far:    z <=  w
+                row2,        // reversed far:  z >= 0
+                row3 - row2, // reversed near: z <= w
             ],
         }
     }

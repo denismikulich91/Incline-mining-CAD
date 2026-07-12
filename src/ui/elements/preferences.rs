@@ -5,7 +5,9 @@ use crate::{
     rendering::color::{byte_to_linear_rgba, linear_to_srgb_byte},
     ui::{
         EditorState, UiCommand,
-        widgets::menu::{MenuFieldBool, MenuFieldColor32, MenuFieldU32, PreferenceCategory},
+        widgets::menu::{
+            MenuFieldBool, MenuFieldColor32, MenuFieldF64, MenuFieldU32, PreferenceCategory,
+        },
     },
 };
 
@@ -50,6 +52,17 @@ pub(crate) fn draw_preferences(
                                 {
                                     editor.active_preference_category =
                                         crate::ui::state::PreferenceCategory::Interface;
+                                }
+                                if PreferenceCategory::new("Camera".to_string())
+                                    .active(
+                                        editor.active_preference_category
+                                            == crate::ui::state::PreferenceCategory::Camera,
+                                    )
+                                    .show(ui)
+                                    .clicked()
+                                {
+                                    editor.active_preference_category =
+                                        crate::ui::state::PreferenceCategory::Camera;
                                 }
                                 if PreferenceCategory::new("Performance".to_string())
                                     .active(
@@ -134,16 +147,14 @@ pub(crate) fn draw_preferences(
                                     &mut draft.topology_wireframes_enabled,
                                 )
                                 .show(ui);
+                                MenuFieldBool::new("View points", &mut draft.show_points).show(ui);
                                 MenuFieldBool::new("Enable dark mode", &mut draft.dark_mode)
+                                    .show(ui);
+                                MenuFieldBool::new("Show console", &mut draft.show_console)
                                     .show(ui);
                                 MenuFieldBool::new(
                                     "Show world axis gizmo",
                                     &mut draft.show_world_axis_gizmo,
-                                )
-                                .show(ui);
-                                MenuFieldBool::new(
-                                    "Enable frame counter",
-                                    &mut draft.frame_counter_enabled,
                                 )
                                 .show(ui);
                             }
@@ -178,10 +189,99 @@ pub(crate) fn draw_preferences(
                                     1..=64,
                                 )
                                 .suffix("x")
+                                    .show(ui);
+                            }
+                            crate::ui::state::PreferenceCategory::Camera => {
+                                ui.heading("Camera Preferences");
+                                ui.add_space(12.0);
+
+                                ui.strong("Plan Mode");
+                                ui.add_space(6.0);
+                                MenuFieldF64::new(
+                                    "Orbit sensitivity",
+                                    &mut draft.plan_orbit_sensitivity,
+                                    0.0001..=0.02,
+                                )
+                                .speed(0.0001)
+                                .max_decimals(4)
+                                .show(ui);
+                                MenuFieldF64::new(
+                                    "Zoom sensitivity",
+                                    &mut draft.plan_zoom_sensitivity,
+                                    0.0001..=0.05,
+                                )
+                                .speed(0.0001)
+                                .max_decimals(4)
+                                .show(ui);
+                                MenuFieldBool::new(
+                                    "Invert vertical look",
+                                    &mut draft.plan_invert_vertical_look,
+                                )
+                                .show(ui);
+                                MenuFieldBool::new(
+                                    "Invert horizontal look",
+                                    &mut draft.plan_invert_horizontal_look,
+                                )
+                                .show(ui);
+                                MenuFieldBool::new(
+                                    "Zoom towards cursor",
+                                    &mut draft.plan_zoom_towards_cursor,
+                                )
+                                .show(ui);
+
+                                ui.add_space(18.0);
+                                ui.strong("Fly Mode");
+                                ui.add_space(6.0);
+                                MenuFieldF64::new(
+                                    "Field of view",
+                                    &mut draft.fly_field_of_view_degrees,
+                                    20.0..=120.0,
+                                )
+                                .suffix("°")
+                                .show(ui);
+                                MenuFieldF64::new(
+                                    "Mouse look sensitivity",
+                                    &mut draft.fly_mouse_look_sensitivity,
+                                    0.0001..=0.02,
+                                )
+                                .speed(0.0001)
+                                .max_decimals(4)
+                                .show(ui);
+                                MenuFieldBool::new(
+                                    "Invert vertical look",
+                                    &mut draft.fly_invert_vertical_look,
+                                )
+                                .show(ui);
+                                MenuFieldBool::new(
+                                    "Invert horizontal look",
+                                    &mut draft.fly_invert_horizontal_look,
+                                )
+                                .show(ui);
+                                MenuFieldF64::new(
+                                    "Near clip limit",
+                                    &mut draft.fly_near_clip_limit,
+                                    0.01..=100.0,
+                                )
+                                .speed(0.01)
+                                .suffix("m")
+                                .show(ui);
+                                MenuFieldF64::new(
+                                    "Maximum clip span",
+                                    &mut draft.fly_max_clip_span,
+                                    100.0..=1_000_000.0,
+                                )
+                                .speed(100.0)
+                                .suffix("m")
                                 .show(ui);
                             }
                             crate::ui::state::PreferenceCategory::Developer => {
                                 ui.heading("Developer");
+                                ui.add_space(12.0);
+                                MenuFieldBool::new(
+                                    "Enable frame counter",
+                                    &mut draft.frame_counter_enabled,
+                                )
+                                .show(ui);
                                 ui.add_space(12.0);
                                 MenuFieldBool::new(
                                     "Colour triangles by GPU chunk",
@@ -192,6 +292,17 @@ pub(crate) fn draw_preferences(
                                 ui.label(
                                     "Visualises the Morton spatial chunking used for frustum \
                                      culling.",
+                                );
+                                ui.add_space(12.0);
+                                MenuFieldBool::new(
+                                    "Show camera clipping planes",
+                                    &mut draft.debug_clip_planes,
+                                )
+                                .show(ui);
+                                ui.add_space(4.0);
+                                ui.label(
+                                    "Shows the live near and far projection distances in the \
+                                     status bar.",
                                 );
                             }
                         }

@@ -17,6 +17,7 @@ impl<'a> App<'a> {
         topology_id: TriangulationId,
         shape_id: TriangulationId,
         name: String,
+        save_as_two: bool,
     ) -> Result<()> {
         if topology_id == shape_id {
             anyhow::bail!("Topology and pit/stockpile solid must be different triangulations");
@@ -53,18 +54,54 @@ impl<'a> App<'a> {
             if included.faces.is_empty() {
                 anyhow::bail!("Combined triangulation produced no faces");
             }
-            let retained = included.retained_topology_faces;
-            let skipped = included.skipped_cap_faces;
-            let edges = triangle_edge_list(&included.faces);
-            // Build the mesh + BVH + edges in the worker too — otherwise the
-            // freeze just moves to the apply step (BVH build is the hidden half).
-            let generated = super::session::build_generated_triangulation(
-                name,
-                included.vertices,
-                included.faces,
-                TriSurfaceType::Surface,
-                |_| edges,
-            )?;
+            let IncludedShapeMesh {
+                mut vertices,
+                mut faces,
+                topology_vertex_count,
+                topology_face_count,
+                retained_topology_faces: retained,
+                skipped_cap_faces: skipped,
+            } = included;
+
+            // Build the mesh(es), BVH(s), and edge lists in the worker too —
+            // otherwise the freeze just moves to the apply step.
+            let generated = if save_as_two {
+                let shape_vertices = vertices.split_off(topology_vertex_count);
+                let mut shape_faces = faces.split_off(topology_face_count);
+                let vertex_offset = topology_vertex_count as u32;
+                for face in &mut shape_faces {
+                    for index in face {
+                        *index -= vertex_offset;
+                    }
+                }
+
+                let topology_edges = triangle_edge_list(&faces);
+                let topology = super::session::build_generated_triangulation(
+                    component_name(&name, "topology"),
+                    vertices,
+                    faces,
+                    TriSurfaceType::Surface,
+                    |_| topology_edges,
+                )?;
+                let shape_edges = triangle_edge_list(&shape_faces);
+                let shape = super::session::build_generated_triangulation(
+                    component_name(&name, "solid"),
+                    shape_vertices,
+                    shape_faces,
+                    TriSurfaceType::Surface,
+                    |_| shape_edges,
+                )?;
+                vec![topology, shape]
+            } else {
+                let edges = triangle_edge_list(&faces);
+                vec![super::session::build_generated_triangulation(
+                    name,
+                    vertices,
+                    faces,
+                    TriSurfaceType::Surface,
+                    |_| edges,
+                )?]
+            };
             Ok(IncludeJobOutput {
                 generated,
                 topology_name,
@@ -83,7 +120,9 @@ impl<'a> App<'a> {
                     output.retained,
                     output.skipped
                 );
-                app.insert_generated_triangulation(output.generated);
+                for generated in output.generated {
+                    app.insert_generated_triangulation(generated);
+                }
             }
             Err(err) => {
                 let message = format!("{err:#}");
@@ -91,9 +130,14 @@ impl<'a> App<'a> {
             }
         };
 
+        // Both source triangulations are dependencies: closing or replacing
+        // either one must cancel the include, not just the topology.
         self.spawn_job(
             "Including pit/stockpile solid…",
-            crate::app::jobs::JobKey::Triangulation(topology_id),
+            vec![
+                crate::app::jobs::JobKey::Triangulation(topology_id),
+                crate::app::jobs::JobKey::Triangulation(shape_id),
+            ],
             compute,
             apply,
         );
@@ -104,7 +148,7 @@ impl<'a> App<'a> {
 /// Worker output for a background include job: the built triangulation plus the
 /// data needed for the completion log message.
 struct IncludeJobOutput {
-    generated: crate::model::triangulation::GeneratedTriangulation,
+    generated: Vec<crate::model::triangulation::GeneratedTriangulation>,
     topology_name: String,
     shape_name: String,
     retained: usize,
@@ -114,6 +158,10 @@ struct IncludeJobOutput {
 pub(super) struct IncludedShapeMesh {
     pub(super) vertices: Vec<tri00t::Vertex>,
     pub(super) faces: Vec<[u32; 3]>,
+    /// Number of leading vertices/faces belonging to the cut topology. The
+    /// remaining mesh is the clipped/extended pit or stockpile surface.
+    pub(super) topology_vertex_count: usize,
+    pub(super) topology_face_count: usize,
     pub(super) retained_topology_faces: usize,
     pub(super) skipped_cap_faces: usize,
 }
@@ -132,6 +180,18 @@ fn sorted_u32_edge(a: u32, b: u32) -> [u32; 2] {
     if a <= b { [a, b] } else { [b, a] }
 }
 
+fn component_name(name: &str, component: &str) -> String {
+    let path = std::path::Path::new(name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(name);
+    match path.extension().and_then(|value| value.to_str()) {
+        Some(extension) => format!("{stem}_{component}.{extension}"),
+        None => format!("{stem}_{component}"),
+    }
+}
+
 pub(super) fn include_shape_mesh_in_topology_with_spatial(
     topology: &tri00t::Triangulation,
     topology_spatial: &crate::model::spatial::TriangleBvh,
@@ -145,23 +205,67 @@ pub(super) fn include_shape_mesh_in_topology_with_spatial(
     }
 
     let topology_vertices = topology.vertices();
-    let shape_vertices = shape.vertices();
-    let shape_faces: Vec<[usize; 3]> = shape.face_vertex_indices_iter().collect();
-    let cap = closure_cap_info(shape_vertices, &shape_faces, topology, topology_spatial)?;
+    let source_shape_vertices = shape.vertices();
+    let source_shape_faces: Vec<[usize; 3]> = shape.face_vertex_indices_iter().collect();
+    let source_cap = closure_cap_info(
+        source_shape_vertices,
+        &source_shape_faces,
+        topology,
+        topology_spatial,
+    )?;
     let xy_area_tolerance = reference_xy_overlap_area_tolerance(topology);
 
     let diag = std::env::var("PI_INCLUDE_DIAG").is_ok();
     let stage_start = std::time::Instant::now();
-    let skipped_cap_faces = cap.face_mask.iter().filter(|masked| **masked).count();
-    let clipped_shape = clip_shape_to_topology(
-        shape_vertices,
+    let skipped_cap_faces = source_cap
+        .face_mask
+        .iter()
+        .filter(|masked| **masked)
+        .count();
+    let mut shape_vertices = source_shape_vertices.to_vec();
+    let mut shape_faces = source_shape_faces;
+    let mut cap_mask = source_cap.face_mask.clone();
+    let original_clip = clip_shape_to_topology(
+        &shape_vertices,
         &shape_faces,
-        &cap.face_mask,
+        &cap_mask,
         topology,
         topology_spatial,
         xy_area_tolerance,
-        cap.shape_cut_side,
-    )?;
+        source_cap.shape_cut_side,
+    );
+    let clipped_shape = match original_clip {
+        Ok(clipped) => clipped,
+        Err(original_error) => {
+            // A shell can sit wholly on the design side of the topology (a pit
+            // below existing ground, or a stockpile above it). None of its
+            // original faces then crosses the topology, so retry with a
+            // temporary vertical curtain from the opening rim. Correctly
+            // intersecting shells stay on the original path above and are not
+            // changed by the fallback geometry.
+            (shape_vertices, shape_faces, cap_mask) = extend_shape_opening_to_topology(
+                &shape_vertices,
+                &shape_faces,
+                &cap_mask,
+                topology_vertices,
+                source_cap.shape_cut_side,
+            );
+            clip_shape_to_topology(
+                &shape_vertices,
+                &shape_faces,
+                &cap_mask,
+                topology,
+                topology_spatial,
+                xy_area_tolerance,
+                source_cap.shape_cut_side,
+            )
+            .map_err(|extended_error| {
+                anyhow::anyhow!(
+                    "Pit/stockpile clip failed before and after vertical rim extension: {original_error:#}; extended clip: {extended_error:#}"
+                )
+            })?
+        }
+    };
     if diag {
         eprintln!("include diag: shape clip {:?}", stage_start.elapsed());
     }
@@ -181,7 +285,7 @@ pub(super) fn include_shape_mesh_in_topology_with_spatial(
             &shape_spatial,
             topology,
             topology_spatial,
-            cap.shape_cut_side,
+            source_cap.shape_cut_side,
         )
     };
     let cut_rings =
@@ -250,13 +354,13 @@ pub(super) fn include_shape_mesh_in_topology_with_spatial(
         topology,
         topology_spatial,
         xy_area_tolerance,
-        side: cap.shape_cut_side,
+        side: source_cap.shape_cut_side,
         emit_surface_pieces: true,
     };
     let (shape_surface_vertices, shape_surface_faces) = clip_shape_faces_by_cells(
-        shape_vertices,
+        &shape_vertices,
         &shape_faces,
-        &cap.face_mask,
+        &cap_mask,
         &shape_coverage,
         &shape_context,
     );
@@ -328,6 +432,9 @@ pub(super) fn include_shape_mesh_in_topology_with_spatial(
         }
     }
 
+    let topology_vertex_count = output_vertices.len();
+    let topology_face_count = output_faces.len();
+
     append_mesh(
         clipped_shape.vertices,
         clipped_shape.faces,
@@ -347,6 +454,8 @@ pub(super) fn include_shape_mesh_in_topology_with_spatial(
     Ok(IncludedShapeMesh {
         vertices: output_vertices,
         faces: output_faces,
+        topology_vertex_count,
+        topology_face_count,
         retained_topology_faces,
         skipped_cap_faces,
     })
@@ -490,7 +599,7 @@ pub(super) fn build_ring_coverage(rings: &[Vec<tri00t::Vertex>]) -> Result<RingC
         triangles.push(cell);
         covered.push(is_covered);
     }
-    let mesh = tri00t::Triangulation::from_vertices_and_faces(vertices, faces);
+    let mesh = tri00t::Triangulation::from_vertices_and_faces(vertices, faces)?;
     let spatial = crate::model::spatial::TriangleBvh::build(&mesh);
     Ok(RingCoverage {
         triangles,
@@ -648,6 +757,122 @@ fn append_xy_polygon_fan(polygon: &[glam::DVec3], output: &mut Vec<[tri00t::Vert
             ]);
         }
     }
+}
+
+/// Clone a shape and add vertical faces from its opening to beyond the target
+/// topology. A closed solid opens where its removable closure cap meets the
+/// shell; an already-open shell uses its free boundary.
+///
+/// Extending to the topology's global Z range (rather than sampling it at rim
+/// vertices) also handles sparse TINs and overlapping survey sheets. The
+/// normal clip immediately trims the temporary faces back to the exact local
+/// topology elevation.
+fn extend_shape_opening_to_topology(
+    source_vertices: &[tri00t::Vertex],
+    source_faces: &[[usize; 3]],
+    cap_mask: &[bool],
+    topology_vertices: &[tri00t::Vertex],
+    side: TriSurfaceCutSide,
+) -> (Vec<tri00t::Vertex>, Vec<[usize; 3]>, Vec<bool>) {
+    // Imported solids are frequently an unwelded triangle soup: adjacent cap
+    // triangles have different vertex indices even though their endpoint
+    // coordinates are identical. Counting index pairs would mistake every
+    // internal cap edge for part of the opening and extrude a curtain through
+    // each triangle. Key by exact endpoint coordinates so those internal edges
+    // cancel while retaining representative source indices for the true rim.
+    type VertexKey = [u64; 3];
+    type EdgeKey = (VertexKey, VertexKey);
+    let vertex_key = |vertex: tri00t::Vertex| {
+        let bits = |value: f64| {
+            if value == 0.0 {
+                0.0f64.to_bits()
+            } else {
+                value.to_bits()
+            }
+        };
+        [bits(vertex.x), bits(vertex.y), bits(vertex.z)]
+    };
+    let mut edge_counts: HashMap<EdgeKey, ((usize, usize), usize)> = HashMap::new();
+    let has_removed_cap = cap_mask.iter().any(|masked| *masked);
+    for (face_index, face) in source_faces.iter().enumerate() {
+        if has_removed_cap && !cap_mask.get(face_index).copied().unwrap_or(false) {
+            continue;
+        }
+        for edge_index in 0..3 {
+            let a = face[edge_index];
+            let b = face[(edge_index + 1) % 3];
+            let a_key = vertex_key(source_vertices[a]);
+            let b_key = vertex_key(source_vertices[b]);
+            let key = if a_key <= b_key {
+                (a_key, b_key)
+            } else {
+                (b_key, a_key)
+            };
+            edge_counts
+                .entry(key)
+                .and_modify(|(_, count)| *count += 1)
+                .or_insert(((a, b), 1));
+        }
+    }
+
+    let mut opening_edges: Vec<(usize, usize)> = edge_counts
+        .into_iter()
+        .filter_map(|(_, (edge, count))| (count == 1).then_some(edge))
+        .collect();
+    opening_edges.sort_unstable();
+
+    let (topology_z_min, topology_z_max) = topology_vertices
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), vertex| {
+            (min.min(vertex.z), max.max(vertex.z))
+        });
+    if opening_edges.is_empty() || !topology_z_min.is_finite() || !topology_z_max.is_finite() {
+        return (
+            source_vertices.to_vec(),
+            source_faces.to_vec(),
+            cap_mask.to_vec(),
+        );
+    }
+
+    let z_span = (topology_z_max - topology_z_min).abs();
+    let z_margin = z_span.max(1.0) * 1.0e-6;
+    let extension_z = match side {
+        TriSurfaceCutSide::CutTop => topology_z_max + z_margin,
+        TriSurfaceCutSide::CutBottom => topology_z_min - z_margin,
+    };
+
+    let mut vertices = source_vertices.to_vec();
+    let mut faces = source_faces.to_vec();
+    let mut extended_mask = cap_mask.to_vec();
+    faces.reserve(opening_edges.len() * 2);
+    extended_mask.reserve(opening_edges.len() * 2);
+
+    for (a, b) in opening_edges {
+        let va = source_vertices[a];
+        let vb = source_vertices[b];
+        let extended_a_z = match side {
+            TriSurfaceCutSide::CutTop => va.z.max(extension_z),
+            TriSurfaceCutSide::CutBottom => va.z.min(extension_z),
+        };
+        let extended_b_z = match side {
+            TriSurfaceCutSide::CutTop => vb.z.max(extension_z),
+            TriSurfaceCutSide::CutBottom => vb.z.min(extension_z),
+        };
+        if extended_a_z == va.z && extended_b_z == vb.z {
+            continue;
+        }
+
+        let extended_a = vertices.len();
+        vertices.push(tri00t::Vertex::new(va.x, va.y, extended_a_z));
+        let extended_b = vertices.len();
+        vertices.push(tri00t::Vertex::new(vb.x, vb.y, extended_b_z));
+        faces.push([a, b, extended_b]);
+        faces.push([a, extended_b, extended_a]);
+        extended_mask.push(false);
+        extended_mask.push(false);
+    }
+
+    (vertices, faces, extended_mask)
 }
 
 pub(super) struct ClosureCapInfo {
@@ -2104,7 +2329,7 @@ fn build_shape_cell_coverage(
         covered.push(is_covered);
         present.push(is_present);
     }
-    let mesh = tri00t::Triangulation::from_vertices_and_faces(vertices, faces);
+    let mesh = tri00t::Triangulation::from_vertices_and_faces(vertices, faces)?;
     let spatial = crate::model::spatial::TriangleBvh::build(&mesh);
     Ok(ShapeCellCoverage {
         triangles,
@@ -2270,6 +2495,14 @@ pub(super) fn clip_vertical_shape_triangle_to_topology(
     let segment_min = origin.min(origin + axis);
     let segment_max = origin.max(origin + axis);
 
+    #[derive(Clone, Copy)]
+    struct VerticalReference {
+        t_min: f64,
+        t_max: f64,
+        triangle: [tri00t::Vertex; 3],
+    }
+
+    let mut references = Vec::new();
     context
         .topology_spatial
         .for_each_xy_bounds_candidate_index_with_stack(
@@ -2286,39 +2519,126 @@ pub(super) fn clip_vertical_shape_triangle_to_topology(
                 else {
                     return;
                 };
-                if t_max - t_min <= 1.0e-10 {
-                    return;
+                if t_max - t_min > 1.0e-10 {
+                    references.push(VerticalReference {
+                        t_min,
+                        t_max,
+                        triangle: reference,
+                    });
                 }
-
-                let mut polygon = triangle
-                    .into_iter()
-                    .map(|vertex| VerticalClipVertex {
-                        t: vertical_t(origin, axis, axis_len_sq, vertex),
-                        z: vertex.z,
-                    })
-                    .collect::<Vec<_>>();
-                polygon = clip_vertical_polygon_t_min(&polygon, t_min);
-                polygon = clip_vertical_polygon_t_max(&polygon, t_max);
-                if polygon.len() < 3 {
-                    return;
-                }
-
-                let surface_polygon = polygon
-                    .into_iter()
-                    .map(|vertex| {
-                        let xy = origin + axis * vertex.t;
-                        let reference_z = bary_z(xy.x, xy.y, reference);
-                        SurfaceClipVertex {
-                            point: glam::DVec3::new(xy.x, xy.y, vertex.z),
-                            height_delta: vertex.z - reference_z,
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                let clipped = clip_surface_polygon(surface_polygon, context.side);
-                collect_topology_segments(&clipped, &mut output.topology_segments);
-                append_surface_clip_polygon(&clipped, &mut output.vertices, &mut output.faces);
             },
         );
+    if references.is_empty() {
+        return;
+    }
+
+    // Sweep the projected wall segment. Within each interval the set of
+    // covering topology faces is constant; choose their cut-side envelope
+    // instead of emitting one coincident wall fragment per face. Pairwise line
+    // crossings split intervals where the governing sheet changes.
+    let mut events = Vec::with_capacity(references.len() * 2);
+    for (index, reference) in references.iter().enumerate() {
+        events.push((reference.t_min, true, index));
+        events.push((reference.t_max, false, index));
+    }
+    events.sort_unstable_by(|left, right| left.0.total_cmp(&right.0));
+    let mut active = vec![false; references.len()];
+    let vertical_polygon = triangle
+        .into_iter()
+        .map(|vertex| VerticalClipVertex {
+            t: vertical_t(origin, axis, axis_len_sq, vertex),
+            z: vertex.z,
+        })
+        .collect::<Vec<_>>();
+    let reference_z = |reference: VerticalReference, t: f64| {
+        let xy = origin + axis * t;
+        bary_z(xy.x, xy.y, reference.triangle)
+    };
+
+    let mut event_cursor = 0usize;
+    let mut interval_start = events[0].0;
+    while event_cursor < events.len() {
+        let event_t = events[event_cursor].0;
+        if event_t - interval_start > 1.0e-10 {
+            let active_indices: Vec<usize> = active
+                .iter()
+                .enumerate()
+                .filter_map(|(index, is_active)| is_active.then_some(index))
+                .collect();
+            if !active_indices.is_empty() {
+                let mut breaks = vec![interval_start, event_t];
+                for (position, &left_index) in active_indices.iter().enumerate() {
+                    for &right_index in &active_indices[position + 1..] {
+                        let left = references[left_index];
+                        let right = references[right_index];
+                        let delta_start =
+                            reference_z(left, interval_start) - reference_z(right, interval_start);
+                        let delta_end = reference_z(left, event_t) - reference_z(right, event_t);
+                        let denominator = delta_start - delta_end;
+                        if denominator.abs() <= 1.0e-20 {
+                            continue;
+                        }
+                        let t =
+                            interval_start + (event_t - interval_start) * delta_start / denominator;
+                        if t > interval_start + 1.0e-10 && t < event_t - 1.0e-10 {
+                            breaks.push(t);
+                        }
+                    }
+                }
+                breaks.sort_unstable_by(f64::total_cmp);
+                breaks.dedup_by(|left, right| (*left - *right).abs() <= 1.0e-10);
+
+                for limits in breaks.windows(2) {
+                    let t_min = limits[0];
+                    let t_max = limits[1];
+                    if t_max - t_min <= 1.0e-10 {
+                        continue;
+                    }
+                    let midpoint = (t_min + t_max) * 0.5;
+                    let governing_index = active_indices
+                        .iter()
+                        .copied()
+                        .min_by(|left, right| {
+                            let left_z = reference_z(references[*left], midpoint);
+                            let right_z = reference_z(references[*right], midpoint);
+                            match context.side {
+                                TriSurfaceCutSide::CutTop => left_z.total_cmp(&right_z),
+                                TriSurfaceCutSide::CutBottom => right_z.total_cmp(&left_z),
+                            }
+                        })
+                        .expect("active topology interval is non-empty");
+                    let governing = references[governing_index];
+
+                    let polygon = clip_vertical_polygon_t_min(&vertical_polygon, t_min);
+                    let polygon = clip_vertical_polygon_t_max(&polygon, t_max);
+                    if polygon.len() < 3 {
+                        continue;
+                    }
+                    let surface_polygon = polygon
+                        .into_iter()
+                        .map(|vertex| {
+                            let xy = origin + axis * vertex.t;
+                            let topology_z = reference_z(governing, vertex.t);
+                            SurfaceClipVertex {
+                                point: glam::DVec3::new(xy.x, xy.y, vertex.z),
+                                height_delta: vertex.z - topology_z,
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let clipped = clip_surface_polygon(surface_polygon, context.side);
+                    collect_topology_segments(&clipped, &mut output.topology_segments);
+                    append_surface_clip_polygon(&clipped, &mut output.vertices, &mut output.faces);
+                }
+            }
+        }
+
+        while event_cursor < events.len() && (events[event_cursor].0 - event_t).abs() <= 1.0e-12 {
+            let (_, starts, reference_index) = events[event_cursor];
+            active[reference_index] = starts;
+            event_cursor += 1;
+        }
+        interval_start = event_t;
+    }
 }
 
 #[derive(Clone, Copy)]

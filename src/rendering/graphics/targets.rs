@@ -1,6 +1,42 @@
 use super::*;
 
 impl<'a> Graphics<'a> {
+    /// Keep expensive full-resolution block-model attachments resident only
+    /// while this viewport has visible work that consumes them.
+    pub(super) fn update_block_model_optional_targets(
+        &mut self,
+        needs_transparency: bool,
+        needs_volume: bool,
+    ) {
+        if needs_transparency {
+            if self.block_model_transparency_targets.is_none() {
+                let targets = Self::create_block_model_transparency_targets(
+                    &self.device,
+                    &self.config,
+                    &self.depth_view,
+                    &self.block_model_transparency_fallback_bind_group_layout,
+                    &self.block_model_transparency_composite_bind_group_layout,
+                );
+                self.block_model_transparency_targets = Some(targets);
+            }
+        } else {
+            self.block_model_transparency_targets = None;
+        }
+
+        if needs_volume {
+            if self.block_model_volume_target.is_none() {
+                let target = Self::create_block_model_volume_target(
+                    &self.device,
+                    &self.config,
+                    &self.block_model_volume_upscale_bind_group_layout,
+                );
+                self.block_model_volume_target = Some(target);
+            }
+        } else {
+            self.block_model_volume_target = None;
+        }
+    }
+
     pub(super) fn create_msaa_target(
         device: &wgpu::Device,
         config: &wgpu::SurfaceConfiguration,
@@ -156,11 +192,13 @@ impl<'a> Graphics<'a> {
         wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: Some(write_enabled),
-            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState {
-                constant: bias,
-                slope_scale: bias.signum() as f32,
+                // Reversed-Z also reverses the direction of a bias used to
+                // pull overlays toward the camera.
+                constant: -bias,
+                slope_scale: -bias.signum() as f32,
                 clamp: 0.0,
             },
         }

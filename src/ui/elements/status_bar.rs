@@ -35,6 +35,15 @@ pub(crate) fn draw_status_bar(ui: &mut egui::Ui, editor: &EditorState) -> egui::
                         None => ui.label("Chunks: --"),
                     };
                 }
+                if editor.debug_clip_planes {
+                    ui.separator();
+                    match editor.debug_clip_plane_distances {
+                        Some((near, far)) => {
+                            ui.label(format!("Clip near/far: {near:.3} / {far:.3} m"))
+                        }
+                        None => ui.label("Clip near/far: -- / --"),
+                    };
+                }
                 if let Some(msg) = &editor.status_message {
                     ui.separator();
                     match msg.progress {

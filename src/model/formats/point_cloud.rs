@@ -4,10 +4,24 @@
 //! RGBA8 colours (r in the low byte). Attributes other than position and
 //! colour (intensity, classification, GPS time, …) are intentionally ignored.
 
-use std::{fs, io::Cursor, path::Path};
+use std::{fs, io::Cursor, mem::size_of, path::Path};
 
 use anyhow::{Context, Result, bail};
 use glam::DVec3;
+
+/// Per-import ceilings keep corrupt LAS/LAZ headers from turning into very
+/// large allocations. These are deliberately independent: point records may
+/// contain large extra-byte payloads while the retained render data is only a
+/// position and optional colour.
+const MAX_LAS_POINTS: usize = 25_000_000;
+const MAX_LAS_EXPANDED_BYTES: usize = 1 << 30;
+const MAX_LAS_OUTPUT_BYTES: usize = 512 << 20;
+/// LAZ is decoded in bounded batches rather than multiplying an arbitrary
+/// header record length by the old fixed 65,536-point batch.
+const MAX_LAZ_BATCH_BYTES: usize = 4 << 20;
+const MAX_LAZ_BATCH_POINTS: usize = 65_536;
+const LAS_MIN_HEADER_LEN: usize = 227;
+const LAS_VLR_HEADER_LEN: usize = 54;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PointCloudFormat {
@@ -65,9 +79,7 @@ struct LasHeader {
 
 fn le_u16(bytes: &[u8], at: usize) -> Result<u16> {
     Ok(u16::from_le_bytes(
-        bytes
-            .get(at..at + 2)
-            .context("LAS header is truncated")?
+        checked_las_slice(bytes, at, 2, "LAS header is truncated")?
             .try_into()
             .unwrap(),
     ))
@@ -75,9 +87,7 @@ fn le_u16(bytes: &[u8], at: usize) -> Result<u16> {
 
 fn le_u32(bytes: &[u8], at: usize) -> Result<u32> {
     Ok(u32::from_le_bytes(
-        bytes
-            .get(at..at + 4)
-            .context("LAS header is truncated")?
+        checked_las_slice(bytes, at, 4, "LAS header is truncated")?
             .try_into()
             .unwrap(),
     ))
@@ -85,9 +95,7 @@ fn le_u32(bytes: &[u8], at: usize) -> Result<u32> {
 
 fn le_u64(bytes: &[u8], at: usize) -> Result<u64> {
     Ok(u64::from_le_bytes(
-        bytes
-            .get(at..at + 8)
-            .context("LAS header is truncated")?
+        checked_las_slice(bytes, at, 8, "LAS header is truncated")?
             .try_into()
             .unwrap(),
     ))
@@ -95,12 +103,20 @@ fn le_u64(bytes: &[u8], at: usize) -> Result<u64> {
 
 fn le_f64(bytes: &[u8], at: usize) -> Result<f64> {
     Ok(f64::from_le_bytes(
-        bytes
-            .get(at..at + 8)
-            .context("LAS header is truncated")?
+        checked_las_slice(bytes, at, 8, "LAS header is truncated")?
             .try_into()
             .unwrap(),
     ))
+}
+
+fn checked_las_slice<'a>(
+    bytes: &'a [u8],
+    at: usize,
+    len: usize,
+    truncated: &'static str,
+) -> Result<&'a [u8]> {
+    let end = at.checked_add(len).context("LAS byte range overflows")?;
+    bytes.get(at..end).context(truncated)
 }
 
 fn parse_las_header(bytes: &[u8]) -> Result<LasHeader> {
@@ -110,6 +126,9 @@ fn parse_las_header(bytes: &[u8]) -> Result<LasHeader> {
     let version_major = *bytes.get(24).context("LAS header is truncated")?;
     let version_minor = *bytes.get(25).context("LAS header is truncated")?;
     let header_size = le_u16(bytes, 94)? as usize;
+    if header_size < LAS_MIN_HEADER_LEN {
+        bail!("LAS header size {header_size} is smaller than {LAS_MIN_HEADER_LEN}");
+    }
     let offset_to_points = le_u32(bytes, 96)? as usize;
     let vlr_count = le_u32(bytes, 100)?;
     let raw_format = *bytes.get(104).context("LAS header is truncated")?;
@@ -120,6 +139,9 @@ fn parse_las_header(bytes: &[u8]) -> Result<LasHeader> {
     let record_length = le_u16(bytes, 105)? as usize;
     let legacy_count = le_u32(bytes, 107)? as u64;
     let point_count = if legacy_count == 0 && (version_major, version_minor) >= (1, 4) {
+        if header_size < 255 {
+            bail!("LAS 1.4 header is too small for the extended point count");
+        }
         le_u64(bytes, 247)?
     } else {
         legacy_count
@@ -161,35 +183,114 @@ fn las_rgb_offset(point_format: u8) -> Option<usize> {
 }
 
 /// The laszip VLR's record data, needed to decompress LAZ point records.
-fn find_laszip_vlr(bytes: &[u8], header: &LasHeader) -> Result<Vec<u8>> {
+fn find_laszip_vlr<'a>(bytes: &'a [u8], header: &LasHeader) -> Result<&'a [u8]> {
     let mut at = header.header_size;
     for _ in 0..header.vlr_count {
-        let user_id = bytes.get(at + 2..at + 18).context("LAZ VLR is truncated")?;
-        let record_id = le_u16(bytes, at + 18)?;
-        let record_length = le_u16(bytes, at + 20)? as usize;
-        let data_start = at + 54;
-        if user_id.starts_with(b"laszip encoded") && record_id == 22204 {
-            return Ok(bytes
-                .get(data_start..data_start + record_length)
-                .context("LAZ VLR is truncated")?
-                .to_vec());
+        let header_end = at
+            .checked_add(LAS_VLR_HEADER_LEN)
+            .context("LAZ VLR range overflows")?;
+        if header_end > header.offset_to_points {
+            bail!("LAZ VLR extends into the point data");
         }
-        at = data_start + record_length;
+        let vlr_header = bytes.get(at..header_end).context("LAZ VLR is truncated")?;
+        let user_id = &vlr_header[2..18];
+        let record_id = u16::from_le_bytes(vlr_header[18..20].try_into().unwrap());
+        let record_length = u16::from_le_bytes(vlr_header[20..22].try_into().unwrap()) as usize;
+        let data_start = header_end;
+        let data_end = data_start
+            .checked_add(record_length)
+            .context("LAZ VLR data range overflows")?;
+        if data_end > header.offset_to_points {
+            bail!("LAZ VLR data extends into the point data");
+        }
+        let record_data = bytes
+            .get(data_start..data_end)
+            .context("LAZ VLR is truncated")?;
+        if user_id.starts_with(b"laszip encoded") && record_id == 22204 {
+            return Ok(record_data);
+        }
+        at = data_end;
     }
     bail!("LAZ file has no laszip VLR; cannot decompress")
 }
 
 fn read_las_bytes(bytes: &[u8]) -> Result<PointCloudData> {
     let header = parse_las_header(bytes)?;
+    if header.header_size > header.offset_to_points {
+        bail!("LAS point-data offset precedes the header");
+    }
+    if header.offset_to_points > bytes.len() {
+        bail!("LAS point-data offset is past the end of the file");
+    }
     let count = usize::try_from(header.point_count).context("LAS point count overflow")?;
-    let rgb_offset =
-        las_rgb_offset(header.point_format).filter(|rgb_at| rgb_at + 6 <= header.record_length);
+    if count > MAX_LAS_POINTS {
+        bail!("LAS point count {count} exceeds the import limit of {MAX_LAS_POINTS}");
+    }
+    let expanded_bytes = count
+        .checked_mul(header.record_length)
+        .context("LAS expanded point-data size overflows addressable memory")?;
+    if expanded_bytes > MAX_LAS_EXPANDED_BYTES {
+        bail!(
+            "LAS expanded point data is {expanded_bytes} bytes, exceeding the import limit of {MAX_LAS_EXPANDED_BYTES} bytes"
+        );
+    }
+    let rgb_offset = las_rgb_offset(header.point_format).filter(|rgb_at| {
+        rgb_at
+            .checked_add(6)
+            .is_some_and(|end| end <= header.record_length)
+    });
 
-    let mut points = Vec::with_capacity(count);
+    // Colour imports temporarily retain the source u16 triplet while packing
+    // the final u32 value, so include both vectors in the live allocation
+    // budget rather than accounting only for the returned representation.
+    let retained_bytes_per_point = size_of::<DVec3>()
+        .checked_add(rgb_offset.map_or(0, |_| size_of::<[u16; 3]>() + size_of::<u32>()))
+        .context("LAS output item size overflows")?;
+    let retained_bytes = count
+        .checked_mul(retained_bytes_per_point)
+        .context("LAS output size overflows addressable memory")?;
+    if retained_bytes > MAX_LAS_OUTPUT_BYTES {
+        bail!(
+            "LAS retained point data is {retained_bytes} bytes, exceeding the import limit of {MAX_LAS_OUTPUT_BYTES} bytes"
+        );
+    }
+
+    let laz_vlr = if header.compressed {
+        let record_data = find_laszip_vlr(bytes, &header)?;
+        let vlr = laz::LazVlr::from_buffer(record_data).context("Invalid laszip VLR")?;
+        // `laz` chunks output by this width. Validate it without calling the
+        // crate's `items_size`, whose u16 summation can itself overflow on a
+        // malicious item list.
+        let item_size = vlr.items().iter().try_fold(0usize, |total, item| {
+            total.checked_add(usize::from(item.size()))
+        });
+        let item_size = item_size.context("Laszip VLR item size overflows")?;
+        if item_size != header.record_length {
+            bail!(
+                "Laszip VLR point size {item_size} does not match LAS record length {}",
+                header.record_length
+            );
+        }
+        Some(vlr)
+    } else {
+        let end = header
+            .offset_to_points
+            .checked_add(expanded_bytes)
+            .context("LAS point-data range overflows addressable memory")?;
+        if end > bytes.len() {
+            bail!("LAS point data is truncated");
+        }
+        None
+    };
+
+    let mut points = try_vec_with_capacity(count, "LAS points")?;
     // 16-bit source triplets; scaled to 8-bit once the file-wide maximum is
     // known (files written with 8-bit colours in the u16 fields are common).
-    let mut raw_colors: Vec<[u16; 3]> =
-        Vec::with_capacity(if rgb_offset.is_some() { count } else { 0 });
+    let mut raw_colors: Vec<[u16; 3]> = if rgb_offset.is_some() {
+        try_vec_with_capacity(count, "LAS colours")?
+    } else {
+        Vec::new()
+    };
 
     let mut consume_record = |record: &[u8]| {
         let x = i32::from_le_bytes(record[0..4].try_into().unwrap()) as f64;
@@ -206,30 +307,47 @@ fn read_las_bytes(bytes: &[u8]) -> Result<PointCloudData> {
     };
 
     if header.compressed {
-        let laszip_vlr = find_laszip_vlr(bytes, &header)?;
-        let vlr = laz::LazVlr::from_buffer(&laszip_vlr).context("Invalid laszip VLR")?;
-        let mut source = Cursor::new(bytes);
-        source.set_position(header.offset_to_points as u64);
-        let mut decompressor = laz::LasZipDecompressor::new(source, vlr)
+        if count > 0 {
+            let mut source = Cursor::new(bytes);
+            source.set_position(
+                u64::try_from(header.offset_to_points)
+                    .context("LAZ point-data offset does not fit in u64")?,
+            );
+            let mut decompressor = laz::LasZipDecompressor::new(
+                source,
+                laz_vlr.expect("compressed LAS validated a laszip VLR"),
+            )
             .context("Failed to initialise LAZ decompressor")?;
-        const BATCH: usize = 65_536;
-        let mut buffer = vec![0u8; header.record_length * BATCH];
-        let mut remaining = count;
-        while remaining > 0 {
-            let batch = remaining.min(BATCH);
-            let out = &mut buffer[..header.record_length * batch];
-            decompressor
-                .decompress_many(out)
-                .context("Failed to decompress LAZ point records")?;
-            for record in out.chunks_exact(header.record_length) {
-                consume_record(record);
+            let batch_capacity = MAX_LAZ_BATCH_POINTS
+                .min(MAX_LAZ_BATCH_BYTES / header.record_length)
+                .max(1)
+                .min(count);
+            let buffer_len = header
+                .record_length
+                .checked_mul(batch_capacity)
+                .context("LAZ batch size overflows addressable memory")?;
+            let mut buffer = try_zeroed_bytes(buffer_len, "LAZ decode batch")?;
+            let mut remaining = count;
+            while remaining > 0 {
+                let batch = remaining.min(batch_capacity);
+                let out_len = header
+                    .record_length
+                    .checked_mul(batch)
+                    .context("LAZ batch range overflows addressable memory")?;
+                let out = &mut buffer[..out_len];
+                decompressor
+                    .decompress_many(out)
+                    .context("Failed to decompress LAZ point records")?;
+                for record in out.chunks_exact(header.record_length) {
+                    consume_record(record);
+                }
+                remaining -= batch;
             }
-            remaining -= batch;
         }
     } else {
         let end = header
             .offset_to_points
-            .checked_add(count * header.record_length)
+            .checked_add(expanded_bytes)
             .filter(|end| *end <= bytes.len())
             .context("LAS point data is truncated")?;
         for record in bytes[header.offset_to_points..end].chunks_exact(header.record_length) {
@@ -237,38 +355,66 @@ fn read_las_bytes(bytes: &[u8]) -> Result<PointCloudData> {
         }
     }
 
-    let colors = rgb_offset.map(|_| pack_las_colors(&raw_colors));
+    let colors = rgb_offset
+        .map(|_| pack_las_colors(&raw_colors))
+        .transpose()?;
     Ok(PointCloudData { points, colors })
+}
+
+fn try_vec_with_capacity<T>(count: usize, label: &'static str) -> Result<Vec<T>> {
+    let allocation_bytes = count
+        .checked_mul(size_of::<T>())
+        .with_context(|| format!("{label} allocation size overflows addressable memory"))?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(count)
+        .with_context(|| format!("Could not allocate {allocation_bytes} bytes for {label}"))?;
+    Ok(out)
+}
+
+fn try_zeroed_bytes(len: usize, label: &'static str) -> Result<Vec<u8>> {
+    let mut out = try_vec_with_capacity(len, label)?;
+    out.resize(len, 0);
+    Ok(out)
 }
 
 /// LAS colours are nominally 16-bit, but files storing 8-bit values are
 /// widespread; scale by the file-wide maximum so both render correctly.
-fn pack_las_colors(raw: &[[u16; 3]]) -> Vec<u32> {
+fn pack_las_colors(raw: &[[u16; 3]]) -> Result<Vec<u32>> {
     let sixteen_bit = raw
         .iter()
         .any(|rgb| rgb.iter().any(|component| *component > 255));
-    raw.iter()
-        .map(|[r, g, b]| {
-            let (r, g, b) = if sixteen_bit {
-                ((r >> 8) as u32, (g >> 8) as u32, (b >> 8) as u32)
-            } else {
-                (*r as u32, *g as u32, *b as u32)
-            };
-            r | (g << 8) | (b << 16) | 0xff00_0000
-        })
-        .collect()
+    let mut packed = try_vec_with_capacity(raw.len(), "LAS packed colours")?;
+    packed.extend(raw.iter().map(|[r, g, b]| {
+        let (r, g, b) = if sixteen_bit {
+            ((r >> 8) as u32, (g >> 8) as u32, (b >> 8) as u32)
+        } else {
+            (*r as u32, *g as u32, *b as u32)
+        };
+        r | (g << 8) | (b << 16) | 0xff00_0000
+    }));
+    Ok(packed)
 }
 
 // --- ASCII XYZ / PTS ---------------------------------------------------
+
+type ParsedXyzRow = Result<Option<(DVec3, Option<u32>)>>;
 
 /// Whitespace- or comma-separated `x y z [... r g b]` lines. Leica PTS
 /// (`x y z intensity r g b`) parses through the same rule: when a row ends
 /// in three integral values within 0..=255, they are taken as its colour.
 fn read_xyz_bytes(bytes: &[u8]) -> Result<PointCloudData> {
-    use rayon::prelude::*;
-
     let text = std::str::from_utf8(bytes).context("ASCII point cloud file is not valid UTF-8")?;
-    let rows: Vec<(DVec3, Option<u32>)> = text.par_lines().filter_map(parse_xyz_line).collect();
+    let parsed: Vec<ParsedXyzRow> = text
+        .lines()
+        .enumerate()
+        .map(|(index, line)| parse_xyz_line(line, index + 1))
+        .collect();
+    let rows: Vec<(DVec3, Option<u32>)> = parsed
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
     if rows.is_empty() {
         bail!("No points found in ASCII point cloud file");
     }
@@ -285,24 +431,34 @@ fn read_xyz_bytes(bytes: &[u8]) -> Result<PointCloudData> {
     Ok(PointCloudData { points, colors })
 }
 
-fn parse_xyz_line(line: &str) -> Option<(DVec3, Option<u32>)> {
+fn parse_xyz_line(line: &str, line_number: usize) -> Result<Option<(DVec3, Option<u32>)>> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
-        return None;
+        return Ok(None);
     }
-    let fields: Vec<f64> = line
+    let tokens: Vec<&str> = line
         .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
         .filter(|field| !field.is_empty())
-        .map(str::parse)
-        .collect::<Result<_, _>>()
-        .ok()?;
-    // A lone field is a point-count preamble (PTS), not a coordinate row.
-    if fields.len() < 3 {
-        return None;
+        .collect();
+    // A lone non-negative integer is a point-count preamble (PTS), not a
+    // coordinate row. Every other non-comment row must be diagnosed.
+    if tokens.len() == 1 && tokens[0].parse::<usize>().is_ok() {
+        return Ok(None);
     }
+    if tokens.len() < 3 {
+        bail!("Malformed ASCII point row at line {line_number}: expected at least x y z");
+    }
+    let fields: Vec<f64> = tokens
+        .iter()
+        .map(|token| {
+            token.parse::<f64>().with_context(|| {
+                format!("Malformed numeric value '{token}' at ASCII point line {line_number}")
+            })
+        })
+        .collect::<Result<_>>()?;
     let point = DVec3::new(fields[0], fields[1], fields[2]);
     if !point.is_finite() {
-        return None;
+        bail!("Non-finite coordinate at ASCII point line {line_number}");
     }
     let color = (fields.len() >= 6)
         .then(|| &fields[fields.len() - 3..])
@@ -313,7 +469,7 @@ fn parse_xyz_line(line: &str) -> Option<(DVec3, Option<u32>)> {
         .map(|rgb| {
             (rgb[0] as u32) | ((rgb[1] as u32) << 8) | ((rgb[2] as u32) << 16) | 0xff00_0000
         });
-    Some((point, color))
+    Ok(Some((point, color)))
 }
 
 // --- PCD ---------------------------------------------------------------
@@ -354,18 +510,45 @@ fn read_pcd_bytes(bytes: &[u8]) -> Result<PointCloudData> {
                     .collect();
             }
             Some("SIZE") => {
-                for (field, token) in fields.iter_mut().zip(tokens) {
-                    field.size = token.parse().context("Invalid PCD SIZE")?;
+                let sizes = tokens
+                    .map(|token| token.parse::<usize>().context("Invalid PCD SIZE"))
+                    .collect::<Result<Vec<_>>>()?;
+                if sizes.len() != fields.len() {
+                    bail!("PCD SIZE count does not match FIELDS");
+                }
+                for (field, size) in fields.iter_mut().zip(sizes) {
+                    if size == 0 {
+                        bail!("PCD field SIZE must be greater than zero");
+                    }
+                    field.size = size;
                 }
             }
             Some("TYPE") => {
-                for (field, token) in fields.iter_mut().zip(tokens) {
-                    field.kind = token.chars().next().unwrap_or('F');
+                let kinds: Vec<&str> = tokens.collect();
+                if kinds.len() != fields.len() {
+                    bail!("PCD TYPE count does not match FIELDS");
+                }
+                for (field, token) in fields.iter_mut().zip(kinds) {
+                    let mut chars = token.chars();
+                    let kind = chars.next().context("Invalid PCD TYPE")?;
+                    if chars.next().is_some() || !matches!(kind, 'F' | 'I' | 'U') {
+                        bail!("Invalid PCD TYPE '{token}'");
+                    }
+                    field.kind = kind;
                 }
             }
             Some("COUNT") => {
-                for (field, token) in fields.iter_mut().zip(tokens) {
-                    field.count = token.parse().context("Invalid PCD COUNT")?;
+                let counts = tokens
+                    .map(|token| token.parse::<usize>().context("Invalid PCD COUNT"))
+                    .collect::<Result<Vec<_>>>()?;
+                if counts.len() != fields.len() {
+                    bail!("PCD COUNT count does not match FIELDS");
+                }
+                for (field, count) in fields.iter_mut().zip(counts) {
+                    if count == 0 {
+                        bail!("PCD field COUNT must be greater than zero");
+                    }
+                    field.count = count;
                 }
             }
             Some("POINTS") => {
@@ -380,12 +563,33 @@ fn read_pcd_bytes(bytes: &[u8]) -> Result<PointCloudData> {
     }
     let data_kind = data_kind.context("PCD file has no DATA line")?;
     let point_count = point_count.context("PCD file has no POINTS line")?;
+    if fields.is_empty() {
+        bail!("PCD file has no FIELDS");
+    }
+    if fields
+        .iter()
+        .any(|field| field.size == 0 || field.count == 0)
+    {
+        bail!("PCD field SIZE and COUNT must be greater than zero");
+    }
     let x = pcd_field_index(&fields, "x")?;
     let y = pcd_field_index(&fields, "y")?;
     let z = pcd_field_index(&fields, "z")?;
     let rgb = fields
         .iter()
         .position(|field| field.name == "rgb" || field.name == "rgba");
+    if let Some(rgb) = rgb {
+        let field = &fields[rgb];
+        if field.size != 4 || field.count != 1 || !matches!(field.kind, 'F' | 'I' | 'U') {
+            bail!(
+                "PCD {} field must be one 4-byte F/I/U scalar (got {}{} COUNT {})",
+                field.name,
+                field.kind,
+                field.size,
+                field.count
+            );
+        }
+    }
 
     match data_kind.as_str() {
         "ascii" => read_pcd_ascii(&bytes[at..], &fields, point_count, [x, y, z], rgb),
@@ -423,10 +627,13 @@ fn read_pcd_ascii(
         .iter()
         .map(|field| {
             let start = column;
-            column += field.count;
+            column = column.saturating_add(field.count);
             start
         })
         .collect();
+    if column == usize::MAX {
+        bail!("PCD row width overflows addressable memory");
+    }
     let mut points = Vec::with_capacity(point_count);
     let mut colors = rgb.map(|_| Vec::with_capacity(point_count));
     for line in text.lines().take(point_count) {
@@ -473,12 +680,22 @@ fn read_pcd_binary(
         .iter()
         .map(|field| {
             let start = offset;
-            offset += field.size * field.count;
+            offset = field
+                .size
+                .checked_mul(field.count)
+                .and_then(|width| offset.checked_add(width))
+                .unwrap_or(usize::MAX);
             start
         })
         .collect();
     let stride = offset;
-    if bytes.len() < stride * point_count {
+    if stride == 0 || stride == usize::MAX {
+        bail!("PCD binary record size is invalid");
+    }
+    let required = stride
+        .checked_mul(point_count)
+        .context("PCD binary data size overflows addressable memory")?;
+    if bytes.len() < required {
         bail!("PCD binary data is truncated");
     }
     let mut points = Vec::with_capacity(point_count);

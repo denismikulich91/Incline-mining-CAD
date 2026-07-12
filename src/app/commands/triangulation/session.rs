@@ -24,48 +24,48 @@ impl<'a> App<'a> {
         if self
             .pending_triangulation_loads
             .iter()
-            .any(|(pending_path, _)| pending_path == path)
+            .any(|(_, pending_path, _)| pending_path == path)
         {
             return Ok(());
         }
 
         let name = file_name(path);
         let path = path.to_path_buf();
-        let scene_was_empty =
-            self.triangulations.is_empty() && self.scene_document.objects().is_empty();
-
-        self.begin_topology_load();
+        let ticket = self.begin_topology_load();
 
         let (tx, rx) = std::sync::mpsc::channel();
-        self.pending_triangulation_loads.push((path.clone(), rx));
+        self.pending_triangulation_loads
+            .push((ticket, path.clone(), rx));
 
         let window = self.window.clone();
-        std::thread::spawn(move || {
-            let result = (|| -> Result<LoadedTriangulation> {
-                let mesh = formats::read_mesh(&path)
-                    .map_err(|err| anyhow::anyhow!("Failed to read {}: {err}", path.display()))?;
-                userspace_log!(
-                    "Loaded triangulation '{}' ({}, {} vertices, {} faces)",
-                    name,
-                    path.display(),
-                    mesh.vertex_count(),
-                    mesh.face_count()
-                );
-                let spatial = std::sync::Arc::new(crate::model::spatial::TriangleBvh::build(&mesh));
-                let edges = crate::model::triangulation::unique_edges(&mesh);
-                let surface_face_order = std::sync::Arc::new(
-                    crate::model::triangulation::morton_surface_face_order(&mesh),
-                );
-                Ok(LoadedTriangulation {
-                    name,
-                    path,
-                    mesh: std::sync::Arc::new(mesh),
-                    spatial,
-                    edges,
-                    surface_face_order,
-                    scene_was_empty,
-                })
-            })();
+        crate::app::jobs::spawn_pool_task(move || {
+            let result =
+                crate::app::jobs::run_compute_catching_panic(|| -> Result<LoadedTriangulation> {
+                    let mesh = formats::read_mesh(&path).map_err(|err| {
+                        anyhow::anyhow!("Failed to read {}: {err}", path.display())
+                    })?;
+                    userspace_log!(
+                        "Loaded triangulation '{}' ({}, {} vertices, {} faces)",
+                        name,
+                        path.display(),
+                        mesh.vertex_count(),
+                        mesh.face_count()
+                    );
+                    let spatial =
+                        std::sync::Arc::new(crate::model::spatial::TriangleBvh::build(&mesh));
+                    let edges = crate::model::triangulation::unique_edges(&mesh);
+                    let surface_face_order = std::sync::Arc::new(
+                        crate::model::triangulation::morton_surface_face_order(&mesh),
+                    );
+                    Ok(LoadedTriangulation {
+                        name,
+                        path,
+                        mesh: std::sync::Arc::new(mesh),
+                        spatial,
+                        edges,
+                        surface_face_order,
+                    })
+                });
             let _ = tx.send(result);
             if let Some(w) = window {
                 w.request_redraw();
@@ -81,10 +81,10 @@ impl<'a> App<'a> {
         let receivers = std::mem::take(&mut self.pending_triangulation_loads);
         let mut still_pending = Vec::new();
 
-        for (path, rx) in receivers {
+        for (ticket, path, rx) in receivers {
             match rx.try_recv() {
                 Ok(Ok(loaded)) => {
-                    self.pending_loads = self.pending_loads.saturating_sub(1);
+                    let should_fit = !self.scene_has_renderables();
                     let id = TriangulationId(self.next_triangulation_id);
                     self.next_triangulation_id += 1;
                     self.triangulations.push(OpenTriangulation {
@@ -100,11 +100,13 @@ impl<'a> App<'a> {
                         color: DEFAULT_TRIANGULATION_COLOR,
                         line_color: [0.05, 0.08, 0.10, 1.0],
                         line_weight: Some(1.0),
+                        raster_texture: None,
+                        raster_opacity: 1.0,
                     });
-                    if loaded.scene_was_empty {
+                    if should_fit {
                         self.fit_view_to_extents();
                     }
-                    self.topology_load_pending_gpu = true;
+                    self.finish_background_task(ticket, true);
                     self.persist_session();
                     // The mesh renders from triangulation_gpu's per-id cache, not
                     // the document scene. A full invalidate_geometry here would
@@ -112,17 +114,19 @@ impl<'a> App<'a> {
                     self.invalidate_topology_bounds_and_redraw();
                 }
                 Ok(Err(e)) => {
-                    self.pending_loads = self.pending_loads.saturating_sub(1);
                     let message = format!("{e:#}");
                     crate::userspace_warn!("Failed to load triangulation: {message}");
-                    self.finish_topology_load();
+                    self.finish_background_task(ticket, false);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    still_pending.push((path, rx));
+                    still_pending.push((ticket, path, rx));
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.pending_loads = self.pending_loads.saturating_sub(1);
-                    self.finish_topology_load();
+                    crate::userspace_warn!(
+                        "Triangulation load for {} ended without a result",
+                        path.display()
+                    );
+                    self.finish_background_task(ticket, false);
                 }
             }
         }
@@ -134,13 +138,14 @@ impl<'a> App<'a> {
         &mut self,
         mut matches: impl FnMut(&std::path::Path) -> bool,
     ) {
-        let before = self.pending_triangulation_loads.len();
-        self.pending_triangulation_loads
-            .retain(|(path, _)| !matches(path));
-        let cancelled = before - self.pending_triangulation_loads.len();
-        self.pending_loads = self.pending_loads.saturating_sub(cancelled);
-        if cancelled > 0 {
-            self.finish_topology_load();
+        let pending = std::mem::take(&mut self.pending_triangulation_loads);
+        for (ticket, path, receiver) in pending {
+            if matches(&path) {
+                self.cancel_background_task(ticket);
+            } else {
+                self.pending_triangulation_loads
+                    .push((ticket, path, receiver));
+            }
         }
     }
 
@@ -176,7 +181,15 @@ impl<'a> App<'a> {
         let Some(tri) = self.triangulations.iter_mut().find(|tri| tri.id == id) else {
             return;
         };
-        tri.visible = !tri.visible;
+        let handle = tri.entity_id();
+        let was_visible = tri.visible && !self.editor.hidden_handles.contains(&handle);
+        tri.visible = !was_visible;
+        if tri.visible {
+            // A toolbar hide is stored on the scene entity, while the explorer
+            // stores visibility on the triangulation. Showing from either UI
+            // must clear both sources of hidden state.
+            self.editor.hidden_handles.remove(&handle);
+        }
         let action = if tri.visible { "Shown" } else { "Hidden" };
         userspace_log!("{} triangulation '{}'", action, tri.name);
         self.invalidate_topology_bounds_and_redraw();
@@ -190,6 +203,9 @@ impl<'a> App<'a> {
         let handle = tri.entity_id();
         self.clear_triangulation_entity_state(handle);
         self.clear_dialog_refs_to_triangulation(id);
+        // In-flight jobs derived from this triangulation would otherwise
+        // finish later and apply against a closed source.
+        self.cancel_jobs(|key| *key == crate::app::jobs::JobKey::Triangulation(id));
         if self.active_triangulation == Some(id) {
             self.active_triangulation = None;
         }
@@ -206,6 +222,8 @@ impl<'a> App<'a> {
             let handle = tri.entity_id();
             self.clear_triangulation_entity_state(handle);
             self.clear_dialog_refs_to_triangulation(tri.id);
+            let removed_id = tri.id;
+            self.cancel_jobs(|key| *key == crate::app::jobs::JobKey::Triangulation(removed_id));
             if self.active_triangulation == Some(tri.id) {
                 self.active_triangulation = None;
             }
@@ -327,9 +345,30 @@ impl<'a> App<'a> {
             .map(|t| t.id)
             .collect();
         let count = ids.len();
-        for id in ids {
-            self.close_triangulation(id);
+        if count == 0 {
+            return;
         }
+        let ids: std::collections::HashSet<_> = ids.into_iter().collect();
+        self.cancel_jobs(
+            |key| matches!(key, crate::app::jobs::JobKey::Triangulation(id) if ids.contains(id)),
+        );
+        let loaded = std::mem::take(&mut self.triangulations);
+        for triangulation in loaded {
+            if ids.contains(&triangulation.id) {
+                self.clear_triangulation_entity_state(triangulation.entity_id());
+                self.clear_dialog_refs_to_triangulation(triangulation.id);
+            } else {
+                self.triangulations.push(triangulation);
+            }
+        }
+        if self
+            .active_triangulation
+            .is_some_and(|id| ids.contains(&id))
+        {
+            self.active_triangulation = None;
+        }
+        self.invalidate_topology_bounds_and_redraw();
+        self.persist_session();
         userspace_log!(
             "Closed {} triangulation(s) from folder {}",
             count,
@@ -442,6 +481,8 @@ impl<'a> App<'a> {
             color: DEFAULT_TRIANGULATION_COLOR,
             line_color: [0.05, 0.08, 0.10, 1.0],
             line_weight: Some(1.0),
+            raster_texture: None,
+            raster_opacity: 1.0,
         });
         self.active_triangulation = Some(id);
         self.editor.selected_handles.clear();
@@ -473,7 +514,7 @@ pub(crate) fn build_generated_triangulation(
     if tri_faces.is_empty() {
         anyhow::bail!("Triangulation produced no faces");
     }
-    let mesh = tri00t::Triangulation::from_vertices_and_faces(tri_vertices, tri_faces);
+    let mesh = tri00t::Triangulation::from_vertices_and_faces(tri_vertices, tri_faces)?;
     let spatial = std::sync::Arc::new(crate::model::spatial::TriangleBvh::build(&mesh));
     let edges = build_edges(&mesh);
     let surface_face_order = std::sync::Arc::new(

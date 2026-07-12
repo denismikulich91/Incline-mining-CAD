@@ -1057,3 +1057,79 @@ impl ViewportLabel {
             });
     }
 }
+
+/// Fixed, titleless shaded plan preview shown while slice mode is active.
+pub(crate) struct ViewportMiniMap {
+    id: egui::Id,
+    viewport_rect: egui::Rect,
+}
+
+impl ViewportMiniMap {
+    pub(crate) fn new(id_source: impl Hash + Debug, viewport_rect: egui::Rect) -> Self {
+        Self {
+            id: egui::Id::new(id_source),
+            viewport_rect,
+        }
+    }
+
+    pub(crate) fn show(
+        self,
+        ctx: &egui::Context,
+        editor: &mut EditorState,
+        commands: &mut Vec<crate::ui::state::UiCommand>,
+    ) {
+        if editor.slice_preview_detached {
+            return;
+        }
+
+        // Keep the embedded preview proportional to the main viewport. It is
+        // deliberately not user-resizable: resizing an egui window captures
+        // pointer interaction and makes the following middle-drag feel as if
+        // the 3D canvas needs to be focused again.
+        let preview_size = egui::vec2(
+            (self.viewport_rect.width() * 0.24).max(160.0),
+            (self.viewport_rect.height() * 0.24).max(160.0),
+        );
+        let preview_pos = egui::pos2(
+            (self.viewport_rect.right() - preview_size.x - 10.0).max(self.viewport_rect.left()),
+            self.viewport_rect.top() + 104.0,
+        );
+        let frame = egui::Frame::window(&ctx.global_style()).inner_margin(egui::Margin::ZERO);
+        egui::Window::new("")
+            .id(self.id)
+            .order(egui::Order::Foreground)
+            .fixed_pos(preview_pos)
+            .fixed_size(preview_size)
+            .movable(false)
+            .resizable(false)
+            .collapsible(false)
+            .title_bar(false)
+            .frame(frame)
+            .show(ctx, |ui| {
+                let size = ui.available_size().max(egui::vec2(120.0, 120.0));
+                let response = if let Some(texture_id) = editor.slice_preview_texture {
+                    ui.add(
+                        egui::Image::new(egui::load::SizedTexture::new(texture_id, size))
+                            .fit_to_exact_size(size)
+                            .sense(egui::Sense::click()),
+                    )
+                } else {
+                    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+                    ui.painter()
+                        .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+                    response
+                };
+                let pixels_per_point = ctx.pixels_per_point();
+                editor.slice_preview_size_px = [
+                    (response.rect.width() * pixels_per_point).round().max(1.0) as u32,
+                    (response.rect.height() * pixels_per_point).round().max(1.0) as u32,
+                ];
+                if response
+                    .on_hover_text("Click to detach into a full-resolution window")
+                    .clicked()
+                {
+                    commands.push(crate::ui::state::UiCommand::SetSlicePreviewDetached(true));
+                }
+            });
+    }
+}

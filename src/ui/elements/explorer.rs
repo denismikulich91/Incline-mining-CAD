@@ -48,53 +48,55 @@ pub(crate) fn draw_explorer(
                         ui.label("No open .pidb");
                     }
                     for entry in &project.projects {
-                        let title = entry.name.clone();
-                        let proj_idx = entry.index;
-
-                        let collapse_id = ui.make_persistent_id(("pidb_project", entry.index));
-
-                        let contains_active_layer =
-                            editor.active_layer.is_some_and(|active_layer| {
-                                entry.layers.iter().any(|layer| layer.id == active_layer)
-                            });
-                        let label = if contains_active_layer {
-                            bold(&title).color(crate::ui::SELECTION_COLOR)
+                        // Every project in this section is a PIDB, so the extension adds no
+                        // useful distinction to its display name.
+                        let stem = entry.name.strip_suffix(".pidb").unwrap_or(&entry.name);
+                        let title = if entry.dirty {
+                            format!("{stem} *")
                         } else {
-                            bold(&title)
+                            stem.to_owned()
                         };
-
-                        let is_any_layers_loaded = entry.layers.iter().any(|layer| layer.is_loaded);
                         let path_tooltip = entry
                             .path
                             .as_deref()
                             .and_then(|p| p.to_str())
                             .unwrap_or("Unsaved")
                             .to_owned();
-                        let src = if is_any_layers_loaded {
+
+                        let runtime_id = entry.runtime_id;
+                        let collapse_id = ui.make_persistent_id(("pidb_project", runtime_id));
+
+                        let contains_active_layer =
+                            editor.active_layer.is_some_and(|active_layer| {
+                                entry.layers.iter().any(|layer| layer.id == active_layer)
+                            });
+                        let label = if entry.is_active || contains_active_layer {
+                            bold(&title).color(crate::ui::SELECTION_COLOR)
+                        } else {
+                            bold(&title)
+                        };
+
+                        let is_any_layer_loaded = entry.layers.iter().any(|layer| layer.is_loaded);
+                        let project_icon = if is_any_layer_loaded {
                             unthemed_icon!("unlocked.svg")
                         } else {
                             unthemed_icon!("locked.svg")
                         };
+
                         let (toggle_response, header_response, _body_response) =
-                            ExplorerHeader::new(collapse_id, src, label)
-                                .default_open(false)
+                            ExplorerHeader::new(collapse_id, project_icon, label)
+                                .default_open(true)
                                 .show(ui, |ui| {
                                     if entry.layers.is_empty() {
                                         ui.label("No layers under this .pidb");
                                     }
                                     for layer in &entry.layers {
                                         let layer_id = layer.id;
-                                        let is_active = entry.is_active
-                                            && editor.active_layer == Some(layer_id);
-                                        let layer_display_name = if layer.dirty {
-                                            format!("{} *", layer.name)
-                                        } else {
-                                            layer.name.clone()
-                                        };
+                                        let is_active = editor.active_layer == Some(layer_id);
                                         let layer_label = if layer.is_loaded {
-                                            bold(&layer_display_name)
+                                            bold(&layer.name)
                                         } else {
-                                            egui::RichText::new(&layer_display_name)
+                                            egui::RichText::new(&layer.name)
                                                 .color(INACTIVE_TEXT_COLOR)
                                         };
                                         let layer_resp = ui.add(
@@ -106,64 +108,46 @@ pub(crate) fn draw_explorer(
                                         );
                                         if layer_resp.double_clicked() {
                                             if layer.is_loaded {
-                                                commands.push(UiCommand::UnloadLayer(
-                                                    proj_idx, layer_id,
-                                                ));
+                                                commands.push(UiCommand::UnloadLayer(layer_id));
                                             } else {
-                                                commands
-                                                    .push(UiCommand::LoadLayer(proj_idx, layer_id));
+                                                commands.push(UiCommand::LoadLayer(layer_id));
                                             }
                                         }
                                         layer_resp.context_menu(|ui| {
                                             if layer.is_loaded {
                                                 if ui.button("Unload").clicked() {
-                                                    commands.push(UiCommand::UnloadLayer(
-                                                        proj_idx, layer_id,
-                                                    ));
+                                                    commands.push(UiCommand::UnloadLayer(layer_id));
                                                     ui.close();
                                                 }
                                             } else if ui.button("Load").clicked() {
-                                                commands
-                                                    .push(UiCommand::LoadLayer(proj_idx, layer_id));
+                                                commands.push(UiCommand::LoadLayer(layer_id));
                                                 ui.close();
                                             }
                                             if layer.is_loaded
                                                 && ui.button("Select All Objects").clicked()
                                             {
                                                 commands.push(UiCommand::SelectAllObjectsInLayer(
-                                                    proj_idx, layer_id,
-                                                ));
-                                                ui.close();
-                                            }
-                                            if ui.button("Save").clicked() {
-                                                commands.push(UiCommand::SaveProjectForLayer(
-                                                    proj_idx, layer_id,
+                                                    layer_id,
                                                 ));
                                                 ui.close();
                                             }
                                             if ui.button("Rename").clicked() {
-                                                commands.push(UiCommand::BeginRenameLayer(
-                                                    proj_idx, layer_id,
-                                                ));
+                                                commands
+                                                    .push(UiCommand::BeginRenameLayer(layer_id));
                                                 ui.close();
                                             }
                                             if ui.button("Duplicate Layer").clicked() {
-                                                commands.push(UiCommand::DuplicateLayer(
-                                                    proj_idx, layer_id,
-                                                ));
+                                                commands.push(UiCommand::DuplicateLayer(layer_id));
                                                 ui.close();
                                             }
                                             if ui.button("Move Layer...").clicked() {
-                                                commands.push(UiCommand::BeginMoveLayer(
-                                                    proj_idx, layer_id,
-                                                ));
+                                                commands.push(UiCommand::BeginMoveLayer(layer_id));
                                                 ui.close();
                                             }
                                             ui.separator();
                                             if ui.button("Delete Layer").clicked() {
-                                                commands.push(UiCommand::RequestDeleteLayer(
-                                                    proj_idx, layer_id,
-                                                ));
+                                                commands
+                                                    .push(UiCommand::RequestDeleteLayer(layer_id));
                                                 ui.close();
                                             }
                                         });
@@ -171,36 +155,48 @@ pub(crate) fn draw_explorer(
                                 });
 
                         let content_response = header_response.inner;
+                        let should_activate = toggle_response.double_clicked()
+                            || header_response.response.double_clicked();
                         let project_header_response = toggle_response
                             .union(header_response.response)
                             .union(content_response.clone())
                             .on_hover_text(&path_tooltip);
 
+                        if should_activate {
+                            commands.push(UiCommand::ActivatePidb(runtime_id));
+                        }
+
                         project_header_response.context_menu(|ui| {
-                            if ui.button("Save All Layers").clicked() {
-                                commands.push(UiCommand::SaveNamedPidb(proj_idx));
+                            if !entry.is_active && ui.button("Activate").clicked() {
+                                commands.push(UiCommand::ActivatePidb(runtime_id));
+                                ui.close();
+                            }
+                            if ui.button("Save").clicked() {
+                                commands.push(UiCommand::SavePidb(runtime_id));
                                 ui.close();
                             }
                             if ui.button("Save As…").clicked() {
-                                commands.push(UiCommand::SaveNamedPidbAs(proj_idx));
+                                commands.push(UiCommand::SavePidbAs(runtime_id));
                                 ui.close();
                             }
                             ui.separator();
                             if ui.button("Load All Layers").clicked() {
-                                commands.push(UiCommand::LoadAllLayersInProject(proj_idx));
+                                commands.push(UiCommand::LoadAllLayers(runtime_id));
                                 ui.close();
                             }
                             if ui.button("Unload All Layers").clicked() {
-                                commands.push(UiCommand::UnloadAllLayersInProject(proj_idx));
+                                commands.push(UiCommand::UnloadAllLayers(runtime_id));
                                 ui.close();
                             }
                             if entry.path.is_some() && ui.button("Reveal in Explorer").clicked() {
-                                commands.push(UiCommand::RevealPidb(proj_idx));
+                                if let Some(path) = entry.path.clone() {
+                                    commands.push(UiCommand::RevealPidb(path));
+                                }
                                 ui.close();
                             }
                             ui.separator();
-                            if ui.button("Remove PIDB").clicked() {
-                                commands.push(UiCommand::ClosePidb(proj_idx));
+                            if ui.button("Close PIDB").clicked() {
+                                commands.push(UiCommand::ClosePidb(runtime_id));
                                 ui.close();
                             }
                         });
@@ -546,7 +542,85 @@ pub(crate) fn draw_explorer(
                             }
                         });
                     }
-                })
+                });
+
+                ExplorerHeader::new(
+                    "textures_dropdown".into(),
+                    unthemed_icon!("texture.svg"),
+                    bold("Rasters"),
+                )
+                .default_open(!project.raster_textures.is_empty())
+                .show(ui, |ui| {
+                    if project.raster_textures.is_empty() {
+                        ui.label("No image textures");
+                    }
+                    for raster in &project.raster_textures {
+                        let label = if raster.is_loaded {
+                            bold(&raster.name)
+                        } else {
+                            egui::RichText::new(&raster.name).color(INACTIVE_TEXT_COLOR)
+                        };
+                        let details = if raster.is_loaded {
+                            format!(
+                                "{} · {} × {}\n{}\n{}",
+                                raster.driver_name,
+                                raster.source_size[0],
+                                raster.source_size[1],
+                                raster.path.display(),
+                                raster.projection
+                            )
+                        } else {
+                            raster.path.display().to_string()
+                        };
+                        let response = ui
+                            .add(
+                                ExplorerEntry::new(unthemed_icon!("texture.svg"), label)
+                                    .selected(raster.is_draped),
+                            )
+                            .on_hover_text(details);
+                        if response.double_clicked() {
+                            if raster.is_loaded {
+                                commands.push(UiCommand::UnloadRaster(raster.path.clone()));
+                            } else {
+                                commands.push(UiCommand::LoadRaster(raster.path.clone()));
+                            }
+                        }
+                        response.context_menu(|ui| {
+                            if raster.is_loaded {
+                                if ui.button("Drape over surface").clicked() {
+                                    commands.push(UiCommand::DrapeRaster(raster.path.clone()));
+                                    ui.close();
+                                }
+                                if raster.is_draped && ui.button("Undrape all").clicked() {
+                                    commands.push(UiCommand::UndrapeRaster(raster.path.clone()));
+                                    ui.close();
+                                }
+                                if ui.button("Unload").clicked() {
+                                    commands.push(UiCommand::UnloadRaster(raster.path.clone()));
+                                    ui.close();
+                                }
+                            } else if ui.button("Load").clicked() {
+                                commands.push(UiCommand::LoadRaster(raster.path.clone()));
+                                ui.close();
+                            }
+                            if project.active_triangulation_for_menu.is_some()
+                                && ui.button("Clear active triangulation texture").clicked()
+                            {
+                                commands.push(UiCommand::ClearActiveTriangulationRaster);
+                                ui.close();
+                            }
+                            if ui.button("Reveal in Explorer").clicked() {
+                                commands.push(UiCommand::RevealRaster(raster.path.clone()));
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("Remove").clicked() {
+                                commands.push(UiCommand::RemoveRaster(raster.path.clone()));
+                                ui.close();
+                            }
+                        });
+                    }
+                });
             });
         })
         .response

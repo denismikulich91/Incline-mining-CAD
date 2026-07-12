@@ -61,7 +61,154 @@ fn aabb_scissor_rect(
     Some((x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0)))
 }
 
+/// Choose a point LOD with a 20% dead band around each boundary. The dead
+/// band prevents tiny camera movements or projection rounding from toggling a
+/// chunk between two visibly different densities every frame.
+fn point_lod_with_hysteresis(counts: [u32; 3], desired: usize, current: usize) -> usize {
+    let mut level = current.min(counts.len() - 1);
+    while level + 1 < counts.len() && desired.saturating_mul(5) < counts[level + 1] as usize * 4 {
+        level += 1;
+    }
+    while level > 0 && desired.saturating_mul(4) > counts[level] as usize * 5 {
+        level -= 1;
+    }
+    level
+}
+
+fn clamped_document_batch_range(
+    range: (u32, u32),
+    available_indices: usize,
+) -> Option<std::ops::Range<u32>> {
+    let start = (range.0 as usize).min(available_indices);
+    let end = (range.1 as usize).min(available_indices);
+    let end = start + (end.saturating_sub(start) / 3) * 3;
+    (start < end).then_some(start as u32..end as u32)
+}
+
+fn document_primitive_order(primitive: DocumentPrimitive) -> u8 {
+    match primitive {
+        DocumentPrimitive::Fill => 0,
+        DocumentPrimitive::Stroke => 1,
+    }
+}
+
 impl<'a> Graphics<'a> {
+    fn draw_document_batches<'pass>(
+        &'pass self,
+        render_pass: &mut wgpu::RenderPass<'pass>,
+        stage: DocumentRenderStage,
+        xray_enabled: bool,
+        primitive_filter: Option<DocumentPrimitive>,
+    ) {
+        let mut batches = self
+            .document_draw_batches
+            .iter()
+            .filter(|batch| {
+                batch.stage(xray_enabled) == stage
+                    && primitive_filter.is_none_or(|primitive| batch.primitive == primitive)
+            })
+            .collect::<Vec<_>>();
+        if stage == DocumentRenderStage::Translucent {
+            let forward = self.camera.forward();
+            let position = self.camera.position;
+            batches.sort_by(|a, b| {
+                let a_depth = (a.center - position).dot(forward);
+                let b_depth = (b.center - position).dot(forward);
+                b_depth.total_cmp(&a_depth).then_with(|| {
+                    document_primitive_order(a.primitive)
+                        .cmp(&document_primitive_order(b.primitive))
+                })
+            });
+        } else {
+            // Preserve the traditional fill-before-outline ordering. Stable
+            // sorting retains object order within each primitive stream.
+            batches.sort_by_key(|batch| document_primitive_order(batch.primitive));
+        }
+
+        let mut bound_primitive = None;
+        for batch in batches {
+            if bound_primitive != Some(batch.primitive) {
+                let pipeline = match (stage, batch.primitive, xray_enabled) {
+                    (_, DocumentPrimitive::Fill, true) => &self.xray_render_pipeline,
+                    (DocumentRenderStage::Opaque, DocumentPrimitive::Fill, false)
+                    | (DocumentRenderStage::Overlay, DocumentPrimitive::Fill, false) => {
+                        &self.render_pipeline
+                    }
+                    (DocumentRenderStage::Translucent, DocumentPrimitive::Fill, false) => {
+                        &self.transparent_document_fill_pipeline
+                    }
+                    (_, DocumentPrimitive::Stroke, true) => &self.overlay_render_pipeline,
+                    (DocumentRenderStage::Opaque, DocumentPrimitive::Stroke, false) => {
+                        &self.opaque_stroke_render_pipeline
+                    }
+                    (DocumentRenderStage::Translucent, DocumentPrimitive::Stroke, false)
+                    | (DocumentRenderStage::Overlay, DocumentPrimitive::Stroke, false) => {
+                        &self.stroke_render_pipeline
+                    }
+                };
+                render_pass.set_pipeline(pipeline);
+                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                match batch.primitive {
+                    DocumentPrimitive::Fill => {
+                        render_pass.set_vertex_buffer(0, self.lyon_vertex_gpu.slice(..));
+                        render_pass.set_index_buffer(
+                            self.lyon_index_gpu.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                    }
+                    DocumentPrimitive::Stroke => {
+                        render_pass.set_vertex_buffer(0, self.stroke_vertex_gpu.slice(..));
+                        render_pass.set_index_buffer(
+                            self.stroke_index_gpu.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                    }
+                }
+                bound_primitive = Some(batch.primitive);
+            }
+
+            let available = match batch.primitive {
+                DocumentPrimitive::Fill => self.lyon_buffer.indices.len(),
+                DocumentPrimitive::Stroke => self.stroke_index_buf.len(),
+            };
+            if let Some(range) = clamped_document_batch_range(batch.index_range, available) {
+                render_pass.draw_indexed(range, 0, 0..1);
+            }
+        }
+    }
+
+    fn draw_static_document_strokes<'pass>(
+        &'pass self,
+        render_pass: &mut wgpu::RenderPass<'pass>,
+        xray_enabled: bool,
+    ) {
+        if !self
+            .static_strokes
+            .chunks()
+            .iter()
+            .any(|chunk| chunk.drawable())
+        {
+            return;
+        }
+        render_pass.set_pipeline(if xray_enabled {
+            &self.overlay_render_pipeline
+        } else {
+            &self.opaque_stroke_render_pipeline
+        });
+        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        for chunk in self.static_strokes.chunks() {
+            if !chunk.drawable() {
+                continue;
+            }
+            let (Some(vertex_gpu), Some(index_gpu)) = (&chunk.vertex_gpu, &chunk.index_gpu) else {
+                continue;
+            };
+            render_pass.set_vertex_buffer(0, vertex_gpu.slice(..));
+            render_pass.set_index_buffer(index_gpu.slice(..), wgpu::IndexFormat::Uint32);
+            render_pass.draw_indexed(0..chunk.index_count, 0, 0..1);
+        }
+    }
+
     /// Scene-origin-relative AABB of a triangulation mesh, in the same space as
     /// the uploaded surface vertices (`world - scene_origin`, no vertical
     /// exaggeration — that lives in `view_proj`). Matches `surface_vertex` so a
@@ -76,6 +223,13 @@ impl<'a> Graphics<'a> {
         (min.as_vec3(), max.as_vec3())
     }
 
+    /// Whether the camera is looking exactly down in orthographic mode — the
+    /// only view in which flat plan-view raster images are drawn.
+    fn plan_view_active(&self) -> bool {
+        !self.projection.is_perspective() && self.camera.forward().z <= -(1.0 - 1.0e-6)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn render_scene_pass(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -84,12 +238,14 @@ impl<'a> Graphics<'a> {
         triangulations: &[OpenTriangulation],
         block_models: &[OpenBlockModel],
         point_clouds: &[crate::model::point_cloud::OpenPointCloud],
+        rasters: &[OpenRasterTexture],
+        include_editor_overlays: bool,
     ) {
         let bg_color = editor.renderer_background_color;
         let clear_color = [
-            linear_to_srgb(bg_color[0]) as f64,
-            linear_to_srgb(bg_color[1]) as f64,
-            linear_to_srgb(bg_color[2]) as f64,
+            bg_color[0].clamp(0.0, 1.0) as f64,
+            bg_color[1].clamp(0.0, 1.0) as f64,
+            bg_color[2].clamp(0.0, 1.0) as f64,
         ];
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Render Pass"),
@@ -110,7 +266,7 @@ impl<'a> Graphics<'a> {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &self.depth_view,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
+                    load: wgpu::LoadOp::Clear(0.0),
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
@@ -123,9 +279,8 @@ impl<'a> Graphics<'a> {
         // Block model chunks carry their own AABB, so cheaply skip GPU draw
         // calls for chunks that are entirely outside the current view
         // instead of always uploading/drawing every renderable block.
-        let frustum = Frustum::from_view_proj(glam::Mat4::from_cols_array_2d(
-            &self.camera_uniform.view_proj,
-        ));
+        let view_proj = glam::Mat4::from_cols_array_2d(&self.camera_uniform.view_proj);
+        let frustum = Frustum::from_view_proj(view_proj);
 
         // Developer chunk-debug view: colour each surface chunk distinctly and
         // report how many chunks survive frustum culling.
@@ -133,11 +288,38 @@ impl<'a> Graphics<'a> {
         let mut rendered_chunks: u32 = 0;
         let mut total_chunks: u32 = 0;
 
+        // Undraped rasters show as flat plan-view images: drawn before all
+        // scene geometry, pinned to the far plane with depth writes off, and
+        // only when the view is exactly top-down orthographic — from any
+        // other angle a heightless image would be misleading.
+        if self.plan_view_active() {
+            let draped: std::collections::HashSet<_> = triangulations
+                .iter()
+                .filter_map(|triangulation| triangulation.raster_texture)
+                .collect();
+            let mut pipeline_bound = false;
+            for raster in rasters {
+                if draped.contains(&raster.id) {
+                    continue;
+                }
+                let Some((bind_group, vertex_buffer)) = self.raster_gpu.plane(raster.id) else {
+                    continue;
+                };
+                if !pipeline_bound {
+                    render_pass.set_pipeline(&self.raster_plane_render_pipeline);
+                    render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    pipeline_bound = true;
+                }
+                render_pass.set_bind_group(1, bind_group, &[]);
+                render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                render_pass.draw(0..4, 0..1);
+            }
+        }
+
         // Point splats write depth, so they draw with the opaque geometry —
         // before the transparent surfaces that must blend over them.
         if !self.point_cloud_gpu.is_empty() {
-            render_pass.set_pipeline(&self.point_cloud_render_pipeline);
-            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            let mut colored_pipeline_active = None;
             for point_cloud in point_clouds {
                 if !point_cloud.visible {
                     continue;
@@ -145,15 +327,68 @@ impl<'a> Graphics<'a> {
                 let Some(cached) = self.point_cloud_gpu.get(point_cloud.id) else {
                     continue;
                 };
+                if colored_pipeline_active != Some(cached.colored) {
+                    let pipeline = if cached.colored {
+                        &self.point_cloud_colored_render_pipeline
+                    } else {
+                        &self.point_cloud_uncolored_render_pipeline
+                    };
+                    render_pass.set_pipeline(pipeline);
+                    render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    colored_pipeline_active = Some(cached.colored);
+                }
                 render_pass.set_bind_group(1, &cached.style_bind_group, &[]);
-                for chunk in &cached.chunks {
-                    if !frustum.intersects_aabb(chunk.bounds_min, chunk.bounds_max) {
+                for chunk in cached.chunks.iter().filter_map(Option::as_ref) {
+                    let bounds_min = chunk.bounds_min + cached.origin_scene;
+                    let bounds_max = chunk.bounds_max + cached.origin_scene;
+                    // Projected bounds are conservative and include raster
+                    // padding. Unlike a separate plane test, an uncertain box
+                    // at the eye plane returns `None` and is always retained.
+                    let projected = aabb_scissor_rect(
+                        &view_proj,
+                        bounds_min,
+                        bounds_max,
+                        self.size.width.max(1) as f32,
+                        self.size.height.max(1) as f32,
+                    );
+                    if projected.is_some_and(|(_, _, width, height)| width == 0 || height == 0) {
                         continue;
                     }
+                    let desired_points = projected
+                        .map(|(_, _, width, height)| {
+                            ((u64::from(width) * u64::from(height)) / 4).max(1) as usize
+                        })
+                        .unwrap_or(usize::MAX);
+                    let level = point_lod_with_hysteresis(
+                        chunk.level_counts,
+                        desired_points,
+                        chunk.selected_level.get(),
+                    );
+                    chunk.selected_level.set(level);
+                    let instance_count = chunk.level_counts[level];
                     render_pass.set_vertex_buffer(0, chunk.instance_buffer.slice(..));
-                    render_pass.draw(0..6, 0..chunk.instance_count);
+                    render_pass.draw(0..4, 0..instance_count);
                 }
             }
+        }
+
+        // Opaque document fills and strokes must establish colour and depth
+        // before any translucent surface or block-model composite. X-ray
+        // intentionally remains an editor overlay and is deferred.
+        if !editor.xray_enabled {
+            self.draw_document_batches(
+                &mut render_pass,
+                DocumentRenderStage::Opaque,
+                false,
+                Some(DocumentPrimitive::Fill),
+            );
+            self.draw_static_document_strokes(&mut render_pass, false);
+            self.draw_document_batches(
+                &mut render_pass,
+                DocumentRenderStage::Opaque,
+                false,
+                Some(DocumentPrimitive::Stroke),
+            );
         }
 
         if !self.triangulation_gpu.is_empty() || !self.block_model_gpu.is_empty() {
@@ -179,6 +414,11 @@ impl<'a> Graphics<'a> {
                 if !debug_chunks {
                     render_pass.set_bind_group(1, &cached.surface_style_bind_group, &[]);
                 }
+                render_pass.set_bind_group(
+                    3,
+                    self.raster_gpu.bind_group(triangulation.raster_texture),
+                    &[],
+                );
                 for chunk in &cached.surface_chunks {
                     // Per-chunk frustum cull: chunks are Morton-spatial, so their
                     // AABBs are tight enough for this to reject real geometry.
@@ -259,6 +499,11 @@ impl<'a> Graphics<'a> {
                 if !debug_chunks {
                     render_pass.set_bind_group(1, &cached.surface_style_bind_group, &[]);
                 }
+                render_pass.set_bind_group(
+                    3,
+                    self.raster_gpu.bind_group(triangulation.raster_texture),
+                    &[],
+                );
                 for chunk in &cached.surface_chunks {
                     if !frustum.intersects_aabb(chunk.bounds_min, chunk.bounds_max) {
                         continue;
@@ -277,8 +522,53 @@ impl<'a> Graphics<'a> {
         }
 
         drop(render_pass);
-        self.chunk_render_stats = (rendered_chunks, total_chunks);
-        self.render_volume_block_models(encoder, view, editor, block_models, &frustum);
+        // Secondary viewports (slice previews) must not overwrite the main
+        // viewport's statistics or advance the shared volume residency
+        // streamer: the main pass may already be encoded against the current
+        // residency tables, and two cameras would evict each other's bricks
+        // every frame. Previews read whatever is resident and fall back to
+        // brick aggregates elsewhere.
+        if include_editor_overlays {
+            self.chunk_render_stats = (rendered_chunks, total_chunks);
+        }
+        let needs_volume_target = block_models.iter().any(|block_model| {
+            let entity = block_model.entity_id();
+            block_model.visible
+                && !editor.hidden_handles.contains(&entity)
+                && self
+                    .block_model_gpu
+                    .get(block_model.id)
+                    .is_some_and(|cached| {
+                        cached.volume.as_ref().is_some_and(|volume| {
+                            frustum.intersects_aabb(volume.bounds_min, volume.bounds_max)
+                        })
+                    })
+        });
+        let needs_transparency_target = needs_volume_target
+            || block_models.iter().any(|block_model| {
+                let entity = block_model.entity_id();
+                block_model.visible
+                    && !editor.hidden_handles.contains(&entity)
+                    && self
+                        .block_model_gpu
+                        .get(block_model.id)
+                        .is_some_and(|cached| {
+                            cached.volume.is_none()
+                                && cached.transparent_surface_chunks.iter().any(|chunk| {
+                                    frustum
+                                        .intersects_aabb(chunk.gpu.bounds_min, chunk.gpu.bounds_max)
+                                })
+                        })
+            });
+        self.update_block_model_optional_targets(needs_transparency_target, needs_volume_target);
+        self.render_volume_block_models(
+            encoder,
+            view,
+            editor,
+            block_models,
+            &frustum,
+            include_editor_overlays,
+        );
         self.render_fallback_transparent_block_models(
             encoder,
             view,
@@ -288,7 +578,7 @@ impl<'a> Graphics<'a> {
         );
 
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Overlay Render Pass"),
+            label: Some("Document Transparency and Overlay Render Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &self.msaa_view,
                 resolve_target: Some(view),
@@ -311,55 +601,38 @@ impl<'a> Graphics<'a> {
             multiview_mask: None,
         });
 
-        if !self.lyon_buffer.vertices.is_empty() && !self.lyon_buffer.indices.is_empty() {
-            render_pass.set_pipeline(if editor.xray_enabled {
-                &self.xray_render_pipeline
-            } else {
-                &self.render_pipeline
-            });
-            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.lyon_vertex_gpu.slice(..));
-            render_pass.set_index_buffer(self.lyon_index_gpu.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..self.lyon_buffer.indices.len() as u32, 0, 0..1);
+        if editor.xray_enabled {
+            // X-ray deliberately bypasses scene depth and stays above all
+            // composited transparency, matching the previous editor behavior.
+            self.draw_document_batches(
+                &mut render_pass,
+                DocumentRenderStage::Overlay,
+                true,
+                Some(DocumentPrimitive::Fill),
+            );
+            self.draw_static_document_strokes(&mut render_pass, true);
+            self.draw_document_batches(
+                &mut render_pass,
+                DocumentRenderStage::Overlay,
+                true,
+                Some(DocumentPrimitive::Stroke),
+            );
+        } else {
+            // Alpha document primitives test the complete opaque depth buffer
+            // but never update it, so farther translucent fills still blend.
+            self.draw_document_batches(
+                &mut render_pass,
+                DocumentRenderStage::Translucent,
+                false,
+                None,
+            );
+            self.draw_document_batches(&mut render_pass, DocumentRenderStage::Overlay, false, None);
         }
 
-        // Static stroke chunks draw before the stream strokes so selected
-        // objects (always on the stream path) still land on top of them.
-        if self.static_strokes.chunks().iter().any(|c| c.drawable()) {
-            render_pass.set_pipeline(if editor.xray_enabled {
-                &self.overlay_render_pipeline
-            } else {
-                &self.stroke_render_pipeline
-            });
-            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            for chunk in self.static_strokes.chunks() {
-                if !chunk.drawable() {
-                    continue;
-                }
-                let (Some(vertex_gpu), Some(index_gpu)) = (&chunk.vertex_gpu, &chunk.index_gpu)
-                else {
-                    continue;
-                };
-                render_pass.set_vertex_buffer(0, vertex_gpu.slice(..));
-                render_pass.set_index_buffer(index_gpu.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..chunk.index_count, 0, 0..1);
-            }
-        }
-
-        if !self.stroke_vertex_buf.is_empty() && !self.stroke_index_buf.is_empty() {
-            render_pass.set_pipeline(if editor.xray_enabled {
-                &self.overlay_render_pipeline
-            } else {
-                &self.stroke_render_pipeline
-            });
-            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.stroke_vertex_gpu.slice(..));
-            render_pass
-                .set_index_buffer(self.stroke_index_gpu.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..self.stroke_index_buf.len() as u32, 0, 0..1);
-        }
-
-        if !self.dynamic_vertex_buf.is_empty() && !self.dynamic_index_buf.is_empty() {
+        if include_editor_overlays
+            && !self.dynamic_vertex_buf.is_empty()
+            && !self.dynamic_index_buf.is_empty()
+        {
             render_pass.set_pipeline(if editor.xray_enabled {
                 &self.overlay_render_pipeline
             } else {
@@ -409,7 +682,10 @@ impl<'a> Graphics<'a> {
             }
         }
 
-        if !self.overlay_vertex_buf.is_empty() && !self.overlay_index_buf.is_empty() {
+        if include_editor_overlays
+            && !self.overlay_vertex_buf.is_empty()
+            && !self.overlay_index_buf.is_empty()
+        {
             render_pass.set_pipeline(&self.overlay_render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.overlay_vertex_gpu.slice(..));
@@ -418,11 +694,13 @@ impl<'a> Graphics<'a> {
             render_pass.draw_indexed(0..self.overlay_index_buf.len() as u32, 0, 0..1);
         }
 
-        if let Err(e) = self.text_system.text_renderer.render(
-            &self.text_system.text_atlas,
-            &self.text_system.viewport,
-            &mut render_pass,
-        ) {
+        if include_editor_overlays
+            && let Err(e) = self.text_system.text_renderer.render(
+                &self.text_system.text_atlas,
+                &self.text_system.viewport,
+                &mut render_pass,
+            )
+        {
             log::error!("Text render failed: {e:?}");
         }
     }
@@ -434,13 +712,18 @@ impl<'a> Graphics<'a> {
         editor: &EditorState,
         block_models: &[OpenBlockModel],
         frustum: &Frustum,
+        stream_residency: bool,
     ) {
         // Advance cell-pool streaming for the camera's current position before
         // drawing: near bricks become resident, far ones fall back to their
-        // aggregates. No-op for volumes that fit the pool.
-        let camera_scene = (self.camera.position - self.scene_origin).as_vec3();
-        self.block_model_gpu
-            .stream_volumes(&self.queue, camera_scene);
+        // aggregates. No-op for volumes that fit the pool. Only the primary
+        // viewport streams; preview cameras render from the main viewport's
+        // residency so they cannot mutate or thrash it.
+        if stream_residency {
+            let camera_scene = (self.camera.position - self.scene_origin).as_vec3();
+            self.block_model_gpu
+                .stream_volumes(&self.queue, camera_scene);
+        }
 
         let mut visible_volume_blocks = block_models
             .iter()
@@ -461,6 +744,14 @@ impl<'a> Graphics<'a> {
         if visible_volume_blocks.is_empty() {
             return;
         }
+        let volume_target = self
+            .block_model_volume_target
+            .as_ref()
+            .expect("visible volume block model must have a volume target");
+        let transparency_targets = self
+            .block_model_transparency_targets
+            .as_ref()
+            .expect("visible volume block model must have a depth bind group");
         // Each model raycasts independently and blends One/OneMinusSrcAlpha
         // into the shared target, so correctness requires back-to-front
         // ordering — the same convention as the transparent-triangulation
@@ -488,7 +779,7 @@ impl<'a> Graphics<'a> {
         let scaled_width = (self.config.width as f32 * render_scale).max(1.0);
         let scaled_height = (self.config.height as f32 * render_scale).max(1.0);
         self.queue.write_buffer(
-            &self.block_model_volume_target.params_buffer,
+            &volume_target.params_buffer,
             0,
             bytemuck::cast_slice(&[scaled_width, scaled_height, 0.0f32, 0.0f32]),
         );
@@ -497,7 +788,7 @@ impl<'a> Graphics<'a> {
             let mut volume_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Block Model Volume Raycast Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.block_model_volume_target.view,
+                    view: &volume_target.view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -515,9 +806,7 @@ impl<'a> Graphics<'a> {
             volume_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             volume_pass.set_bind_group(
                 2,
-                &self
-                    .block_model_transparency_targets
-                    .transparency_fallback_bind_groups[0],
+                &transparency_targets.transparency_fallback_bind_groups[0],
                 &[],
             );
             let view_proj = glam::Mat4::from_cols_array_2d(&self.camera_uniform.view_proj);
@@ -571,7 +860,7 @@ impl<'a> Graphics<'a> {
             multiview_mask: None,
         });
         upscale_pass.set_pipeline(&self.block_model_volume_upscale_pipeline);
-        upscale_pass.set_bind_group(0, &self.block_model_volume_target.bind_group, &[]);
+        upscale_pass.set_bind_group(0, &volume_target.bind_group, &[]);
         upscale_pass.draw(0..3, 0..1);
     }
 
@@ -593,19 +882,27 @@ impl<'a> Graphics<'a> {
                         .block_model_gpu
                         .get(block_model.id)
                         .is_some_and(|cached| {
-                            cached.volume.is_none() && !cached.transparent_surface_chunks.is_empty()
+                            cached.volume.is_none()
+                                && cached.transparent_surface_chunks.iter().any(|chunk| {
+                                    frustum
+                                        .intersects_aabb(chunk.gpu.bounds_min, chunk.gpu.bounds_max)
+                                })
                         })
             })
             .collect::<Vec<_>>();
         if visible_transparent_blocks.is_empty() {
             return;
         }
+        let transparency_targets = self
+            .block_model_transparency_targets
+            .as_ref()
+            .expect("visible transparent block model must have transparency targets");
 
         {
             let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Block Model Transparency Clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.block_model_transparency_targets.accum_views[0],
+                    view: &transparency_targets.accum_views[0],
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -624,7 +921,7 @@ impl<'a> Graphics<'a> {
             let mut transparency_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Block Model Order-Independent Transparency Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.block_model_transparency_targets.accum_views[0],
+                    view: &transparency_targets.accum_views[0],
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -641,9 +938,7 @@ impl<'a> Graphics<'a> {
             transparency_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             transparency_pass.set_bind_group(
                 2,
-                &self
-                    .block_model_transparency_targets
-                    .transparency_fallback_bind_groups[0],
+                &transparency_targets.transparency_fallback_bind_groups[0],
                 &[],
             );
             for block_model in &visible_transparent_blocks {
@@ -678,11 +973,7 @@ impl<'a> Graphics<'a> {
             multiview_mask: None,
         });
         composite_pass.set_pipeline(&self.block_model_transparency_composite_pipeline);
-        composite_pass.set_bind_group(
-            0,
-            &self.block_model_transparency_targets.composite_bind_groups[0],
-            &[],
-        );
+        composite_pass.set_bind_group(0, &transparency_targets.composite_bind_groups[0], &[]);
         composite_pass.draw(0..3, 0..1);
     }
 }

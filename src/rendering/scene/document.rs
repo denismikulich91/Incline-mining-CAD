@@ -7,9 +7,12 @@ use lyon::{
     tessellation::{BuffersBuilder, FillOptions, FillTessellator, FillVertex, VertexBuffers},
 };
 
-use crate::rendering::{
-    Vertex,
-    geometry::{DrawContext, draw_line},
+use crate::{
+    model::{PolyVertex, geometry::tessellate_polyline_bulges},
+    rendering::{
+        Vertex,
+        geometry::{DrawContext, draw_line},
+    },
 };
 
 pub(crate) fn draw_origin_marker(draw_ctx: &mut DrawContext<'_>) {
@@ -38,19 +41,17 @@ pub(crate) fn draw_origin_marker(draw_ctx: &mut DrawContext<'_>) {
     );
 }
 
-/// Compute an orthonormal local frame for a polygon's best-fit plane using
-/// Newell's method. Returns (centroid, axis_u, axis_v). For horizontal
-/// polygons (normal ~= Z) the axes align with X and Y, so horizontal fills
-/// are identical to the old XY projection. For tilted polygons the fill
-/// sits in the actual face plane rather than being projected onto XY.
-pub(crate) fn polygon_plane_frame(verts: &[crate::model::PolyVertex]) -> (DVec3, DVec3, DVec3) {
-    let n = verts.len();
-    let centroid = verts.iter().fold(DVec3::ZERO, |a, v| a + v.pos) / n as f64;
+fn polygon_plane_frame_points(points: &[DVec3]) -> (DVec3, DVec3, DVec3) {
+    let n = points.len();
+    if n == 0 {
+        return (DVec3::ZERO, DVec3::X, DVec3::Y);
+    }
+    let centroid = points.iter().copied().sum::<DVec3>() / n as f64;
 
     let mut normal = DVec3::ZERO;
     for i in 0..n {
-        let c = verts[i].pos;
-        let d = verts[(i + 1) % n].pos;
+        let c = points[i];
+        let d = points[(i + 1) % n];
         normal.x += (c.y - d.y) * (c.z + d.z);
         normal.y += (c.z - d.z) * (c.x + d.x);
         normal.z += (c.x - d.x) * (c.y + d.y);
@@ -71,26 +72,41 @@ pub(crate) fn polygon_plane_frame(verts: &[crate::model::PolyVertex]) -> (DVec3,
     (centroid, axis_u, axis_v)
 }
 
+pub(crate) fn polygon_hatch_spacing(verts: &[PolyVertex], divisions: f64) -> f64 {
+    let points = tessellate_polyline_bulges(verts, true);
+    let (centroid, axis_u, axis_v) = polygon_plane_frame_points(&points);
+    let mut min = glam::DVec2::splat(f64::INFINITY);
+    let mut max = glam::DVec2::splat(f64::NEG_INFINITY);
+    for point in points {
+        let delta = point - centroid;
+        let projected = glam::DVec2::new(delta.dot(axis_u), delta.dot(axis_v));
+        min = min.min(projected);
+        max = max.max(projected);
+    }
+    ((max - min).max_element() / divisions.max(1.0)).max(f64::EPSILON)
+}
+
 /// Draw hatch lines at `angle_deg` clipped to the interior of a closed polygon.
 /// Works in the polygon's own plane, so the fill is correct regardless of
 /// camera orientation or polygon tilt.
 pub(crate) fn fill_polygon_hatch(
     draw_ctx: &mut DrawContext<'_>,
-    verts: &[crate::model::PolyVertex],
+    verts: &[PolyVertex],
     color: [f32; 4],
     angle_deg: f32,
     spacing: f64,
     line_weight: f32,
 ) {
-    if verts.len() < 3 {
+    let points = tessellate_polyline_bulges(verts, true);
+    if points.len() < 3 {
         return;
     }
-    let (centroid, axis_u, axis_v) = polygon_plane_frame(verts);
+    let (centroid, axis_u, axis_v) = polygon_plane_frame_points(&points);
 
-    let pts_2d: Vec<[f64; 2]> = verts
+    let pts_2d: Vec<[f64; 2]> = points
         .iter()
-        .map(|v| {
-            let d = v.pos - centroid;
+        .map(|point| {
+            let d = *point - centroid;
             [d.dot(axis_u), d.dot(axis_v)]
         })
         .collect();
@@ -148,19 +164,20 @@ pub(crate) fn fill_polygon_hatch(
 pub(crate) fn fill_polygon_solid(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u32>,
-    verts: &[crate::model::PolyVertex],
+    verts: &[PolyVertex],
     color: [f32; 4],
     scene_origin: DVec3,
 ) {
-    if verts.len() < 3 {
+    let points = tessellate_polyline_bulges(verts, true);
+    if points.len() < 3 {
         return;
     }
-    let (centroid, axis_u, axis_v) = polygon_plane_frame(verts);
+    let (centroid, axis_u, axis_v) = polygon_plane_frame_points(&points);
 
-    let pts_2d: Vec<[f32; 2]> = verts
+    let pts_2d: Vec<[f32; 2]> = points
         .iter()
-        .map(|v| {
-            let d = v.pos - centroid;
+        .map(|point| {
+            let d = *point - centroid;
             [d.dot(axis_u) as f32, d.dot(axis_v) as f32]
         })
         .collect();

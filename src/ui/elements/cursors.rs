@@ -70,7 +70,21 @@ pub(crate) fn draw_orientation_gizmo(
             let mut painter = ui.painter_at(rect);
             painter.set_clip_rect(canvas_rect);
 
+            let draw_origin_dot = |painter: &egui::Painter| {
+                painter.circle_filled(
+                    origin,
+                    4.0,
+                    egui::Color32::from_rgba_unmultiplied(238, 242, 246, 235),
+                );
+            };
+            let mut origin_dot_drawn = false;
+
             for node in &nodes {
+                if !origin_dot_drawn && node.depth < 0.0 {
+                    draw_origin_dot(&painter);
+                    origin_dot_drawn = true;
+                }
+
                 let front_factor = ((-node.depth + 1.0) * 0.5).clamp(0.0, 1.0);
                 let alpha = lerp_u8(80, 245, front_factor);
                 let color = egui::Color32::from_rgba_unmultiplied(
@@ -105,11 +119,9 @@ pub(crate) fn draw_orientation_gizmo(
                 }
             }
 
-            painter.circle_filled(
-                origin,
-                4.0,
-                egui::Color32::from_rgba_unmultiplied(238, 242, 246, 235),
-            );
+            if !origin_dot_drawn {
+                draw_origin_dot(&painter);
+            }
 
             if response.clicked()
                 && let Some(pos) = response.hover_pos()

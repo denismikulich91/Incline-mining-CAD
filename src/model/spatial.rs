@@ -2,20 +2,45 @@
 
 use glam::{DMat4, DVec2, DVec3};
 
-use crate::model::{Object, PolyVertex, formats::tri00t};
+use crate::model::{
+    Document, FillStyle, Object, PolyVertex,
+    formats::tri00t,
+    geometry::{polyline_bulge_bounds, tessellate_polyline_bulges, text_bounds_corners},
+    road_network::{ResolvedNetwork, RoadKey, resolve},
+};
 
 /// BVH over document objects, built once when the scene document changes.
 /// Allows `snap_cursor` to find nearby objects in O(log N) instead of O(N).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ObjectSnapIndex {
     bboxes: Vec<(DVec3, DVec3)>,
+    /// Ray-test geometry for closed solid fills, aligned with document object
+    /// indices. Tessellation and plane projection are paid once per document
+    /// revision when this index is rebuilt, rather than on every snap poll.
+    filled_polygons: Vec<Option<FilledPolygon>>,
     order: Vec<u32>,
     nodes: Vec<Node>,
 }
 
 impl ObjectSnapIndex {
-    pub(crate) fn build(objects: &[Object]) -> Self {
-        let bboxes: Vec<(DVec3, DVec3)> = objects.iter().map(object_bbox).collect();
+    pub(crate) fn build(document: &Document) -> Self {
+        let road_network = resolve(document, None);
+        let filled_polygons: Vec<Option<FilledPolygon>> = document
+            .objects()
+            .iter()
+            .map(FilledPolygon::from_object)
+            .collect();
+        let bboxes: Vec<(DVec3, DVec3)> = document
+            .objects()
+            .iter()
+            .enumerate()
+            .map(|(index, object)| {
+                let bounds = object_bbox(object, &road_network);
+                filled_polygons[index]
+                    .as_ref()
+                    .map_or(bounds, |polygon| union_bounds(bounds, polygon.bounds))
+            })
+            .collect();
         let order: Vec<u32> = bboxes
             .iter()
             .enumerate()
@@ -24,6 +49,7 @@ impl ObjectSnapIndex {
         let n = order.len();
         let mut index = Self {
             bboxes,
+            filled_polygons,
             order,
             nodes: Vec::new(),
         };
@@ -68,6 +94,65 @@ impl ObjectSnapIndex {
             }
         }
         result
+    }
+
+    /// Find the nearest cached solid-polygon hit along a ray. The BVH rejects
+    /// distant objects before `eligible` is called, so visibility/opacity
+    /// checks and polygon tests scale with ray-local candidates rather than
+    /// every object in the document.
+    pub(crate) fn nearest_filled_polygon_hit(
+        &self,
+        origin: DVec3,
+        direction: DVec3,
+        mut eligible: impl FnMut(usize) -> bool,
+    ) -> Option<DVec3> {
+        if self.nodes.is_empty()
+            || !origin.is_finite()
+            || !direction.is_finite()
+            || direction.length_squared() <= f64::EPSILON
+        {
+            return None;
+        }
+
+        let mut stack = vec![0usize];
+        let mut nearest_distance = f64::INFINITY;
+        while let Some(node_index) = stack.pop() {
+            let node = self.nodes[node_index];
+            if !ray_box(origin, direction, node.min, node.max, nearest_distance) {
+                continue;
+            }
+            if node.count == 0 {
+                stack.push(node.left as usize);
+                stack.push(node.right as usize);
+                continue;
+            }
+
+            let range = node.start as usize..(node.start + node.count) as usize;
+            for &object_index in &self.order[range] {
+                let object_index = object_index as usize;
+                let Some(Some(polygon)) = self.filled_polygons.get(object_index) else {
+                    continue;
+                };
+                let Some(&(min, max)) = self.bboxes.get(object_index) else {
+                    continue;
+                };
+                if !ray_box(origin, direction, min, max, nearest_distance)
+                    || !eligible(object_index)
+                {
+                    continue;
+                }
+                let Some(distance) = polygon.ray_distance(origin, direction) else {
+                    continue;
+                };
+                if distance < nearest_distance {
+                    nearest_distance = distance;
+                }
+            }
+        }
+
+        nearest_distance
+            .is_finite()
+            .then(|| origin + direction * nearest_distance)
     }
 
     fn build_node(&mut self, start: usize, end: usize) -> u32 {
@@ -119,25 +204,152 @@ impl ObjectSnapIndex {
     }
 }
 
-fn object_bbox(object: &Object) -> (DVec3, DVec3) {
-    match object {
-        Object::Point { pos, .. } | Object::Text { pos, .. } => (*pos, *pos),
-        Object::Polyline { verts, .. }
-        | Object::Road {
-            centerline: verts, ..
-        } => polyline_bbox(verts),
+#[derive(Clone, Debug)]
+struct FilledPolygon {
+    centroid: DVec3,
+    axis_u: DVec3,
+    axis_v: DVec3,
+    normal: DVec3,
+    points_2d: Vec<DVec2>,
+    bounds: (DVec3, DVec3),
+}
+
+impl FilledPolygon {
+    fn from_object(object: &Object) -> Option<Self> {
+        let Object::Polyline {
+            verts,
+            closed: true,
+            fill: FillStyle::Solid,
+            ..
+        } = object
+        else {
+            return None;
+        };
+        Self::from_vertices(verts)
+    }
+
+    fn from_vertices(verts: &[PolyVertex]) -> Option<Self> {
+        let points = tessellate_polyline_bulges(verts, true);
+        if points.len() < 3 {
+            return None;
+        }
+        let centroid = points.iter().copied().sum::<DVec3>() / points.len() as f64;
+        let mut normal = DVec3::ZERO;
+        for (current, next) in points
+            .iter()
+            .copied()
+            .zip(points.iter().copied().cycle().skip(1))
+            .take(points.len())
+        {
+            normal.x += (current.y - next.y) * (current.z + next.z);
+            normal.y += (current.z - next.z) * (current.x + next.x);
+            normal.z += (current.x - next.x) * (current.y + next.y);
+        }
+        let normal = normal.try_normalize().unwrap_or(DVec3::Z);
+        let up_hint = if normal.z.abs() < 0.9 {
+            DVec3::Z
+        } else {
+            DVec3::Y
+        };
+        let axis_u = up_hint.cross(normal).normalize_or(DVec3::X);
+        let axis_v = normal.cross(axis_u).normalize_or(DVec3::Y);
+        let points_2d: Vec<DVec2> = points
+            .into_iter()
+            .map(|point| {
+                let delta = point - centroid;
+                DVec2::new(delta.dot(axis_u), delta.dot(axis_v))
+            })
+            .collect();
+        let bounds = points_2d.iter().fold(
+            (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY)),
+            |(min, max), point| {
+                let world = centroid + point.x * axis_u + point.y * axis_v;
+                (min.min(world), max.max(world))
+            },
+        );
+        Some(Self {
+            centroid,
+            axis_u,
+            axis_v,
+            normal,
+            points_2d,
+            bounds,
+        })
+    }
+
+    fn ray_distance(&self, origin: DVec3, direction: DVec3) -> Option<f64> {
+        let denominator = direction.dot(self.normal);
+        if denominator.abs() <= 1.0e-12 {
+            return None;
+        }
+        let distance = (self.centroid - origin).dot(self.normal) / denominator;
+        if distance < 0.0 {
+            return None;
+        }
+        let point = origin + direction * distance;
+        let delta = point - self.centroid;
+        let local = DVec2::new(delta.dot(self.axis_u), delta.dot(self.axis_v));
+        point_in_polygon(local, &self.points_2d).then_some(distance)
     }
 }
 
-fn polyline_bbox(verts: &[PolyVertex]) -> (DVec3, DVec3) {
-    if verts.is_empty() {
+fn union_bounds(a: (DVec3, DVec3), b: (DVec3, DVec3)) -> (DVec3, DVec3) {
+    (a.0.min(b.0), a.1.max(b.1))
+}
+
+fn point_in_polygon(point: DVec2, polygon: &[DVec2]) -> bool {
+    let mut inside = false;
+    let mut previous = polygon[polygon.len() - 1];
+    for &current in polygon {
+        if ((current.y > point.y) != (previous.y > point.y))
+            && point.x
+                < (previous.x - current.x) * (point.y - current.y) / (previous.y - current.y)
+                    + current.x
+        {
+            inside = !inside;
+        }
+        previous = current;
+    }
+    inside
+}
+
+fn object_bbox(object: &Object, road_network: &ResolvedNetwork) -> (DVec3, DVec3) {
+    match object {
+        Object::Point { pos, .. } => (*pos, *pos),
+        Object::Text {
+            pos,
+            content,
+            height,
+            rotation,
+            ..
+        } => points_bbox(&text_bounds_corners(*pos, content, *height, *rotation)),
+        Object::Polyline { verts, closed, .. } => polyline_bulge_bounds(verts, *closed)
+            .unwrap_or((DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY))),
+        Object::Road { id, centerline, .. } => {
+            let points: Vec<DVec3> = road_network
+                .edges_for(RoadKey::Object(*id))
+                .flat_map(|edge| edge.center.iter().chain(&edge.left).chain(&edge.right))
+                .copied()
+                .collect();
+            if points.is_empty() {
+                polyline_bulge_bounds(centerline, false)
+                    .unwrap_or((DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY)))
+            } else {
+                points_bbox(&points)
+            }
+        }
+    }
+}
+
+fn points_bbox(points: &[DVec3]) -> (DVec3, DVec3) {
+    if points.is_empty() {
         return (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY));
     }
     let mut min = DVec3::splat(f64::INFINITY);
     let mut max = DVec3::splat(f64::NEG_INFINITY);
-    for v in verts {
-        min = min.min(v.pos);
-        max = max.max(v.pos);
+    for &point in points {
+        min = min.min(point);
+        max = max.max(point);
     }
     if min.x > max.x {
         return (DVec3::ZERO, DVec3::ZERO);
@@ -281,18 +493,13 @@ impl TriangleBvh {
         if self.nodes.is_empty() {
             return None;
         }
-        let inverse = DVec3::new(
-            safe_inverse(direction.x),
-            safe_inverse(direction.y),
-            safe_inverse(direction.z),
-        );
         let mut stack = vec![0usize];
         let mut nearest = f64::INFINITY;
         while let Some(index) = stack.pop() {
             let node = self.nodes[index];
             if !ray_box(
                 origin,
-                inverse,
+                direction,
                 self.node_min(&node),
                 self.node_max(&node),
                 nearest,
@@ -655,6 +862,13 @@ fn build_triangle_info(triangle: [u32; 3], vertices: &[[f32; 3]]) -> BuildTriang
             sum[i] += vertex[i];
         }
     }
+    // The f64 mesh coordinates were narrowed into the temporary f32 cache.
+    // Pad each stored bound by one representable value so rounding can never
+    // move a BVH face inward and reject a triangle lying on its boundary.
+    for axis in 0..3 {
+        min[axis] = min[axis].next_down();
+        max[axis] = max[axis].next_up();
+    }
     BuildTriangleInfo {
         min,
         max,
@@ -666,20 +880,32 @@ fn build_triangle_info(triangle: [u32; 3], vertices: &[[f32; 3]]) -> BuildTriang
     }
 }
 
-fn safe_inverse(value: f64) -> f64 {
-    if value.abs() <= f64::EPSILON {
-        f64::INFINITY.copysign(value)
-    } else {
-        value.recip()
+fn ray_box(origin: DVec3, direction: DVec3, min: DVec3, max: DVec3, limit: f64) -> bool {
+    let mut near: f64 = 0.0;
+    let mut far = limit;
+    for axis in 0..3 {
+        let ray_origin = origin[axis];
+        let ray_direction = direction[axis];
+        let slab_min = min[axis];
+        let slab_max = max[axis];
+        if ray_direction.abs() <= f64::EPSILON {
+            // Multiplying a zero delta by an infinite reciprocal produces
+            // NaN exactly on a slab boundary. Handle parallel axes directly.
+            if ray_origin < slab_min || ray_origin > slab_max {
+                return false;
+            }
+            continue;
+        }
+        let inverse = ray_direction.recip();
+        let t0 = (slab_min - ray_origin) * inverse;
+        let t1 = (slab_max - ray_origin) * inverse;
+        near = near.max(t0.min(t1));
+        far = far.min(t0.max(t1));
+        if near > far {
+            return false;
+        }
     }
-}
-
-fn ray_box(origin: DVec3, inverse: DVec3, min: DVec3, max: DVec3, limit: f64) -> bool {
-    let t0 = (min - origin) * inverse;
-    let t1 = (max - origin) * inverse;
-    let near = t0.min(t1).max_element().max(0.0);
-    let far = t0.max(t1).min_element().min(limit);
-    near <= far
+    true
 }
 
 fn ray_triangle(origin: DVec3, direction: DVec3, triangle: [DVec3; 3]) -> Option<f64> {

@@ -280,8 +280,8 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
     let scaled_dims = camera.viewport.xy * render_scale;
     let uv = frag_coord.xy / max(scaled_dims, vec2<f32>(1.0));
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    let near_h = camera.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
-    let far_h = camera.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    let near_h = camera.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    let far_h = camera.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
     let scene_near = near_h.xyz / near_h.w;
     let scene_far = far_h.xyz / far_h.w;
     let scene_dir = normalize(scene_far - scene_near);
@@ -299,8 +299,8 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
     // footprint(t) ≈ fp_base + fp_slope * t in world units. Drives the
     // cell-vs-brick LOD decision each step.
     let ndc_next = vec2<f32>(ndc.x + 2.0 / max(scaled_dims.x, 1.0), ndc.y);
-    let near_next_h = camera.inv_view_proj * vec4<f32>(ndc_next, 0.0, 1.0);
-    let far_next_h = camera.inv_view_proj * vec4<f32>(ndc_next, 1.0, 1.0);
+    let near_next_h = camera.inv_view_proj * vec4<f32>(ndc_next, 1.0, 1.0);
+    let far_next_h = camera.inv_view_proj * vec4<f32>(ndc_next, 0.0, 1.0);
     let near_next = near_next_h.xyz / near_next_h.w;
     let far_next = far_next_h.xyz / far_next_h.w;
     let fp_base = length(near_next - scene_near);
@@ -321,7 +321,7 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
     // The scene→local transform is a rigid rotation, so scene-space t equals
     // local-space t. This also clips the final segment exactly at the
     // occluder rather than dropping/keeping whole cells by their midpoint.
-    if (opaque_depth < 1.0) {
+    if (opaque_depth > 0.0) {
         let occluder_h = camera.inv_view_proj * vec4<f32>(ndc, opaque_depth, 1.0);
         let occluder = occluder_h.xyz / occluder_h.w;
         t_exit = min(t_exit, dot(occluder - scene_near, scene_dir) - 1.0e-5);

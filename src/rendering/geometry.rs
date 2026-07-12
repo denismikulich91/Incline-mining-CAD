@@ -6,7 +6,7 @@ use std::sync::LazyLock;
 use glam::DVec3;
 
 use crate::{
-    model::PolyVertex,
+    model::{PolyVertex, geometry::tessellate_bulge_segment},
     rendering::{StrokeVertex, Vertex},
 };
 
@@ -19,9 +19,6 @@ pub(crate) struct DrawContext<'a> {
     pub(crate) scale_factor: f32,
 }
 
-const MIN_CURVE_SEGMENTS: usize = 16;
-const MAX_CURVE_SEGMENTS: usize = 4096;
-const TARGET_SEGMENT_LENGTH_WORLD: f64 = 0.15;
 /// Cosine of the turn angle below which a round join is visually redundant:
 /// the wedge gap between adjacent stroke quads is `half_width * tan(angle/2)`,
 /// sub-pixel at document line widths for turns under ~11 degrees. Densely
@@ -287,19 +284,6 @@ pub(crate) fn tessellate_polyline_stroke(
     }
 }
 
-/// Original (untessellated) segment endpoints of a polyline, as stored in pick
-/// records for cross-select edge tests.
-pub(crate) fn polyline_segments(verts: &[PolyVertex], closed: bool) -> Vec<[DVec3; 2]> {
-    let mut segments: Vec<[DVec3; 2]> = verts.windows(2).map(|w| [w[0].pos, w[1].pos]).collect();
-    if closed
-        && verts.len() >= 2
-        && let (Some(first), Some(last)) = (verts.first(), verts.last())
-    {
-        segments.push([last.pos, first.pos]);
-    }
-    segments
-}
-
 pub(crate) fn draw_bulge_segment(
     ctx: &mut DrawContext,
     start: DVec3,
@@ -308,42 +292,21 @@ pub(crate) fn draw_bulge_segment(
     line_width: f32,
     color: [f32; 4],
 ) {
-    let chord = end - start;
-    let chord_len = chord.length();
-    if bulge.abs() <= f64::EPSILON || chord_len <= f64::EPSILON {
-        draw_line(ctx, start, end, line_width, color);
+    let points = tessellate_bulge_segment(start, end, bulge);
+    let segments = points.len().saturating_sub(1);
+    if segments == 0 {
         return;
     }
-
-    let theta = 4.0 * bulge.atan();
-    let radius = chord_len * (1.0 + bulge * bulge) / (4.0 * bulge.abs());
-    let midpoint = (start + end) * 0.5;
-    let chord_dir = chord / chord_len;
-    let perp = DVec3::Z.cross(chord_dir);
-    if perp.length_squared() <= f64::EPSILON {
-        draw_line(ctx, start, end, line_width, color);
-        return;
-    }
-    let center = midpoint + perp.normalize() * chord_len * (1.0 - bulge * bulge) / (4.0 * bulge);
-    let start_vec = start - center;
-    let segments = ((radius * theta.abs() / TARGET_SEGMENT_LENGTH_WORLD).ceil() as usize)
-        .clamp(MIN_CURVE_SEGMENTS, MAX_CURVE_SEGMENTS);
     // The turn between consecutive arc segments is theta/segments; when it is
     // near-collinear the interior joins are invisible and can be skipped.
-    let interior_joins = (theta / segments as f64).cos() < JOIN_COLLINEAR_COS;
-    let mut previous = start;
-    for i in 1..=segments {
-        let point = if i == segments {
-            end
-        } else {
-            center
-                + glam::DQuat::from_axis_angle(DVec3::Z, theta * i as f64 / segments as f64)
-                    .mul_vec3(start_vec)
-        };
-        draw_line(ctx, previous, point, line_width, color);
-        if i < segments && interior_joins {
-            draw_round_join(ctx, point, line_width, color);
+    let theta = 4.0 * bulge.atan();
+    let interior_joins = bulge.is_finite()
+        && bulge.abs() > f64::EPSILON
+        && (theta / segments as f64).cos() < JOIN_COLLINEAR_COS;
+    for (index, pair) in points.windows(2).enumerate() {
+        draw_line(ctx, pair[0], pair[1], line_width, color);
+        if index + 1 < segments && interior_joins {
+            draw_round_join(ctx, pair[1], line_width, color);
         }
-        previous = point;
     }
 }
